@@ -228,6 +228,11 @@ const OUTPUT_SCHEMA = {
   additionalProperties: false,
 } as const;
 
+// Retained as the canonical contract for future strict-schema model tiers.
+// The current entry-tier request uses JSON Object mode and validates against
+// the equivalent runtime rules in validateGeneratedEnvelope().
+void OUTPUT_SCHEMA;
+
 const SYSTEM_PROMPT = `You are the circuit-design engine for AI Circuit Studio.
 Generate a complete, electrically sensible Arduino Uno digital circuit and an Arduino C++ sketch from the user's request.
 
@@ -246,7 +251,16 @@ Rules:
 - Produce ordinary Arduino Uno C++ containing void setup() and void loop(). Keep pin assignments exactly consistent with the connections.
 - Place components on a readable 2000 by 1200 canvas without overlapping them.
 - Fill every properties key required by the schema. Use null for a property that does not apply.
-- Return only the JSON object required by the response schema. Do not use Markdown fences.`;
+- Return only JSON, with no Markdown fences or prose outside it.
+
+The top-level JSON object must have exactly these fields:
+- project: { schemaVersion: 1, id, name, description, board: "arduino-uno", components, connections, code }
+- explanation: a concise string
+- assumptions: an array of strings
+- warnings: an array of strings
+
+Each component is { id, type, label, x, y, rotation, properties }.
+Each connection is { id, from: { componentId, pin }, to: { componentId, pin }, color }.`;
 
 type Primitive = string | number | boolean;
 
@@ -746,15 +760,12 @@ export async function POST(request: Request) {
           { role: "user", content: userContent },
         ],
         temperature: 0.2,
-        max_completion_tokens: 8_192,
-        response_format: {
-          type: "json_schema",
-          json_schema: {
-            name: "arduino_uno_circuit_proposal",
-            strict: true,
-            schema: OUTPUT_SCHEMA,
-          },
-        },
+        // Keep the full request below Groq's entry-tier 8K TPM limit. A v1
+        // circuit proposal comfortably fits within this response budget.
+        max_completion_tokens: 4_096,
+        // JSON Object mode is reliable across Groq tiers. The result still
+        // passes through validateGeneratedEnvelope() before reaching the UI.
+        response_format: { type: "json_object" },
       }),
       signal: controller.signal,
     });
