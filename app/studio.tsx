@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
+  type WheelEvent as ReactWheelEvent,
 } from "react";
 import {
   COMPONENT_CATALOG,
@@ -23,6 +24,13 @@ import {
   ArduinoSimulator,
   type SimulatorSnapshot,
 } from "../lib/simulator";
+import {
+  componentSize,
+  fitViewport,
+  orthogonalWireSegments,
+  pinPosition,
+} from "../lib/schematic";
+import { SchematicSymbol } from "./schematic-symbols";
 
 const STORAGE_KEY = "ai-circuit-studio.project.v1";
 const WIRE_COLORS = ["#ffb547", "#ff6b6b", "#56d7c3", "#68a7ff", "#b38cff"];
@@ -81,29 +89,6 @@ function uid(prefix: string) {
 
 function deepClone(project: CircuitProject): CircuitProject {
   return JSON.parse(JSON.stringify(project)) as CircuitProject;
-}
-
-function nodeSize(component: CircuitComponent) {
-  if (component.type === "arduino-uno") return { width: 176, height: 190 };
-  if (component.type === "lcd-16x2") return { width: 164, height: 92 };
-  if (component.type === "l293d") return { width: 126, height: 132 };
-  if (component.type.includes("logic")) return { width: 92, height: 64 };
-  return { width: 104, height: 78 };
-}
-
-function componentCenter(component: CircuitComponent) {
-  const size = nodeSize(component);
-  return { x: component.x + size.width / 2, y: component.y + size.height / 2 };
-}
-
-function displayPins(component: CircuitComponent) {
-  const definition = getComponentDefinition(component.type);
-  if (!definition) return [];
-  if (component.type === "arduino-uno") {
-    const preferred = ["5V", "D2", "D3", "D9", "D10", "D11", "D12", "D13", "A0", "GND"];
-    return preferred.map((id) => definition.pins.find((pin) => pin.id === id)).filter(Boolean) as typeof definition.pins[number][];
-  }
-  return definition.pins.slice(0, 8);
 }
 
 function createTrafficLightProject(): CircuitProject {
@@ -189,6 +174,15 @@ export function CircuitStudio() {
   const [bottomTab, setBottomTab] = useState<BottomTab>("code");
   const [bottomOpen, setBottomOpen] = useState(true);
   const [zoom, setZoom] = useState(0.9);
+  const [pan, setPan] = useState({ x: 72, y: 42 });
+  const [panDrag, setPanDrag] = useState<{
+    pointerId: number;
+    clientX: number;
+    clientY: number;
+    panX: number;
+    panY: number;
+  } | null>(null);
+  const [spaceHeld, setSpaceHeld] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [chat, setChat] = useState<ChatMessage[]>(initialChat);
   const [generating, setGenerating] = useState(false);
@@ -197,6 +191,7 @@ export function CircuitStudio() {
   const [buildState, setBuildState] = useState<"idle" | "building" | "ready" | "error">("idle");
   const [dragState, setDragState] = useState<{ id: string; pointerX: number; pointerY: number; x: number; y: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
   const [simulator] = useState(() => new ArduinoSimulator(initialProject.code));
   const [snapshot, setSnapshot] = useState<SimulatorSnapshot>(() => simulator.getSnapshot());
 
@@ -268,9 +263,9 @@ export function CircuitStudio() {
       const dy = (event.clientY - dragState.pointerY) / zoom;
       setProject((current) => ({
         ...current,
-        components: current.components.map((component) =>
-          component.id === dragState.id
-            ? { ...component, x: Math.max(12, dragState.x + dx), y: Math.max(12, dragState.y + dy) }
+          components: current.components.map((component) =>
+            component.id === dragState.id
+            ? { ...component, x: dragState.x + dx, y: dragState.y + dy }
             : component,
         ),
       }));
@@ -311,6 +306,10 @@ export function CircuitStudio() {
     const keydown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       const typing = target?.tagName === "INPUT" || target?.tagName === "TEXTAREA";
+      if (!typing && event.code === "Space") {
+        event.preventDefault();
+        setSpaceHeld(true);
+      }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
         event.preventDefault();
         if (event.shiftKey) redo(); else undo();
@@ -325,8 +324,18 @@ export function CircuitStudio() {
         setSelectedId(null);
       }
     };
+    const keyup = (event: KeyboardEvent) => {
+      if (event.code === "Space") setSpaceHeld(false);
+    };
+    const blur = () => setSpaceHeld(false);
     window.addEventListener("keydown", keydown);
-    return () => window.removeEventListener("keydown", keydown);
+    window.addEventListener("keyup", keyup);
+    window.addEventListener("blur", blur);
+    return () => {
+      window.removeEventListener("keydown", keydown);
+      window.removeEventListener("keyup", keyup);
+      window.removeEventListener("blur", blur);
+    };
   }, [commitProject, redo, selectedId, undo]);
 
   const selected = project.components.find((component) => component.id === selectedId) ?? null;
@@ -345,12 +354,16 @@ export function CircuitStudio() {
     const definition = getComponentDefinition(type);
     if (!definition) return;
     const count = project.components.filter((component) => component.type === type).length + 1;
+    const viewport = viewportRef.current?.getBoundingClientRect();
+    const centerX = viewport ? (viewport.width / 2 - pan.x) / zoom : 480;
+    const centerY = viewport ? (viewport.height / 2 - pan.y) / zoom : 260;
+    const size = componentSize(type);
     const component: CircuitComponent = {
       id: uid(type),
       type,
       label: `${definition.displayName} ${count}`,
-      x: 430 + ((project.components.length * 37) % 280),
-      y: 94 + ((project.components.length * 71) % 320),
+      x: centerX - size.width / 2 + ((project.components.length * 19) % 90),
+      y: centerY - size.height / 2 + ((project.components.length * 23) % 70),
       properties: createDefaultProperties(type),
     };
     commitProject({ ...project, components: [...project.components, component] });
@@ -360,10 +373,74 @@ export function CircuitStudio() {
   };
 
   const beginDrag = (event: ReactPointerEvent, component: CircuitComponent) => {
-    if ((event.target as HTMLElement).closest(".pin-button")) return;
+    if (spaceHeld || event.button !== 0) return;
+    if ((event.target as HTMLElement).closest(".schematic-pin")) return;
     event.preventDefault();
+    event.stopPropagation();
     setSelectedId(component.id);
     setDragState({ id: component.id, pointerX: event.clientX, pointerY: event.clientY, x: component.x, y: component.y });
+  };
+
+  const beginCanvasPan = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 && event.button !== 1) return;
+    const target = event.target as HTMLElement;
+    const forcedPan = spaceHeld || event.button === 1;
+    if (!forcedPan && target.closest(".circuit-node, .wire-segment, .minimap")) return;
+    event.preventDefault();
+    setSelectedId(null);
+    setPanDrag({
+      pointerId: event.pointerId,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      panX: pan.x,
+      panY: pan.y,
+    });
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const moveCanvasPan = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!panDrag || event.pointerId !== panDrag.pointerId) return;
+    setPan({
+      x: panDrag.panX + event.clientX - panDrag.clientX,
+      y: panDrag.panY + event.clientY - panDrag.clientY,
+    });
+  };
+
+  const endCanvasPan = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!panDrag || event.pointerId !== panDrag.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    setPanDrag(null);
+  };
+
+  const zoomAt = (nextZoom: number, clientX?: number, clientY?: number) => {
+    const clamped = Math.min(2.2, Math.max(0.2, nextZoom));
+    const rect = viewportRef.current?.getBoundingClientRect();
+    if (!rect) {
+      setZoom(clamped);
+      return;
+    }
+    const focusX = (clientX ?? rect.left + rect.width / 2) - rect.left;
+    const focusY = (clientY ?? rect.top + rect.height / 2) - rect.top;
+    const worldX = (focusX - pan.x) / zoom;
+    const worldY = (focusY - pan.y) / zoom;
+    setPan({ x: focusX - worldX * clamped, y: focusY - worldY * clamped });
+    setZoom(clamped);
+  };
+
+  const handleCanvasWheel = (event: ReactWheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const factor = Math.exp(-event.deltaY * 0.0015);
+    zoomAt(zoom * factor, event.clientX, event.clientY);
+  };
+
+  const fitCanvas = () => {
+    const rect = viewportRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const fitted = fitViewport(project.components, rect.width, rect.height, 64);
+    setZoom(Math.min(1.5, Math.max(0.2, fitted.zoom)));
+    setPan(fitted.pan);
   };
 
   const connectPin = (endpoint: ConnectionEndpoint) => {
@@ -590,94 +667,109 @@ export function CircuitStudio() {
         <section className="canvas-column">
           <div className="canvas-toolbar">
             <div className="tool-group">
-              <button className="tool active" title="Select">↖ <span>Select</span></button>
+              <button className={`tool ${panDrag ? "" : "active"}`} title="Select and move parts">↖ <span>Select</span></button>
+              <button className={`tool ${spaceHeld || panDrag ? "active" : ""}`} title="Drag empty canvas, middle-drag, or hold Space">✋ <span>Pan</span></button>
               <button className={`tool ${pendingPin ? "active amber" : ""}`} onClick={() => setPendingPin(null)} title="Wire">⌁ <span>{pendingPin ? "Cancel wire" : "Wire"}</span></button>
             </div>
             <div className="canvas-title">
               <strong>Schematic</strong><span>{project.components.length} parts · {project.connections.length} wires</span>
             </div>
             <div className="zoom-controls">
-              <button onClick={() => setZoom((value) => Math.max(0.55, value - 0.1))}>−</button>
+              <button onClick={() => zoomAt(zoom - 0.1)} title="Zoom out">−</button>
               <span>{Math.round(zoom * 100)}%</span>
-              <button onClick={() => setZoom((value) => Math.min(1.35, value + 0.1))}>+</button>
-              <button onClick={() => setZoom(0.9)} title="Fit to screen">⊙</button>
+              <button onClick={() => zoomAt(zoom + 0.1)} title="Zoom in">+</button>
+              <button onClick={fitCanvas} title="Fit all components">⊙</button>
             </div>
           </div>
 
-          <div className="canvas-viewport" onPointerDown={(event) => { if (event.target === event.currentTarget) setSelectedId(null); }}>
-            <div className="schematic-grid" style={{ transform: `scale(${zoom})` }}>
+          <div
+            ref={viewportRef}
+            className={`canvas-viewport ${panDrag ? "is-panning" : ""} ${spaceHeld ? "space-pan" : ""}`}
+            style={{
+              "--grid-major": `${80 * zoom}px`,
+              "--grid-minor": `${16 * zoom}px`,
+              "--grid-pan-x": `${pan.x}px`,
+              "--grid-pan-y": `${pan.y}px`,
+            } as React.CSSProperties}
+            onPointerDown={beginCanvasPan}
+            onPointerMove={moveCanvasPan}
+            onPointerUp={endCanvasPan}
+            onPointerCancel={endCanvasPan}
+            onWheel={handleCanvasWheel}
+          >
+            <div className="schematic-grid" style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}>
               {project.connections.map((connection) => {
                 const fromComponent = project.components.find((component) => component.id === connection.from.componentId);
                 const toComponent = project.components.find((component) => component.id === connection.to.componentId);
-                if (!fromComponent || !toComponent) return null;
-                const from = componentCenter(fromComponent);
-                const to = componentCenter(toComponent);
-                const length = Math.hypot(to.x - from.x, to.y - from.y);
-                const angle = Math.atan2(to.y - from.y, to.x - from.x) * 180 / Math.PI;
+                const fromDefinition = fromComponent ? getComponentDefinition(fromComponent.type) : undefined;
+                const toDefinition = toComponent ? getComponentDefinition(toComponent.type) : undefined;
+                if (!fromComponent || !toComponent || !fromDefinition || !toDefinition) return null;
+                const from = pinPosition({ ...fromComponent, rotation: 0 }, connection.from.pin, fromDefinition);
+                const to = pinPosition({ ...toComponent, rotation: 0 }, connection.to.pin, toDefinition);
+                if (!from || !to) return null;
+                const segments = orthogonalWireSegments(from, to);
+                const removeWire = (event: React.MouseEvent) => {
+                  event.stopPropagation();
+                  commitProject({ ...project, connections: project.connections.filter((item) => item.id !== connection.id) });
+                  announce("Wire removed");
+                };
                 return (
-                  <button
-                    className="wire-line"
-                    key={connection.id}
-                    title={`${connection.from.pin} → ${connection.to.pin}. Click to remove.`}
-                    style={{ left: from.x, top: from.y, width: length, transform: `rotate(${angle}deg)`, "--wire-color": connection.color ?? "#ffb547" } as React.CSSProperties}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      commitProject({ ...project, connections: project.connections.filter((item) => item.id !== connection.id) });
-                      announce("Wire removed");
-                    }}
-                  ><span>{connection.from.pin}</span><i></i><span>{connection.to.pin}</span></button>
+                  <div className="wire-route" key={connection.id} style={{ "--wire-color": connection.color ?? "#47b86b" } as React.CSSProperties}>
+                    {segments.map((segment, index) => {
+                      const horizontal = segment.from.y === segment.to.y;
+                      return (
+                        <button
+                          key={index}
+                          className={`wire-segment ${horizontal ? "horizontal" : "vertical"}`}
+                          title={`${connection.from.pin} → ${connection.to.pin}. Click to remove.`}
+                          style={{
+                            left: Math.min(segment.from.x, segment.to.x),
+                            top: Math.min(segment.from.y, segment.to.y),
+                            width: horizontal ? Math.max(1, Math.abs(segment.to.x - segment.from.x)) : 9,
+                            height: horizontal ? 9 : Math.max(1, Math.abs(segment.to.y - segment.from.y)),
+                          }}
+                          onClick={removeWire}
+                        />
+                      );
+                    })}
+                    <i className="wire-junction from" style={{ left: from.x, top: from.y }} />
+                    <i className="wire-junction to" style={{ left: to.x, top: to.y }} />
+                  </div>
                 );
               })}
 
               {project.components.map((component) => {
                 const definition = getComponentDefinition(component.type);
-                const size = nodeSize(component);
+                const size = componentSize(component.type);
                 const isSelected = component.id === selectedId;
                 const isLedOn = component.type === "led" && pin13?.digitalValue === 1 && snapshot.status === "running";
                 return (
                   <article
                     key={component.id}
-                    className={`circuit-node ${component.type === "arduino-uno" ? "board-node" : ""} ${isSelected ? "selected" : ""} ${isLedOn ? "powered" : ""}`}
-                    style={{ left: component.x, top: component.y, width: size.width, minHeight: size.height, "--node-accent": definition?.accent ?? "#64748b" } as React.CSSProperties}
+                    className={`circuit-node schematic-component component-${component.type} ${isSelected ? "selected" : ""} ${isLedOn ? "powered" : ""}`}
+                    style={{ left: component.x, top: component.y, width: size.width, height: size.height, "--node-accent": definition?.accent ?? "#64748b" } as React.CSSProperties}
                     onPointerDown={(event) => beginDrag(event, component)}
                     onDoubleClick={() => { setSelectedId(component.id); setSideTab("inspector"); }}
                   >
-                    <header>
-                      <span className="node-glyph">{PART_GLYPHS[component.type] ?? "IC"}</span>
-                      <div><strong>{component.label}</strong><small>{component.type === "arduino-uno" ? "ATmega328P · 16 MHz" : definition?.displayName}</small></div>
-                      {isLedOn && <i className="live-dot" title="High output"></i>}
-                    </header>
-                    {component.type === "arduino-uno" && (
-                      <div className="board-art" aria-hidden="true">
-                        <span className="usb-port">USB</span><span className="chip">ATMEGA<br />328P</span><span className={`builtin-led ${pin13?.digitalValue ? "on" : ""}`}>L</span>
-                      </div>
-                    )}
-                    {component.type === "led" && <div className={`led-art ${isLedOn ? "on" : ""}`} style={{ "--led-color": String(component.properties?.color ?? "#ff5b65") } as React.CSSProperties}><span></span></div>}
-                    {component.type === "resistor" && <div className="resistor-art"><span></span><i></i><span></span></div>}
-                    {component.type === "push-button" && <button className="push-art" title="Press simulated button"><span></span></button>}
-                    {component.type === "buzzer" && <div className="buzzer-art">)))</div>}
-                    {component.type === "lcd-16x2" && <div className="lcd-art"><span>AI CIRCUIT STUDIO</span><span>READY_</span></div>}
-                    <div className="node-pins">
-                      {displayPins(component).map((pin) => {
+                    <div className="symbol-caption"><strong>{component.label}</strong><small>{component.type === "arduino-uno" ? "ARDUINO UNO R3" : definition?.displayName}</small></div>
+                    <SchematicSymbol type={component.type} properties={component.properties} powered={isLedOn || component.type === "arduino-uno"} />
+                    {definition?.pins.map((pin) => {
+                        const localPoint = pinPosition({ ...component, x: 0, y: 0, rotation: 0 }, pin.id, definition);
+                        if (!localPoint) return null;
                         const active = pendingPin?.componentId === component.id && pendingPin.pin === pin.id;
-                        return <button key={pin.id} className={`pin-button ${active ? "active" : ""}`} title={`${pin.label} · click to wire`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); connectPin({ componentId: component.id, pin: pin.id }); }}><i></i>{pin.id}</button>;
+                        return <button key={pin.id} className={`schematic-pin side-${pin.side} ${active ? "active" : ""}`} style={{ left: localPoint.x, top: localPoint.y }} title={`${pin.label} · click to wire`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); connectPin({ componentId: component.id, pin: pin.id }); }}><i /><span>{pin.label}</span></button>;
                       })}
-                    </div>
                   </article>
                 );
               })}
-              <div className="canvas-origin">0,0</div>
+              <div className="canvas-origin"><i></i><span>0,0</span></div>
             </div>
 
             <div className="canvas-help">
               <span className={pendingPin ? "active" : ""}>{pendingPin ? `Wiring from ${pendingPin.pin} — choose a destination pin` : "Click any pin to start a wire"}</span>
-              <span>Drag parts to arrange · Double-click to inspect</span>
+              <span>Drag empty space to pan · Wheel to zoom · Space + drag anywhere</span>
             </div>
-            <div className="minimap" aria-hidden="true">
-              <div className="mini-board"></div>
-              {project.components.filter((component) => component.type !== "arduino-uno").slice(0, 8).map((component) => <i key={component.id} style={{ left: `${Math.min(88, component.x / 10)}%`, top: `${Math.min(80, component.y / 7)}%` }}></i>)}
-              <span></span>
-            </div>
+            <div className="pan-readout" aria-hidden="true">X {Math.round(-pan.x / zoom)} &nbsp; Y {Math.round(-pan.y / zoom)}</div>
           </div>
         </section>
 

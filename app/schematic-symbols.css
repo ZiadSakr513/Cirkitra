@@ -1,0 +1,318 @@
+/* Proteus-style canvas and physical component symbols. All artwork is CSS/HTML. */
+
+.canvas-viewport {
+  touch-action: none;
+  cursor: grab;
+  background-color: #091017;
+  background-image:
+    linear-gradient(#20303a 1px, transparent 1px),
+    linear-gradient(90deg, #20303a 1px, transparent 1px),
+    linear-gradient(#121e27 1px, transparent 1px),
+    linear-gradient(90deg, #121e27 1px, transparent 1px);
+  background-position:
+    var(--grid-pan-x) var(--grid-pan-y),
+    var(--grid-pan-x) var(--grid-pan-y),
+    var(--grid-pan-x) var(--grid-pan-y),
+    var(--grid-pan-x) var(--grid-pan-y);
+  background-size:
+    var(--grid-major) var(--grid-major),
+    var(--grid-major) var(--grid-major),
+    var(--grid-minor) var(--grid-minor),
+    var(--grid-minor) var(--grid-minor);
+}
+
+.canvas-viewport.space-pan,
+.canvas-viewport.is-panning { cursor: grabbing; }
+
+.schematic-grid {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  overflow: visible;
+  background: none;
+  transform-origin: 0 0;
+  transition: none;
+}
+
+.canvas-origin {
+  position: absolute;
+  top: -8px;
+  left: -8px;
+  width: 16px;
+  height: 16px;
+  color: #57707e;
+  font: 8px var(--font-mono);
+}
+
+.canvas-origin::before,
+.canvas-origin::after {
+  position: absolute;
+  background: #557181;
+  content: "";
+}
+.canvas-origin::before { top: 7px; left: -8px; width: 32px; height: 1px; }
+.canvas-origin::after { top: -8px; left: 7px; width: 1px; height: 32px; }
+.canvas-origin i { position: absolute; inset: 5px; border: 1px solid #718b98; border-radius: 50%; }
+.canvas-origin span { position: absolute; top: 19px; left: 18px; white-space: nowrap; }
+
+.pan-readout {
+  position: absolute;
+  top: 11px;
+  right: 12px;
+  padding: 5px 8px;
+  border: 1px solid #263945;
+  border-radius: 4px;
+  background: #0a121acc;
+  color: #617685;
+  font: 8px var(--font-mono);
+  pointer-events: none;
+}
+
+/* Orthogonal nets terminate on actual catalog pin coordinates. */
+.wire-route {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  pointer-events: none;
+}
+
+.wire-segment {
+  position: absolute;
+  z-index: 1;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  pointer-events: auto;
+}
+.wire-segment.horizontal { transform: translateY(-4px); }
+.wire-segment.vertical { transform: translateX(-4px); }
+.wire-segment::before {
+  position: absolute;
+  background: var(--wire-color);
+  box-shadow: 0 0 3px color-mix(in srgb, var(--wire-color) 35%, transparent);
+  content: "";
+}
+.wire-segment.horizontal::before { top: 4px; right: 0; left: 0; height: 2px; }
+.wire-segment.vertical::before { top: 0; bottom: 0; left: 4px; width: 2px; }
+.wire-segment:hover::before { background: #f5cb5c; box-shadow: 0 0 6px #f5cb5c88; }
+
+.wire-junction {
+  position: absolute;
+  z-index: 2;
+  width: 7px;
+  height: 7px;
+  border: 1px solid #071017;
+  border-radius: 50%;
+  background: var(--wire-color);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+/* Component containers are transparent; only the physical symbol is visible. */
+.circuit-node.schematic-component {
+  position: absolute;
+  z-index: 2;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  transform-origin: center;
+  overflow: visible;
+  cursor: grab;
+  user-select: none;
+}
+.circuit-node.schematic-component::before { display: none; }
+.circuit-node.schematic-component:hover { border: 0; }
+.circuit-node.schematic-component:active { cursor: grabbing; }
+.circuit-node.schematic-component.selected { border: 0; box-shadow: none; }
+.circuit-node.schematic-component.selected::after {
+  position: absolute;
+  z-index: 20;
+  inset: -9px;
+  border: 1px dashed #ff616d;
+  content: "";
+  pointer-events: none;
+}
+.circuit-node.schematic-component.selected::before {
+  position: absolute;
+  z-index: 21;
+  right: -12px;
+  bottom: -12px;
+  display: block;
+  width: 7px;
+  height: 7px;
+  border: 1px solid #ff616d;
+  background: #091017;
+  content: "";
+}
+
+.symbol-caption {
+  position: absolute;
+  z-index: 12;
+  top: -31px;
+  left: 50%;
+  min-width: max-content;
+  max-width: 230px;
+  transform: translateX(-50%);
+  color: #dde7ed;
+  text-align: center;
+  text-shadow: 0 1px 2px #000;
+  pointer-events: none;
+}
+.symbol-caption strong { display: block; font: 700 11px/1.2 var(--font-mono); }
+.symbol-caption small { display: block; margin-top: 2px; color: #708390; font: 7px var(--font-mono); letter-spacing: .08em; }
+.component-arduino-uno .symbol-caption { top: -35px; }
+
+/* Pin labels sit inside each physical outline; terminal dots sit on its edge. */
+.schematic-pin {
+  position: absolute;
+  z-index: 15;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #b9c7cf;
+  font: 7px/1 var(--font-mono);
+  white-space: nowrap;
+}
+.schematic-pin i {
+  display: block;
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border: 1px solid #a6b3ba;
+  border-radius: 50%;
+  background: #0a1118;
+}
+.schematic-pin span { opacity: .86; }
+.schematic-pin:hover { z-index: 22; color: #ffd88f; }
+.schematic-pin:hover i,
+.schematic-pin.active i { border-color: #ffb547; background: #ffb547; box-shadow: 0 0 7px #ffb547; }
+.schematic-pin.active { z-index: 22; color: #ffd88f; }
+.schematic-pin.side-left { transform: translate(0, -50%); }
+.schematic-pin.side-right { flex-direction: row-reverse; transform: translate(-100%, -50%); }
+.schematic-pin.side-top { flex-direction: column; transform: translate(-50%, 0); }
+.schematic-pin.side-bottom { flex-direction: column-reverse; transform: translate(-50%, -100%); }
+.schematic-pin.side-top span,
+.schematic-pin.side-bottom span { font-size: 6px; writing-mode: vertical-rl; }
+.component-arduino-uno .schematic-pin { gap: 3px; color: #e8f1ef; font-size: 7px; }
+.component-arduino-uno .schematic-pin i { border-color: #d3e0dc; background: #172127; }
+
+.schematic-symbol { position: absolute; inset: 0; pointer-events: none; }
+
+/* Arduino Uno R3 */
+.symbol-uno__board {
+  position: absolute;
+  inset: 5px 25px;
+  overflow: hidden;
+  border: 2px solid #34a19e;
+  border-radius: 8px 30px 8px 8px;
+  background:
+    radial-gradient(circle at 75% 20%, #4bb9b4 0 2px, transparent 3px),
+    radial-gradient(circle at 20% 72%, #4bb9b4 0 2px, transparent 3px),
+    linear-gradient(145deg, #087c80, #07565e);
+  box-shadow: inset 0 0 28px #022e3588, 0 10px 25px #0007;
+}
+.symbol-uno__board::before,
+.symbol-uno__board::after {
+  position: absolute;
+  top: 17px;
+  bottom: 17px;
+  width: 14px;
+  border: 1px solid #111b20;
+  background: repeating-linear-gradient(to bottom, #111a20 0 10px, #b4bec0 11px 12px, #111a20 13px 19px);
+  content: "";
+}
+.symbol-uno__board::before { left: 5px; }
+.symbol-uno__board::after { right: 5px; }
+.symbol-uno__usb-port { position: absolute; top: 42px; left: 28px; width: 58px; height: 46px; border: 2px solid #aebbc0; border-radius: 5px; background: linear-gradient(#a8b6ba, #607176); box-shadow: inset 0 0 0 4px #78898e; }
+.symbol-uno__usb-mouth { position: absolute; inset: 10px 8px; border: 2px solid #35474c; border-radius: 2px; background: #18282e; }
+.symbol-uno__barrel-jack { position: absolute; bottom: 40px; left: 26px; width: 54px; height: 46px; border-radius: 8px; background: #171d21; box-shadow: inset 0 0 0 3px #343e43; }
+.symbol-uno__barrel-opening { position: absolute; top: 9px; left: -4px; width: 25px; height: 28px; border: 4px solid #4c575c; border-radius: 50%; background: #05080a; }
+.symbol-uno__reset-button { position: absolute; top: 18px; left: 102px; width: 25px; height: 25px; border: 4px solid #c6d0d3; border-radius: 5px; background: #e85048; box-shadow: inset 0 0 0 3px #8c2927; }
+.symbol-uno__reset-label { position: absolute; top: 47px; left: 101px; color: #d8f2ee; font: 6px var(--font-mono); }
+.symbol-uno__atmega { position: absolute; right: 53px; bottom: 78px; width: 99px; height: 42px; border-radius: 5px; background: #11171b; box-shadow: 0 0 0 2px #091013, inset 0 0 10px #000; }
+.symbol-uno__atmega::before,
+.symbol-uno__atmega::after { position: absolute; right: 6px; left: 6px; height: 7px; background: repeating-linear-gradient(90deg, #aeb7b8 0 3px, transparent 3px 9px); content: ""; }
+.symbol-uno__atmega::before { top: -7px; }.symbol-uno__atmega::after { bottom: -7px; }
+.symbol-uno__chip-notch { position: absolute; top: 14px; left: -1px; width: 8px; height: 14px; border-radius: 0 8px 8px 0; background: #075a60; }
+.symbol-uno__chip-label { display: grid; height: 100%; place-items: center; color: #78868b; font: 7px var(--font-mono); }
+.symbol-uno__crystal { position: absolute; right: 62px; bottom: 137px; padding: 5px 4px; border-radius: 4px; background: #aeb9b9; color: #4d5e62; font: 5px var(--font-mono); }
+.symbol-uno__voltage-regulator { position: absolute; bottom: 118px; left: 99px; width: 28px; height: 35px; border-radius: 3px; background: #1a2226; box-shadow: inset 0 -7px #39474b; }
+.symbol-uno__icsp-header { position: absolute; top: 95px; right: 82px; width: 33px; height: 24px; border: 2px solid #182126; background: radial-gradient(circle, #c5a85f 0 2px, #141d21 3px) 0 0/11px 12px; }
+.symbol-uno__status-led { position: absolute; display: grid; width: 18px; height: 12px; place-items: center; border-radius: 2px; background: #695923; color: #d6bf66; font: 5px var(--font-mono); }
+.symbol-uno__status-led--on { top: 68px; right: 30px; box-shadow: 0 0 8px #efc94d; }
+.symbol-uno__status-led--tx { top: 85px; right: 30px; }.symbol-uno__status-led--rx { top: 102px; right: 30px; }.symbol-uno__status-led--l { top: 119px; right: 30px; }
+.symbol-uno__silkscreen { position: absolute; color: #b9e4de; font: 6px var(--font-mono); letter-spacing: .06em; }
+.symbol-uno__silkscreen--brand { top: 140px; left: 87px; font-size: 13px; font-weight: 800; transform: rotate(-90deg); }
+.symbol-uno__silkscreen--model { top: 142px; left: 129px; font-size: 23px; font-weight: 800; opacity: .85; }
+.symbol-uno__silkscreen--digital { top: 7px; right: 27px; }.symbol-uno__silkscreen--power { bottom: 8px; left: 27px; }.symbol-uno__silkscreen--analog { bottom: 8px; right: 27px; }
+
+/* LEDs */
+.symbol-led__dome { position: absolute; top: 20px; left: 18px; width: 37px; height: 43px; border: 2px solid color-mix(in srgb, var(--symbol-led-color) 75%, white); border-radius: 20px 20px 8px 8px; background: color-mix(in srgb, var(--symbol-led-color) 55%, #162029); box-shadow: inset 7px 5px 12px #ffffff35, inset -7px -7px 12px #0008; }
+.schematic-symbol--powered .symbol-led__dome { background: var(--symbol-led-color); box-shadow: 0 0 22px var(--symbol-led-color), inset 7px 5px 10px #ffffff55; }
+.symbol-led__highlight { position: absolute; top: 7px; left: 8px; width: 9px; height: 12px; border-radius: 50%; background: #fff6; transform: rotate(25deg); }
+.symbol-led__rim { position: absolute; top: 59px; left: 14px; width: 45px; height: 8px; border-radius: 4px; background: color-mix(in srgb, var(--symbol-led-color) 70%, #28333c); }
+.symbol-led__lead { position: absolute; width: 2px; background: #b8c4c8; }
+.symbol-led__lead--anode { top: 0; left: 36px; height: 21px; }.symbol-led__lead--cathode { top: 66px; left: 36px; height: 38px; }
+.symbol-led__lead--rgb-extra { left: 36px; height: 34px; }.symbol-led__lead--common { left: 53px; height: 25px; }
+.symbol-led__emitters { position: absolute; inset: 16px 7px 7px; display: flex; gap: 3px; }.symbol-led__emitter { flex: 1; border-radius: 4px; }.symbol-led__emitter--red { background:#ef4444; }.symbol-led__emitter--green { background:#22c55e; }.symbol-led__emitter--blue { background:#3b82f6; }
+
+/* Axial resistor */
+.symbol-resistor__lead { position: absolute; top: 23px; height: 2px; background: #aeb9bd; }
+.symbol-resistor__lead--left { left: 0; width: 34px; }.symbol-resistor__lead--right { right: 0; width: 34px; }
+.symbol-resistor__body { position: absolute; top: 12px; left: 32px; width: 76px; height: 25px; border: 2px solid #c59d69; border-radius: 10px 8px 8px 10px; background: linear-gradient(#dfc08b, #b98c56); box-shadow: inset 0 4px #ffffff2b, 0 3px 6px #0007; }
+.symbol-resistor__band { position: absolute; top: -2px; bottom: -2px; width: 7px; }.symbol-resistor__band--one { left: 13px; background:#7a4124; }.symbol-resistor__band--two { left: 27px; background:#e34c50; }.symbol-resistor__band--multiplier { left: 41px; background:#8c4c24; }.symbol-resistor__band--tolerance { right: 9px; width:5px; background:#d4a53d; }
+
+/* Push button and switch */
+.symbol-button__leg { position:absolute; top:35px; width:28px; height:3px; background:#aeb8bd; }.symbol-button__leg--left{left:0}.symbol-button__leg--right{right:0}
+.symbol-button__base { position:absolute; top:19px; left:27px; width:42px; height:34px; border:2px solid #6b7880; border-radius:5px; background:#2b353b; box-shadow:0 5px 8px #0006; }
+.symbol-button__collar { position:absolute; top:-10px; left:8px; width:23px; height:17px; border-radius:8px 8px 3px 3px; background:#8d979d; }.symbol-button__plunger { position:absolute; top:-17px; left:12px; width:15px; height:14px; border-radius:5px; background:#c3ccd0; }
+.symbol-toggle__terminal { position:absolute; top:60px; width:2px; height:20px; background:#aeb8bd; }.symbol-toggle__terminal--left{left:27px}.symbol-toggle__terminal--center{left:55px}.symbol-toggle__terminal--right{right:27px}
+.symbol-toggle__body{position:absolute;top:26px;left:28px;width:56px;height:36px;border:2px solid #6f7d84;border-radius:5px;background:#303a40}.symbol-toggle__bezel{position:absolute;top:-10px;left:15px;width:22px;height:20px;border-radius:50%;background:#98a5a9}.symbol-toggle__lever{position:absolute;bottom:27px;left:25px;width:7px;height:38px;border-radius:4px;background:#c0c9cb;transform:rotate(20deg);transform-origin:bottom}
+
+/* Potentiometer */
+.symbol-pot__terminal{position:absolute;background:#aeb8bd}.symbol-pot__terminal--left{top:0;left:51px;width:2px;height:20px}.symbol-pot__terminal--right{top:55px;right:0;width:27px;height:2px}.symbol-pot__terminal--wiper{bottom:0;left:51px;width:2px;height:39px}
+.symbol-pot__case{position:absolute;top:19px;left:25px;width:55px;height:55px;border:3px solid #7a858a;border-radius:50%;background:#263139;box-shadow:0 5px 9px #0007}.symbol-pot__dial{position:absolute;inset:8px;border-radius:50%;background:#aeb7b9}.symbol-pot__wiper{position:absolute;top:4px;left:16px;width:3px;height:14px;border-radius:2px;background:#35434a;transform:rotate(calc(var(--symbol-pot-value) * 2.7));transform-origin:bottom}.symbol-pot__index{position:absolute;top:4px;left:25px;width:3px;height:8px;background:#d8e1e2}
+
+/* Seven-segment */
+.symbol-seven-segment__case{position:absolute;inset:9px 13px;border:2px solid #343b41;border-radius:7px;background:#15191d;box-shadow:inset 0 0 15px #000,0 5px 10px #0007}.symbol-seven-segment__digit{position:absolute;inset:17px 20px}.symbol-seven-segment__segment{position:absolute;border-radius:4px;background:color-mix(in srgb,var(--symbol-display-color) 30%,#351417);box-shadow:inset 0 0 4px #000}.schematic-symbol--powered .symbol-seven-segment__segment{background:var(--symbol-display-color);box-shadow:0 0 8px var(--symbol-display-color)}
+.symbol-seven-segment__segment--a,.symbol-seven-segment__segment--d,.symbol-seven-segment__segment--g{left:11px;width:42px;height:7px}.symbol-seven-segment__segment--a{top:0}.symbol-seven-segment__segment--g{top:52px}.symbol-seven-segment__segment--d{bottom:0}.symbol-seven-segment__segment--b,.symbol-seven-segment__segment--c,.symbol-seven-segment__segment--e,.symbol-seven-segment__segment--f{width:7px;height:43px}.symbol-seven-segment__segment--b{top:7px;right:0}.symbol-seven-segment__segment--c{right:0;bottom:7px}.symbol-seven-segment__segment--f{top:7px;left:0}.symbol-seven-segment__segment--e{bottom:7px;left:0}.symbol-seven-segment__segment--dp{right:-13px;bottom:0;width:8px;height:8px;border-radius:50%}
+
+/* LCD */
+.symbol-lcd__pcb{position:absolute;inset:10px;border:2px solid #2a79bc;border-radius:6px;background:#1765a8;box-shadow:inset 0 0 13px #0b3c70,0 7px 13px #0007}.symbol-lcd__mount{position:absolute;width:9px;height:9px;border-radius:50%;background:#0b2537;box-shadow:inset 0 0 0 2px #7fb4cf}.symbol-lcd__mount--top-left{top:5px;left:5px}.symbol-lcd__mount--top-right{top:5px;right:5px}.symbol-lcd__mount--bottom-left{bottom:5px;left:5px}.symbol-lcd__mount--bottom-right{right:5px;bottom:5px}.symbol-lcd__bezel{position:absolute;inset:18px 23px;border:5px solid #263742;border-radius:4px;background:#0e171c}.symbol-lcd__screen{position:absolute;inset:5px;display:flex;flex-direction:column;padding:7px 10px;background:#9bd8e4;color:#174d58;box-shadow:inset 0 0 12px #2a7a8e99;font:8px/1.7 var(--font-mono);letter-spacing:.08em}.symbol-lcd__screen b{font-weight:700;white-space:pre}
+
+/* Buzzer */
+.symbol-buzzer__lead{position:absolute;left:45px;width:2px;background:#aeb8bd}.symbol-buzzer__lead--positive{top:0;height:15px}.symbol-buzzer__lead--negative{top:73px;height:19px}.symbol-buzzer__case{position:absolute;top:14px;left:16px;width:60px;height:60px;border:3px solid #4e5961;border-radius:50%;background:radial-gradient(circle,#090d10 0 9px,#222b31 10px 100%);box-shadow:0 6px 10px #0008}.symbol-buzzer__aperture{position:absolute;inset:18px;border-radius:50%;background:#050708}.symbol-buzzer__polarity{position:absolute;top:5px;left:9px;color:#d6dde0;font:11px var(--font-mono)}.symbol-buzzer__wave{position:absolute;border:2px solid #71808a;border-left:0;border-top-color:transparent;border-bottom-color:transparent;border-radius:50%}.symbol-buzzer__wave--near{top:27px;right:5px;width:13px;height:34px}.symbol-buzzer__wave--far{top:18px;right:-8px;width:22px;height:52px}
+
+/* Servo */
+.symbol-servo__case{position:absolute;top:25px;left:20px;width:100px;height:70px;border:3px solid #53738f;border-radius:7px;background:linear-gradient(#3b74a5,#28567f);box-shadow:0 6px 12px #0007}.symbol-servo__mount{position:absolute;top:24px;width:22px;height:17px;border-radius:3px;background:#35688f}.symbol-servo__mount--left{left:-22px}.symbol-servo__mount--right{right:-22px}.symbol-servo__hub{position:absolute;top:-16px;left:34px;width:32px;height:32px;border:4px solid #d3dadd;border-radius:50%;background:#7e8d93}.symbol-servo__horn{position:absolute;top:-7px;left:7px;width:85px;height:8px;border-radius:5px;background:#e0e5e6;transform:rotate(var(--symbol-servo-angle));transform-origin:center}.symbol-servo__label{position:absolute;right:9px;bottom:8px;color:#b8d7ee;font:8px var(--font-mono)}.symbol-servo__cable{position:absolute;left:0;bottom:11px;width:42px;height:22px}.symbol-servo__wire{position:absolute;left:0;width:42px;height:2px}.symbol-servo__wire--signal{top:3px;background:#f0c84c}.symbol-servo__wire--power{top:10px;background:#dd4a4a}.symbol-servo__wire--ground{top:17px;background:#27323a}
+
+/* DC motor */
+.symbol-motor__terminal{position:absolute;top:47px;width:18px;height:3px;background:#aeb8bd}.symbol-motor__terminal--positive{left:0}.symbol-motor__terminal--negative{right:0}.symbol-motor__can{position:absolute;top:16px;left:18px;width:62px;height:64px;border:3px solid #808d92;border-radius:12px 8px 8px 12px;background:linear-gradient(90deg,#737f82,#c0c9c8 50%,#5a676c);box-shadow:0 6px 10px #0007}.symbol-motor__vent{position:absolute;top:13px;width:6px;height:38px;border-radius:3px;background:#39464b}.symbol-motor__vent--one{left:18px}.symbol-motor__vent--two{left:33px}.symbol-motor__polarity{position:absolute;top:4px;left:5px;color:#ef5757}.symbol-motor__endbell{position:absolute;top:22px;right:9px;width:14px;height:52px;border-radius:0 7px 7px 0;background:#343f44}.symbol-motor__shaft{position:absolute;top:44px;right:-3px;width:20px;height:7px;background:#c2cbcc}
+
+/* DIP motor driver */
+.symbol-dip__body{position:absolute;top:12px;bottom:12px;left:24px;right:24px;border-radius:8px;background:#171c20;box-shadow:inset 0 0 18px #000,0 7px 12px #0008}.symbol-dip__notch{position:absolute;top:-1px;left:50%;width:30px;height:13px;border-radius:0 0 16px 16px;background:#091017;transform:translateX(-50%)}.symbol-dip__pin-one{position:absolute;top:17px;left:10px;width:7px;height:7px;border-radius:50%;background:#626d72}.symbol-dip__label{position:absolute;top:46%;left:50%;color:#a7b0b3;font:700 12px var(--font-mono);transform:translate(-50%,-50%)}.symbol-dip__sub-label{position:absolute;top:57%;left:50%;color:#57636a;font:6px var(--font-mono);transform:translateX(-50%)}.symbol-dip__legs{position:absolute;top:19px;bottom:19px;display:flex;flex-direction:column;justify-content:space-between}.symbol-dip__legs--left{left:7px}.symbol-dip__legs--right{right:7px}.symbol-dip__leg{width:26px;height:6px;background:#aeb7b9}.symbol-dip__legs--left .symbol-dip__leg{border-radius:3px 0 0 3px}.symbol-dip__legs--right .symbol-dip__leg{border-radius:0 3px 3px 0}
+
+/* IEC-style logic symbols */
+.symbol-gate__body{position:absolute;top:15px;left:24px;width:64px;height:50px;border:2px solid #c5d0d5;background:#0b131a}.symbol-gate__body--and,.symbol-gate__body--nand{border-radius:3px 26px 26px 3px}.symbol-gate__body--or,.symbol-gate__body--nor,.symbol-gate__body--xor{border-radius:50% 28px 28px 50%}.symbol-gate__body--not{clip-path:polygon(0 0,100% 50%,0 100%);border:0;background:#c5d0d5}.symbol-gate__operator{display:grid;height:100%;place-items:center;color:#bfcbd0;font:16px var(--font-mono)}.symbol-gate__input,.symbol-gate__output{position:absolute;height:2px;background:#c5d0d5}.symbol-gate__input{left:0;width:25px}.symbol-gate__input--a{top:27px}.symbol-gate__input--b{top:53px}.symbol-gate__input--single{top:39px}.symbol-gate__output{top:39px;right:0;width:25px}.symbol-gate__inversion-bubble{position:absolute;top:34px;right:20px;width:10px;height:10px;border:2px solid #c5d0d5;border-radius:50%;background:#091017}
+
+/* HC-SR04 */
+.symbol-ultrasonic__pcb{position:absolute;inset:11px 7px;border:2px solid #2d91a7;border-radius:5px;background:#16758a;box-shadow:inset 0 0 12px #08475a,0 6px 11px #0007}.symbol-ultrasonic__transducer{position:absolute;top:13px;width:51px;height:51px;border:4px solid #aeb9bb;border-radius:50%;background:radial-gradient(circle,#54656b 0 14px,#86969a 15px 19px,#c6cecf 20px);box-shadow:0 3px 6px #0007}.symbol-ultrasonic__transducer--trigger{left:21px}.symbol-ultrasonic__transducer--echo{right:21px}.symbol-ultrasonic__label{position:absolute;bottom:3px;left:50%;color:#b7e3ea;font:7px var(--font-mono);transform:translateX(-50%)}.symbol-ultrasonic__mount{position:absolute;width:8px;height:8px;border-radius:50%;background:#0b3440}.symbol-ultrasonic__mount--left{top:4px;left:4px}.symbol-ultrasonic__mount--right{top:4px;right:4px}
+
+/* PIR sensor */
+.symbol-pir__pcb{position:absolute;inset:9px;border:2px solid #2d8a67;border-radius:6px;background:#176347;box-shadow:inset 0 0 12px #0b3c2b,0 6px 11px #0007}.symbol-pir__lens{position:absolute;top:11px;left:24px;width:48px;height:48px;border-radius:50%;background:radial-gradient(circle,#f0f1e8 0 5px,#d7ddd7 6px 15px,#b9c2bf 16px 24px);box-shadow:inset 0 0 8px #fff,0 4px 8px #0005}.symbol-pir__lens-ring{position:absolute;border:1px solid #a6b0ad66;border-radius:50%}.symbol-pir__lens-ring--outer{inset:5px}.symbol-pir__lens-ring--middle{inset:11px}.symbol-pir__lens-ring--inner{inset:17px}.symbol-pir__trimmer{position:absolute;bottom:8px;width:17px;height:17px;border-radius:50%;background:#4b78aa;box-shadow:inset 0 0 0 3px #2b4d73}.symbol-pir__trimmer--delay{left:15px}.symbol-pir__trimmer--sensitivity{right:15px}.symbol-pir__mount{position:absolute;top:5px;width:6px;height:6px;border-radius:50%;background:#092c20}.symbol-pir__mount--left{left:5px}.symbol-pir__mount--right{right:5px}
+
+/* Generic fallback remains a physical IC, never a dashboard card. */
+.symbol-generic__body{position:absolute;top:17px;bottom:17px;left:25px;right:25px;border-radius:5px;background:#171d21;box-shadow:inset 0 0 10px #000}.symbol-generic__lead{position:absolute;top:39px;width:25px;height:2px;background:#adb7ba}.symbol-generic__lead--left{left:0}.symbol-generic__lead--right{right:0}.symbol-generic__notch{position:absolute;top:-1px;left:50%;width:17px;height:8px;border-radius:0 0 8px 8px;background:#091017;transform:translateX(-50%)}.symbol-generic__label{display:grid;height:100%;place-items:center;color:#7e8b90;font:8px var(--font-mono)}
+
+@media (prefers-reduced-motion: reduce) {
+  .schematic-grid { transition: none !important; }
+}

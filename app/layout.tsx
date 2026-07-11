@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import "./schematic-symbols.css";
 
 const title = "AI Circuit Studio — Prompt, wire, simulate";
 const description =

@@ -8,10 +8,12 @@ const GROQ_TIMEOUT_MS = 45_000;
 
 const COMPONENT_CATALOG = {
   "arduino-uno": [
+    "IOREF",
     "5V",
     "3V3",
     "GND",
     "GND2",
+    "GND3",
     "VIN",
     "RESET",
     "AREF",
@@ -35,6 +37,8 @@ const COMPONENT_CATALOG = {
     "A3",
     "A4",
     "A5",
+    "SDA",
+    "SCL",
   ],
   led: ["A", "K"],
   "rgb-led": ["R", "G", "B", "COM"],

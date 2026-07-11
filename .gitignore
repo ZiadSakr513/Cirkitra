@@ -33,6 +33,7 @@ yarn-error.log*
 !.env.example
 /.npm-cache/
 .dev-server.*
+.dev-server-*
 .preview-server.*
 
 # vercel
