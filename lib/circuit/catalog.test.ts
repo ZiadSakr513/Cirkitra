@@ -32,3 +32,9 @@ test("new Uno R3 pins are accepted by catalog diagnostics", () => {
     );
   }
 });
+
+test("Ground is a simulated one-pin catalog component", () => {
+  assert.equal(COMPONENT_CATALOG.ground.simulated, true);
+  assert.deepEqual(COMPONENT_CATALOG.ground.pins.map((pin) => pin.id), ["GND"]);
+  assert.deepEqual(COMPONENT_CATALOG.ground.pins[0].signals, ["ground"]);
+});

@@ -174,6 +174,28 @@ function binaryGate(
  * may change, but saved projects and AI output must use the IDs exactly.
  */
 export const COMPONENT_CATALOG = {
+  ground: {
+    id: "ground",
+    displayName: "Ground",
+    category: "passives",
+    description: "Zero-volt reference terminal for clean ground returns.",
+    width: 56,
+    height: 58,
+    accent: "#8fa5b5",
+    simulated: true,
+    pins: [
+      {
+        id: "GND",
+        label: "GND",
+        direction: "power",
+        signals: ["ground"],
+        side: "top",
+        order: 0,
+      },
+    ],
+    properties: {},
+    defaultProperties: {},
+  },
   "arduino-uno": {
     id: "arduino-uno",
     displayName: "Arduino Uno",

@@ -1,4 +1,5 @@
 import { diagnoseCircuit, type CircuitDiagnostic } from "./diagnostics.ts";
+import { normalizeGroundReturns } from "./project.ts";
 import {
   safeParseCircuitProject,
   type ValidationIssue,
@@ -153,11 +154,12 @@ export function importCircuitProject(
     };
   }
 
+  const normalized = normalizeGroundReturns(validation.data);
   return {
     ok: true,
-    project: validation.data,
+    project: normalized,
     migratedFrom: migration.migratedFrom,
-    diagnostics: diagnoseCircuit(validation.data),
+    diagnostics: diagnoseCircuit(normalized),
   };
 }
 

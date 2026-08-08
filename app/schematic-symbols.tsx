@@ -357,12 +357,25 @@ function GenericSymbol({ type, powered }: { type: string; powered: boolean }) {
   );
 }
 
+function GroundSymbol() {
+  return (
+    <div className={symbolClass("ground", false)} aria-hidden="true">
+      <i className="symbol-ground__lead" />
+      <i className="symbol-ground__bar symbol-ground__bar--wide" />
+      <i className="symbol-ground__bar symbol-ground__bar--middle" />
+      <i className="symbol-ground__bar symbol-ground__bar--narrow" />
+    </div>
+  );
+}
+
 export function SchematicSymbol({
   type,
   properties = {},
   powered = false,
 }: SchematicSymbolProps) {
   switch (type) {
+    case "ground":
+      return <GroundSymbol />;
     case "arduino-uno":
       return <ArduinoUnoSymbol powered={powered} />;
     case "led":

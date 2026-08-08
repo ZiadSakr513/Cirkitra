@@ -88,6 +88,7 @@ const DEFAULT_COMPONENT_SIZE: Readonly<ComponentSize> = {
  * groups (especially the Uno headers and DIP packages) remain selectable.
  */
 const COMPONENT_SIZES: Readonly<Record<string, Readonly<ComponentSize>>> = {
+  ground: { width: 56, height: 58 },
   "arduino-uno": { width: 320, height: 350 },
   led: { width: 72, height: 104 },
   "rgb-led": { width: 88, height: 112 },

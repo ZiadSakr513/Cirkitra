@@ -85,7 +85,12 @@ function reachableBoardPins(
 
     const endpoint = graph.endpoints.get(key);
     if (!endpoint) continue;
-    if (graph.componentTypes.get(endpoint.componentId) === "arduino-uno") {
+    const componentType = graph.componentTypes.get(endpoint.componentId);
+    if (componentType === "ground") {
+      boardPins.add("GND");
+      continue;
+    }
+    if (componentType === "arduino-uno") {
       boardPins.add(endpoint.pin);
       continue;
     }

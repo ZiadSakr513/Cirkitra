@@ -1,3 +1,8 @@
+import {
+  normalizeGroundReturns,
+  type CircuitProject as SharedCircuitProject,
+} from "../../../../lib/circuit/index.ts";
+
 const GEMINI_API_BASE_URL =
   "https://generativelanguage.googleapis.com/v1beta/models";
 const GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite"] as const;
@@ -9,6 +14,7 @@ const MAX_REQUEST_BYTES = 100_000;
 const GEMINI_TIMEOUT_MS = 45_000;
 
 const COMPONENT_CATALOG = {
+  ground: ["GND"],
   "arduino-uno": [
     "IOREF",
     "5V",
@@ -252,7 +258,7 @@ Rules:
 - Include exactly one arduino-uno component. Every connection endpoint must reference a component ID in the project and a valid pin for that component type.
 - Use unique, identifier-safe IDs (letters first, then letters, digits, hyphens, or underscores).
 - Use only supported parts. If a request needs an unsupported or analog/SPICE-only part, build the closest useful supported alternative and explain the limitation in warnings.
-- Add current-limiting resistors for LEDs, shared grounds where required, and a driver stage for DC motors. Do not create power-to-ground shorts or connect two actively driven outputs together.
+- Add current-limiting resistors for LEDs and a driver stage for DC motors. Use the Arduino GND, GND2, and GND3 pins once each before adding ground components. If more than three returns need ground, add one separate ground component beside each remaining load and connect its GND pin. Never send several return wires to the same Arduino ground pin. Do not create power-to-ground shorts or connect two actively driven outputs together.
 - Produce ordinary Arduino Uno C++ containing void setup() and void loop(). Keep pin assignments exactly consistent with the connections.
 - Use a compact, non-overlapping layout with its top-left near x=64, y=64. Keep the full circuit within roughly 1100 by 650 when practical.
 - Use bright, high-contrast hex colors for wires on the dark canvas (for example #42d7bd, #f59e0b, #ef4444, or #68a7ff). Never use black or near-black wire colors.
@@ -613,7 +619,15 @@ function validateGeneratedEnvelope(value: unknown): ValidationResult {
 
   return issues.length
     ? { ok: false, issues: [...new Set(issues)].slice(0, 20) }
-    : { ok: true, value: envelope };
+    : {
+        ok: true,
+        value: {
+          ...envelope,
+          project: normalizeGroundReturns(
+            envelope.project as unknown as SharedCircuitProject,
+          ) as unknown as GeneratedEnvelope["project"],
+        },
+      };
 }
 
 function parseModelJson(content: string): unknown {

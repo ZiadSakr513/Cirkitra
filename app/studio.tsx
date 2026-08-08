@@ -16,6 +16,7 @@ import {
   createDefaultBlinkProject,
   createDefaultProperties,
   getComponentDefinition,
+  normalizeGroundReturns,
   removeComponentFromProject,
   removeComponentsFromProject,
   safeParseCircuitProject,
@@ -49,7 +50,7 @@ const GEMINI_MODEL_LABELS: Record<GeminiModel, string> = {
   "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite",
 };
 const WIRE_COLORS = ["#ffb547", "#ff6b6b", "#56d7c3", "#68a7ff", "#b38cff"];
-const PALETTE_CATEGORIES = ["all", "boards", "inputs", "outputs", "displays", "sensors", "logic"] as const;
+const PALETTE_CATEGORIES = ["all", "boards", "passives", "inputs", "outputs", "displays", "sensors", "logic"] as const;
 
 type SideTab = "assistant" | "inspector";
 type BottomTab = "code" | "serial" | "problems";
@@ -172,6 +173,7 @@ function resizePanel(
 const CATEGORY_LABELS: Record<string, string> = {
   all: "All",
   boards: "Boards",
+  passives: "Passives",
   inputs: "Input",
   outputs: "Output",
   displays: "Display",
@@ -201,6 +203,7 @@ const PART_GLYPHS: Record<string, string> = {
   "hc-sr04": "SON",
   "pir-sensor": "PIR",
   "arduino-uno": "UNO",
+  ground: "GND",
 };
 
 function uid(prefix: string) {
@@ -329,14 +332,15 @@ export function CircuitStudio() {
   };
 
   const commitProject = useCallback((next: CircuitProject) => {
-    const copy = deepClone(next);
+    const normalized = normalizeGroundReturns(next);
+    const copy = deepClone(normalized);
     const nextHistory = historyRef.current.slice(0, historyIndex + 1);
     nextHistory.push(copy);
     if (nextHistory.length > 60) nextHistory.shift();
     historyRef.current = nextHistory;
     setHistoryIndex(nextHistory.length - 1);
     setHistoryLength(nextHistory.length);
-    setProject(next);
+    setProject(normalized);
     setBuildState("idle");
   }, [historyIndex]);
 
@@ -346,9 +350,10 @@ export function CircuitStudio() {
       if (saved) {
         const parsed = safeParseCircuitProject(JSON.parse(saved));
         if (parsed.success) {
+          const normalized = normalizeGroundReturns(parsed.data);
           queueMicrotask(() => {
-            setProject(parsed.data);
-            historyRef.current = [deepClone(parsed.data)];
+            setProject(normalized);
+            historyRef.current = [deepClone(normalized)];
             setHistoryIndex(0);
             setHistoryLength(1);
           });

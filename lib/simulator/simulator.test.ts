@@ -187,3 +187,18 @@ test("does not light an LED whose cathode is not connected", () => {
   assert.deepEqual(binding?.cathodeBoardPins, []);
   assert.equal(isLedCircuitPowered(binding, simulator.getSnapshot()), false);
 });
+
+test("treats a Ground component as the zero-volt reference", () => {
+  const project = createDefaultBlinkProject();
+  project.components.push({ id: "ground1", type: "ground", label: "GND", x: 500, y: 350 });
+  project.connections = project.connections.map((connection) => connection.id === "wire-led-gnd"
+    ? { ...connection, to: { componentId: "ground1", pin: "GND" } }
+    : connection);
+  const binding = resolveLedCircuitBindings(project).get("led1");
+  const simulator = new ArduinoSimulator(project.code);
+  simulator.run();
+  simulator.advance(0);
+
+  assert.deepEqual(binding?.cathodeBoardPins, ["GND"]);
+  assert.equal(isLedCircuitPowered(binding, simulator.getSnapshot()), true);
+});
