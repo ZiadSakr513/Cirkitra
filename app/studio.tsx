@@ -971,7 +971,6 @@ export function CircuitStudio() {
             ))}
             {!parts.length && <p className="empty-note">No supported parts match that search.</p>}
           </div>
-          <div className="library-note"><span>{SUPPORTED_COMPONENT_TYPES.length}</span><p><strong>Simulation-ready parts</strong><br />Every listed part is understood by the AI circuit schema.</p></div>
           <button
             type="button"
             role="separator"
