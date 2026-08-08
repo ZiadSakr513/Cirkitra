@@ -67,6 +67,16 @@ test("canvas marquee selects and deletes multiple components", async () => {
   assert.match(source, /Delete removes all/);
 });
 
+test("select all and bulk delete work even when a canvas button has focus", async () => {
+  const source = await readFile(studioUrl, "utf8");
+
+  assert.match(source, /const selectAllComponents = useCallback/);
+  assert.match(source, /projectRef\.current\.components\.map\(\(component\) => component\.id\)/);
+  assert.match(source, /event\.key\.toLowerCase\(\) === "a"/);
+  assert.match(source, /if \(!editing && \(event\.key === "Delete" \|\| event\.key === "Backspace"\)/);
+  assert.doesNotMatch(source, /if \(!interactive && \(event\.key === "Delete" \|\| event\.key === "Backspace"\)/);
+});
+
 test("pan mode still allows components to be dragged", async () => {
   const source = await readFile(studioUrl, "utf8");
   const beginDrag = source.match(

@@ -519,6 +519,13 @@ export function CircuitStudio() {
     announce(existingIds.length === 1 ? "Component removed" : `${existingIds.length} components removed`);
   }, [announce, commitProject, selectedIds]);
 
+  const selectAllComponents = useCallback(() => {
+    const componentIds = projectRef.current.components.map((component) => component.id);
+    setSelectedIds(componentIds);
+    if (componentIds.length > 1) setSideTab("inspector");
+    announce(componentIds.length ? `${componentIds.length} components selected` : "No components to select");
+  }, [announce]);
+
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
@@ -532,7 +539,11 @@ export function CircuitStudio() {
         event.preventDefault();
         if (event.shiftKey) redo(); else undo();
       }
-      if (!interactive && (event.key === "Delete" || event.key === "Backspace") && selectedIds.length) {
+      if (!editing && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
+        event.preventDefault();
+        selectAllComponents();
+      }
+      if (!editing && (event.key === "Delete" || event.key === "Backspace") && selectedIds.length) {
         event.preventDefault();
         removeSelectedComponents();
       }
@@ -549,7 +560,7 @@ export function CircuitStudio() {
       window.removeEventListener("keyup", keyup);
       window.removeEventListener("blur", blur);
     };
-  }, [redo, removeSelectedComponents, selectedIds.length, undo]);
+  }, [redo, removeSelectedComponents, selectAllComponents, selectedIds.length, undo]);
 
   const selectedId = selectedIds.length === 1 ? selectedIds[0] : null;
   const selected = project.components.find((component) => component.id === selectedId) ?? null;
