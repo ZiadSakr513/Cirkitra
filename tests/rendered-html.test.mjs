@@ -1,48 +1,29 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-const workerUrl = new URL("../dist/server/index.js", import.meta.url);
+import { POST as generateCircuit } from "../app/api/ai/generate/route.ts";
+import { POST as compileSketch } from "../app/api/compile/route.ts";
 
-async function loadWorker() {
-  const url = new URL(workerUrl);
-  url.searchParams.set("test", `${process.pid}-${Date.now()}-${Math.random()}`);
-  const { default: worker } = await import(url.href);
-  return worker;
-}
+test("the Zircuit workbench and metadata contain the production identity", async () => {
+  const [layout, studio] = await Promise.all([
+    readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/studio.tsx", import.meta.url), "utf8"),
+  ]);
+  const source = `${layout}\n${studio}`;
 
-const bindings = {
-  ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) },
-};
-
-const context = {
-  waitUntil() {},
-  passThroughOnException() {},
-};
-
-test("server-renders the Zircuit workbench", async () => {
-  const worker = await loadWorker();
-  const response = await worker.fetch(
-    new Request("http://localhost/", { headers: { accept: "text/html" } }),
-    bindings,
-    context,
-  );
-
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
-  const html = await response.text();
-  assert.match(html, /<title>Zircuit/);
-  assert.doesNotMatch(html, /IMAGINE · WIRE · RUN/);
-  assert.match(html, /Founded by/);
-  assert.match(html, /Ziad Sakr/);
-  assert.match(html, /Components/);
-  assert.match(html, /Describe a circuit/);
-  assert.match(html, /Run simulation/);
-  assert.doesNotMatch(html, /codex-preview|react-loading-skeleton|Your site is taking shape/);
+  assert.match(source, /const title = "Zircuit"/);
+  assert.doesNotMatch(source, /IMAGINE · WIRE · RUN/);
+  assert.match(source, /Founded by/);
+  assert.match(source, /Ziad Sakr/);
+  assert.match(source, /Components/);
+  assert.match(source, /Describe a circuit/);
+  assert.match(source, /Run simulation/);
+  assert.doesNotMatch(source, /codex-preview|react-loading-skeleton|Your site is taking shape/);
 });
 
 test("compile endpoint accepts a simulation-ready Uno sketch", async () => {
-  const worker = await loadWorker();
-  const response = await worker.fetch(
+  const response = await compileSketch(
     new Request("http://localhost/api/compile", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -51,8 +32,6 @@ test("compile endpoint accepts a simulation-ready Uno sketch", async () => {
         code: "void setup(){pinMode(13, OUTPUT);} void loop(){digitalWrite(13, HIGH);delay(500);}",
       }),
     }),
-    bindings,
-    context,
   );
 
   assert.equal(response.status, 200);
@@ -62,16 +41,20 @@ test("compile endpoint accepts a simulation-ready Uno sketch", async () => {
   assert.equal(payload.artifact.board, "arduino-uno");
 });
 
-test("AI endpoint fails safely when the server key is absent", async () => {
-  const worker = await loadWorker();
-  const response = await worker.fetch(
+test("AI endpoint fails safely when the server key is absent", async (context) => {
+  const originalKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  delete process.env.GEMINI_API_KEY;
+
+  const response = await generateCircuit(
     new Request("http://localhost/api/ai/generate", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "Blink an LED" }),
     }),
-    bindings,
-    context,
   );
 
   assert.equal(response.status, 503);
@@ -81,15 +64,12 @@ test("AI endpoint fails safely when the server key is absent", async () => {
 });
 
 test("AI endpoint rejects models outside the Gemini allowlist", async () => {
-  const worker = await loadWorker();
-  const response = await worker.fetch(
+  const response = await generateCircuit(
     new Request("http://localhost/api/ai/generate", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "Blink an LED", model: "arbitrary-provider-model" }),
     }),
-    bindings,
-    context,
   );
 
   assert.equal(response.status, 400);

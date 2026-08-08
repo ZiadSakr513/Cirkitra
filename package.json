@@ -6,9 +6,12 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "dev": "vinext dev",
-    "build": "vinext build",
-    "start": "vinext start",
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "dev:sites": "vinext dev",
+    "build:sites": "vinext build",
+    "start:sites": "vinext start",
     "test": "npm run build && node --experimental-transform-types --test tests/rendered-html.test.mjs tests/no-canned-ai.test.mjs tests/studio-components.test.mjs app/api/ai/generate/route.test.ts lib/circuit/catalog.test.ts lib/circuit/project.test.ts lib/schematic/geometry.test.ts lib/simulator/simulator.test.ts",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern work --ignore-pattern outputs",
     "db:generate": "drizzle-kit generate"

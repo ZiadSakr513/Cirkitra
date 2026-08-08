@@ -348,7 +348,7 @@ export function centerComponentsAtOrigin<T extends SchematicComponentLike>(
 
   const bounds = validComponents
     .map(componentBounds)
-    .reduce<Bounds>((combined, current) => ({
+    .reduce((combined, current) => ({
       left: Math.min(combined.left, current.left),
       top: Math.min(combined.top, current.top),
       right: Math.max(combined.right, current.right),
@@ -406,7 +406,7 @@ export function fitViewport(
 
   const bounds = validComponents
     .map(componentBounds)
-    .reduce<Bounds>((combined, current) => ({
+    .reduce((combined, current) => ({
       left: Math.min(combined.left, current.left),
       top: Math.min(combined.top, current.top),
       right: Math.max(combined.right, current.right),
