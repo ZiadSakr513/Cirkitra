@@ -41,12 +41,22 @@ export interface WireSegment {
   to: Point;
 }
 
+export interface WireRouteEndpoint {
+  point: Point;
+  side: SchematicPinSide;
+}
+
 /**
  * A transform where `screenPoint = worldPoint * zoom + pan`.
  */
 export interface ViewportTransform {
   zoom: number;
   pan: Point;
+}
+
+export interface ViewportZoomLimits {
+  minZoom?: number;
+  maxZoom?: number;
 }
 
 const DEFAULT_COMPONENT_SIZE: Readonly<ComponentSize> = {
@@ -204,6 +214,96 @@ export function orthogonalWireSegments(
   ];
 }
 
+function escapePoint(endpoint: WireRouteEndpoint, clearance: number): Point {
+  switch (endpoint.side) {
+    case "top": return { x: endpoint.point.x, y: endpoint.point.y - clearance };
+    case "right": return { x: endpoint.point.x + clearance, y: endpoint.point.y };
+    case "bottom": return { x: endpoint.point.x, y: endpoint.point.y + clearance };
+    case "left": return { x: endpoint.point.x - clearance, y: endpoint.point.y };
+  }
+}
+
+function segmentLength(segment: WireSegment) {
+  return Math.abs(segment.to.x - segment.from.x) + Math.abs(segment.to.y - segment.from.y);
+}
+
+function segmentCrossesBounds(segment: WireSegment, bounds: Bounds) {
+  if (segment.from.y === segment.to.y) {
+    const y = segment.from.y;
+    const left = Math.min(segment.from.x, segment.to.x);
+    const right = Math.max(segment.from.x, segment.to.x);
+    return y > bounds.top && y < bounds.bottom && right > bounds.left && left < bounds.right;
+  }
+  const x = segment.from.x;
+  const top = Math.min(segment.from.y, segment.to.y);
+  const bottom = Math.max(segment.from.y, segment.to.y);
+  return x > bounds.left && x < bounds.right && bottom > bounds.top && top < bounds.bottom;
+}
+
+function segmentsFromPoints(points: readonly Point[]): WireSegment[] {
+  const compact = points.filter((point, index) => index === 0 || point.x !== points[index - 1].x || point.y !== points[index - 1].y);
+  return compact.slice(1).map((point, index) => ({ from: compact[index], to: point }));
+}
+
+/**
+ * Route a wire away from each pin in the direction that pin faces, then choose
+ * the shortest orthogonal channel that does not cross a component body.
+ */
+export function pinAwareWireSegments(
+  from: WireRouteEndpoint,
+  to: WireRouteEndpoint,
+  components: readonly SchematicComponentLike[],
+  clearance = 18,
+): WireSegment[] {
+  const safeClearance = Number.isFinite(clearance) ? Math.max(8, clearance) : 18;
+  const start = escapePoint(from, safeClearance);
+  const end = escapePoint(to, safeClearance);
+  const obstacles = components.map((component) => {
+    const bounds = componentBounds(component);
+    return {
+      left: bounds.left - safeClearance,
+      top: bounds.top - safeClearance,
+      right: bounds.right + safeClearance,
+      bottom: bounds.bottom + safeClearance,
+    };
+  });
+  const minLeft = Math.min(start.x, end.x, ...obstacles.map((bounds) => bounds.left)) - safeClearance;
+  const maxRight = Math.max(start.x, end.x, ...obstacles.map((bounds) => bounds.right)) + safeClearance;
+  const minTop = Math.min(start.y, end.y, ...obstacles.map((bounds) => bounds.top)) - safeClearance;
+  const maxBottom = Math.max(start.y, end.y, ...obstacles.map((bounds) => bounds.bottom)) + safeClearance;
+  const xChannels = new Set([start.x, end.x, (start.x + end.x) / 2, minLeft, maxRight]);
+  const yChannels = new Set([start.y, end.y, (start.y + end.y) / 2, minTop, maxBottom]);
+  for (const bounds of obstacles) {
+    xChannels.add(bounds.left);
+    xChannels.add(bounds.right);
+    yChannels.add(bounds.top);
+    yChannels.add(bounds.bottom);
+  }
+
+  const candidates: Point[][] = [
+    [start, { x: end.x, y: start.y }, end],
+    [start, { x: start.x, y: end.y }, end],
+  ];
+  for (const x of xChannels) candidates.push([start, { x, y: start.y }, { x, y: end.y }, end]);
+  for (const y of yChannels) candidates.push([start, { x: start.x, y }, { x: end.x, y }, end]);
+
+  const validRoutes = candidates
+    .map(segmentsFromPoints)
+    .filter((segments) => segments.every((segment) => obstacles.every((bounds) => !segmentCrossesBounds(segment, bounds))))
+    .sort((a, b) => {
+      const lengthDifference = a.reduce((sum, segment) => sum + segmentLength(segment), 0) -
+        b.reduce((sum, segment) => sum + segmentLength(segment), 0);
+      return lengthDifference || a.length - b.length;
+    });
+  const middle = validRoutes[0] ?? segmentsFromPoints([start, { x: minLeft, y: start.y }, { x: minLeft, y: minTop }, { x: end.x, y: minTop }, end]);
+
+  return [
+    { from: { ...from.point }, to: start },
+    ...middle,
+    { from: end, to: { ...to.point } },
+  ].filter((segment) => segmentLength(segment) > 0);
+}
+
 interface Bounds {
   left: number;
   top: number;
@@ -234,6 +334,37 @@ function componentBounds(component: SchematicComponentLike): Bounds {
 }
 
 /**
+ * Center a complete layout on world origin while preserving every component's
+ * relative position. Generated projects use this before the viewport is fit so
+ * the 0,0 crosshair remains the stable center of each new circuit.
+ */
+export function centerComponentsAtOrigin<T extends SchematicComponentLike>(
+  components: readonly T[],
+): T[] {
+  const validComponents = components.filter(
+    (component) => Number.isFinite(component.x) && Number.isFinite(component.y),
+  );
+  if (validComponents.length === 0) return [...components];
+
+  const bounds = validComponents
+    .map(componentBounds)
+    .reduce<Bounds>((combined, current) => ({
+      left: Math.min(combined.left, current.left),
+      top: Math.min(combined.top, current.top),
+      right: Math.max(combined.right, current.right),
+      bottom: Math.max(combined.bottom, current.bottom),
+    }));
+  const offsetX = -(bounds.left + bounds.right) / 2;
+  const offsetY = -(bounds.top + bounds.bottom) / 2;
+
+  return components.map((component) => ({
+    ...component,
+    x: component.x + offsetX,
+    y: component.y + offsetY,
+  }));
+}
+
+/**
  * Compute a centered fit transform for any set of world-space components,
  * including layouts left of or above the world origin.
  */
@@ -242,6 +373,7 @@ export function fitViewport(
   viewportWidth: number,
   viewportHeight: number,
   padding = 48,
+  zoomLimits: ViewportZoomLimits = {},
 ): ViewportTransform {
   const safeViewportWidth = Number.isFinite(viewportWidth)
     ? Math.max(0, viewportWidth)
@@ -253,9 +385,18 @@ export function fitViewport(
   const validComponents = components.filter(
     (component) => Number.isFinite(component.x) && Number.isFinite(component.y),
   );
+  const requestedMinZoom = Number.isFinite(zoomLimits.minZoom)
+    ? Math.max(0.01, zoomLimits.minZoom ?? 0.01)
+    : 0.01;
+  const requestedMaxZoom = Number.isFinite(zoomLimits.maxZoom)
+    ? Math.max(0.01, zoomLimits.maxZoom ?? Number.POSITIVE_INFINITY)
+    : Number.POSITIVE_INFINITY;
+  const minZoom = Math.min(requestedMinZoom, requestedMaxZoom);
+  const maxZoom = Math.max(requestedMinZoom, requestedMaxZoom);
+
   if (validComponents.length === 0) {
     return {
-      zoom: 1,
+      zoom: Math.min(maxZoom, Math.max(minZoom, 1)),
       pan: {
         x: safeViewportWidth / 2,
         y: safeViewportHeight / 2,
@@ -277,7 +418,8 @@ export function fitViewport(
   const usableHeight = Math.max(1, safeViewportHeight - safePadding * 2);
   const boundsWidth = Math.max(1, bounds.right - bounds.left);
   const boundsHeight = Math.max(1, bounds.bottom - bounds.top);
-  const zoom = Math.min(usableWidth / boundsWidth, usableHeight / boundsHeight);
+  const naturalZoom = Math.min(usableWidth / boundsWidth, usableHeight / boundsHeight);
+  const zoom = Math.min(maxZoom, Math.max(minZoom, naturalZoom));
   const worldCenterX = (bounds.left + bounds.right) / 2;
   const worldCenterY = (bounds.top + bounds.bottom) / 2;
 

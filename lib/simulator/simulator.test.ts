@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { ArduinoSimulator, compileArduinoSketch } from "./index.ts";
+import { createDefaultBlinkProject } from "../circuit/index.ts";
+import {
+  ArduinoSimulator,
+  compileArduinoSketch,
+  isLedCircuitPowered,
+  resolveLedCircuitBindings,
+} from "./index.ts";
 
 const blinkSketch = `
 const int LED_PIN = LED_BUILTIN;
@@ -120,4 +126,64 @@ test("supports named external inputs and stable subscription snapshots", () => {
   assert.equal(before.pins[14].digitalValue, 0);
   assert.equal(after.pins[14].digitalValue, 1);
   assert.deepEqual(received, [1]);
+});
+
+test("powers an external LED from the Uno pin used by its actual wiring", () => {
+  const project = createDefaultBlinkProject();
+  project.connections = project.connections.map((connection) => {
+    if (connection.id === "wire-d13-r1") {
+      return {
+        ...connection,
+        from: { ...connection.from, pin: "D12" },
+      };
+    }
+    if (connection.id === "wire-led-gnd") {
+      return {
+        ...connection,
+        to: { ...connection.to, pin: "GND3" },
+      };
+    }
+    return connection;
+  });
+  project.code = `
+    const int LED_PIN = 12;
+    void setup() { pinMode(LED_PIN, OUTPUT); }
+    void loop() {
+      digitalWrite(LED_PIN, HIGH);
+      delay(500);
+      digitalWrite(LED_PIN, LOW);
+      delay(500);
+    }
+  `;
+
+  const binding = resolveLedCircuitBindings(project).get("led1");
+  assert.deepEqual(binding?.anodeBoardPins, ["D12"]);
+  assert.deepEqual(binding?.cathodeBoardPins, ["GND3"]);
+
+  const simulator = new ArduinoSimulator(project.code);
+  simulator.run();
+  simulator.advance(0);
+  assert.equal(isLedCircuitPowered(binding, simulator.getSnapshot()), true);
+  assert.equal(simulator.getSnapshot().pins[13].digitalValue, 0);
+
+  simulator.advance(500);
+  assert.equal(isLedCircuitPowered(binding, simulator.getSnapshot()), false);
+
+  simulator.advance(500);
+  assert.equal(isLedCircuitPowered(binding, simulator.getSnapshot()), true);
+});
+
+test("does not light an LED whose cathode is not connected", () => {
+  const project = createDefaultBlinkProject();
+  project.connections = project.connections.filter(
+    (connection) => connection.id !== "wire-led-gnd",
+  );
+  const binding = resolveLedCircuitBindings(project).get("led1");
+  const simulator = new ArduinoSimulator(project.code);
+
+  simulator.run();
+  simulator.advance(0);
+
+  assert.deepEqual(binding?.cathodeBoardPins, []);
+  assert.equal(isLedCircuitPowered(binding, simulator.getSnapshot()), false);
 });

@@ -1,6 +1,11 @@
 export { ArduinoSimulator } from "./engine.ts";
 export { compileArduinoSketch } from "./parser.ts";
 export {
+  isLedCircuitPowered,
+  resolveLedCircuitBindings,
+} from "./circuit-state.ts";
+export type { LedCircuitBinding } from "./circuit-state.ts";
+export {
   createInitialPinStates,
   isUnoPin,
   parseUnoPinLabel,

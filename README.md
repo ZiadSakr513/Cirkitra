@@ -1,14 +1,15 @@
-# AI Circuit Studio
+# Zircuit
 
-AI Circuit Studio is a browser-based Arduino Uno workbench. Describe a circuit, review the generated schematic and C++ sketch, edit either one, then run the supported firmware subset in a deterministic digital simulator.
+Zircuit is a browser-based Arduino Uno workbench. Describe a circuit, review the generated schematic and C++ sketch, edit either one, then run the supported firmware subset in a deterministic digital simulator.
 
 ## Included in v1
 
-- Groq-backed structured circuit generation with strict server-side validation
+- Gemini-backed structured circuit generation with strict server-side validation
 - Editable schematic with a supported component library, draggable parts, and pin-to-pin wiring
 - Arduino code editor with build diagnostics, run/pause/reset/step controls, speed selection, live outputs, and Serial monitor
 - Local autosave plus portable `.aics` project import/export
-- Offline-safe demo planner when Groq is not configured or unavailable
+- Selectable Gemini 3.5 Flash and Gemini 3.5 Flash-Lite models
+- Explicit Gemini error handling that preserves the open project when generation fails
 - Responsive dark workbench interface
 
 ## Local setup
@@ -21,11 +22,10 @@ copy .env.example .env.local
 npm run dev
 ```
 
-Add a newly-created Groq key to `.env.local`:
+Add a newly-created Google AI Studio key to `.env.local`:
 
 ```text
-GROQ_API_KEY=your_replacement_key
-GROQ_MODEL=openai/gpt-oss-20b
+GEMINI_API_KEY=your_replacement_key
 ```
 
 Never commit `.env.local`; environment files are ignored by Git.

@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  centerComponentsAtOrigin,
   componentSize,
   fitViewport,
   orthogonalWireSegments,
+  pinAwareWireSegments,
   pinPosition,
   type Point,
   type SchematicDefinitionLike,
@@ -98,6 +100,46 @@ test("routes exactly three axis-aligned wire segments", () => {
   }
 });
 
+test("routes away from pins in the direction each pin faces", () => {
+  const cases = [
+    { side: "left" as const, point: { x: 0, y: 40 }, expected: { x: -18, y: 40 } },
+    { side: "right" as const, point: { x: 120, y: 40 }, expected: { x: 138, y: 40 } },
+    { side: "top" as const, point: { x: 60, y: 0 }, expected: { x: 60, y: -18 } },
+    { side: "bottom" as const, point: { x: 60, y: 80 }, expected: { x: 60, y: 98 } },
+  ];
+
+  for (const routeCase of cases) {
+    const [lead] = pinAwareWireSegments(
+      { point: routeCase.point, side: routeCase.side },
+      { point: { x: 300, y: 200 }, side: "left" },
+      [{ type: "unknown-symbol", x: 0, y: 0 }],
+    );
+    assert.deepEqual(lead, { from: routeCase.point, to: routeCase.expected });
+  }
+});
+
+test("pin-aware routing does not tunnel through component bodies", () => {
+  const board = { type: "arduino-uno", x: 0, y: 0 };
+  const obstacle = { type: "resistor", x: -150, y: 430 };
+  const segments = pinAwareWireSegments(
+    { point: { x: 0, y: 175 }, side: "left" },
+    { point: { x: -80, y: 454 }, side: "top" },
+    [board, obstacle],
+  );
+
+  assert.deepEqual(segments[0], {
+    from: { x: 0, y: 175 },
+    to: { x: -18, y: 175 },
+  });
+  for (const segment of segments) {
+    assert.ok(segment.from.x === segment.to.x || segment.from.y === segment.to.y);
+    const crossesBoardInterior = segment.from.y === segment.to.y
+      ? segment.from.y > 0 && segment.from.y < 350 && Math.max(segment.from.x, segment.to.x) > 0 && Math.min(segment.from.x, segment.to.x) < 320
+      : segment.from.x > 0 && segment.from.x < 320 && Math.max(segment.from.y, segment.to.y) > 0 && Math.min(segment.from.y, segment.to.y) < 350;
+    assert.equal(crossesBoardInterior, false, "wire must not cross the Arduino body");
+  }
+});
+
 function toScreen(point: Point, transform: ReturnType<typeof fitViewport>) {
   return {
     x: point.x * transform.zoom + transform.pan.x,
@@ -128,4 +170,66 @@ test("centers world origin when fitting an empty schematic", () => {
     zoom: 1,
     pan: { x: 400, y: 250 },
   });
+});
+
+test("centers a distant layout on world origin without changing spacing", () => {
+  const components = [
+    { id: "uno", type: "arduino-uno", x: 900, y: 700 },
+    { id: "resistor", type: "resistor", x: 1400, y: 800 },
+  ];
+  const centered = centerComponentsAtOrigin(components);
+
+  assert.deepEqual(centered, [
+    { id: "uno", type: "arduino-uno", x: -320, y: -175 },
+    { id: "resistor", type: "resistor", x: 180, y: -75 },
+  ]);
+  assert.deepEqual(components[0], {
+    id: "uno",
+    type: "arduino-uno",
+    x: 900,
+    y: 700,
+  });
+});
+
+test("centers rotated component bounds on world origin", () => {
+  const [component] = centerComponentsAtOrigin([
+    { id: "resistor", type: "resistor", x: 1000, y: 500, rotation: 90 },
+  ]);
+
+  assert.deepEqual(component, {
+    id: "resistor",
+    type: "resistor",
+    x: -70,
+    y: -24,
+    rotation: 90,
+  });
+});
+
+test("keeps pan centered when fitted zoom is capped", () => {
+  const component = { type: "resistor", x: 100, y: 100 };
+  const transform = fitViewport([component], 1000, 600, 50, {
+    minZoom: 0.2,
+    maxZoom: 1.5,
+  });
+  const center = toScreen({ x: 170, y: 124 }, transform);
+
+  assert.equal(transform.zoom, 1.5);
+  assert.ok(Math.abs(center.x - 500) < 1e-9);
+  assert.ok(Math.abs(center.y - 300) < 1e-9);
+});
+
+test("keeps pan centered when fitted zoom is raised to its minimum", () => {
+  const components = [
+    { type: "resistor", x: -5000, y: -100 },
+    { type: "led", x: 5000, y: 100 },
+  ];
+  const transform = fitViewport(components, 1000, 600, 50, {
+    minZoom: 0.2,
+    maxZoom: 1.5,
+  });
+  const center = toScreen({ x: 36, y: 52 }, transform);
+
+  assert.equal(transform.zoom, 0.2);
+  assert.ok(Math.abs(center.x - 500) < 1e-9);
+  assert.ok(Math.abs(center.y - 300) < 1e-9);
 });

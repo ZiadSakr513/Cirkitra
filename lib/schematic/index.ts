@@ -1,7 +1,9 @@
 export {
+  centerComponentsAtOrigin,
   componentSize,
   fitViewport,
   orthogonalWireSegments,
+  pinAwareWireSegments,
   pinPosition,
   type ComponentSize,
   type Point,
@@ -10,5 +12,7 @@ export {
   type SchematicPinDefinitionLike,
   type SchematicPinSide,
   type ViewportTransform,
+  type ViewportZoomLimits,
   type WireSegment,
+  type WireRouteEndpoint,
 } from "./geometry.ts";

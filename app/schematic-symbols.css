@@ -196,6 +196,19 @@
 .schematic-pin:hover i,
 .schematic-pin.active i { border-color: #ffb547; background: #ffb547; box-shadow: 0 0 7px #ffb547; }
 .schematic-pin.active { z-index: 22; color: #ffd88f; }
+.schematic-pin.connected { color: color-mix(in srgb, var(--pin-wire-color, #42d7bd) 72%, white); }
+.schematic-pin.connected i {
+  width: 9px;
+  height: 9px;
+  border: 2px solid #e9fbff;
+  background: var(--pin-wire-color, #42d7bd);
+  box-shadow: 0 0 0 2px #071018, 0 0 9px color-mix(in srgb, var(--pin-wire-color, #42d7bd) 68%, white);
+}
+.schematic-pin.wire-highlighted { z-index: 24; color: #fff; text-shadow: 0 0 8px var(--pin-wire-color, #42d7bd); }
+.schematic-pin.wire-highlighted i {
+  transform: scale(1.25);
+  box-shadow: 0 0 0 2px #071018, 0 0 15px var(--pin-wire-color, #42d7bd);
+}
 .schematic-pin.side-left { transform: translate(0, -50%); }
 .schematic-pin.side-right { flex-direction: row-reverse; transform: translate(-100%, -50%); }
 .schematic-pin.side-top { flex-direction: column; transform: translate(-50%, 0); }
@@ -204,6 +217,11 @@
 .schematic-pin.side-bottom span { font-size: 6px; writing-mode: vertical-rl; }
 .component-arduino-uno .schematic-pin { gap: 3px; color: #e8f1ef; font-size: 7px; }
 .component-arduino-uno .schematic-pin i { border-color: #d3e0dc; background: #172127; }
+.component-arduino-uno .schematic-pin.connected i {
+  border-color: #e9fbff;
+  background: var(--pin-wire-color, #42d7bd);
+  box-shadow: 0 0 0 2px #071018, 0 0 9px color-mix(in srgb, var(--pin-wire-color, #42d7bd) 68%, white);
+}
 
 .schematic-symbol { position: absolute; inset: 0; pointer-events: none; }
 

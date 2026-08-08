@@ -6,6 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type WheelEvent as ReactWheelEvent,
 } from "react";
@@ -15,6 +16,8 @@ import {
   createDefaultBlinkProject,
   createDefaultProperties,
   getComponentDefinition,
+  removeComponentFromProject,
+  removeComponentsFromProject,
   safeParseCircuitProject,
   type CircuitComponent,
   type CircuitProject,
@@ -22,27 +25,153 @@ import {
 } from "../lib/circuit";
 import {
   ArduinoSimulator,
+  isLedCircuitPowered,
+  resolveLedCircuitBindings,
   type SimulatorSnapshot,
 } from "../lib/simulator";
 import {
+  centerComponentsAtOrigin,
   componentSize,
   fitViewport,
-  orthogonalWireSegments,
+  pinAwareWireSegments,
   pinPosition,
 } from "../lib/schematic";
 import { SchematicSymbol } from "./schematic-symbols";
 
 const STORAGE_KEY = "ai-circuit-studio.project.v1";
+const LAYOUT_STORAGE_KEY = "ai-circuit-studio.layout.v1";
+const MODEL_STORAGE_KEY = "ai-circuit-studio.ai-model.v1";
+const GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite"] as const;
+type GeminiModel = (typeof GEMINI_MODELS)[number];
+const DEFAULT_GEMINI_MODEL: GeminiModel = "gemini-3.5-flash";
+const GEMINI_MODEL_LABELS: Record<GeminiModel, string> = {
+  "gemini-3.5-flash": "Gemini 3.5 Flash",
+  "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite",
+};
 const WIRE_COLORS = ["#ffb547", "#ff6b6b", "#56d7c3", "#68a7ff", "#b38cff"];
-const PALETTE_CATEGORIES = ["all", "inputs", "outputs", "displays", "sensors", "logic"] as const;
+const PALETTE_CATEGORIES = ["all", "boards", "inputs", "outputs", "displays", "sensors", "logic"] as const;
 
 type SideTab = "assistant" | "inspector";
 type BottomTab = "code" | "serial" | "problems";
 type ChatMessage = { id: string; role: "assistant" | "user"; text: string; meta?: string };
 type CompileMessage = { severity: "error" | "warning"; line?: number; message: string };
+type PanelSizes = { left: number; right: number; bottom: number };
+type ResizeTarget = keyof PanelSizes;
+type PanelResizeState = {
+  target: ResizeTarget;
+  startX: number;
+  startY: number;
+  startSize: number;
+};
+type CanvasTool = "select" | "pan";
+type MarqueeState = {
+  pointerId: number;
+  startClientX: number;
+  startClientY: number;
+  currentClientX: number;
+  currentClientY: number;
+  startWorldX: number;
+  startWorldY: number;
+  currentWorldX: number;
+  currentWorldY: number;
+};
+
+const DEFAULT_PANEL_SIZES: PanelSizes = { left: 232, right: 356, bottom: 230 };
+const PANEL_LIMITS = {
+  left: { min: 176, max: 380 },
+  right: { min: 280, max: 560 },
+  bottom: { min: 140, max: 520 },
+} satisfies Record<ResizeTarget, { min: number; max: number }>;
+const COMPACT_BREAKPOINT = 1180;
+const LEFT_PANEL_BREAKPOINT = 930;
+const RIGHT_PANEL_BREAKPOINT = 720;
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function isGeminiModel(value: unknown): value is GeminiModel {
+  return typeof value === "string" && (GEMINI_MODELS as readonly string[]).includes(value);
+}
+
+function finiteSize(value: unknown, fallback: number) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function centerMinimum(viewportWidth: number) {
+  return viewportWidth <= COMPACT_BREAKPOINT ? 320 : 420;
+}
+
+function bottomMaximum(viewportHeight: number) {
+  const available = Math.max(650, viewportHeight) - 60 - 24 - 320;
+  return clamp(available, PANEL_LIMITS.bottom.min, PANEL_LIMITS.bottom.max);
+}
+
+function constrainPanelSizes(sizes: Partial<PanelSizes>, viewportWidth: number, viewportHeight: number): PanelSizes {
+  let left = clamp(finiteSize(sizes.left, DEFAULT_PANEL_SIZES.left), PANEL_LIMITS.left.min, PANEL_LIMITS.left.max);
+  let right = clamp(finiteSize(sizes.right, DEFAULT_PANEL_SIZES.right), PANEL_LIMITS.right.min, PANEL_LIMITS.right.max);
+  const bottom = clamp(
+    finiteSize(sizes.bottom, DEFAULT_PANEL_SIZES.bottom),
+    PANEL_LIMITS.bottom.min,
+    bottomMaximum(viewportHeight),
+  );
+
+  if (viewportWidth > LEFT_PANEL_BREAKPOINT) {
+    const availableForPanels = Math.max(
+      PANEL_LIMITS.left.min + PANEL_LIMITS.right.min,
+      viewportWidth - centerMinimum(viewportWidth),
+    );
+    let overflow = Math.max(0, left + right - availableForPanels);
+    const rightReduction = Math.min(overflow, right - PANEL_LIMITS.right.min);
+    right -= rightReduction;
+    overflow -= rightReduction;
+    left -= Math.min(overflow, left - PANEL_LIMITS.left.min);
+  } else if (viewportWidth > RIGHT_PANEL_BREAKPOINT) {
+    right = Math.min(right, Math.max(PANEL_LIMITS.right.min, viewportWidth - centerMinimum(viewportWidth)));
+  }
+
+  return { left, right, bottom };
+}
+
+function resizePanel(
+  sizes: PanelSizes,
+  target: ResizeTarget,
+  requestedSize: number,
+  viewportWidth: number,
+  viewportHeight: number,
+): PanelSizes {
+  if (target === "bottom") {
+    return {
+      ...sizes,
+      bottom: clamp(requestedSize, PANEL_LIMITS.bottom.min, bottomMaximum(viewportHeight)),
+    };
+  }
+
+  if (target === "left") {
+    const dynamicMax = viewportWidth > LEFT_PANEL_BREAKPOINT
+      ? viewportWidth - sizes.right - centerMinimum(viewportWidth)
+      : PANEL_LIMITS.left.max;
+    return {
+      ...sizes,
+      left: clamp(requestedSize, PANEL_LIMITS.left.min, Math.max(PANEL_LIMITS.left.min, Math.min(PANEL_LIMITS.left.max, dynamicMax))),
+    };
+  }
+
+  const dynamicMax = viewportWidth > LEFT_PANEL_BREAKPOINT
+    ? viewportWidth - sizes.left - centerMinimum(viewportWidth)
+    : viewportWidth > RIGHT_PANEL_BREAKPOINT
+      ? viewportWidth - centerMinimum(viewportWidth)
+      : PANEL_LIMITS.right.max;
+  return {
+    ...sizes,
+    right: clamp(requestedSize, PANEL_LIMITS.right.min, Math.max(PANEL_LIMITS.right.min, Math.min(PANEL_LIMITS.right.max, dynamicMax))),
+  };
+}
 
 const CATEGORY_LABELS: Record<string, string> = {
   all: "All",
+  boards: "Boards",
   inputs: "Input",
   outputs: "Output",
   displays: "Display",
@@ -74,80 +203,12 @@ const PART_GLYPHS: Record<string, string> = {
   "arduino-uno": "UNO",
 };
 
-const initialChat: ChatMessage[] = [
-  {
-    id: "welcome",
-    role: "assistant",
-    text: "Describe the circuit you want. I’ll create the schematic and Arduino sketch together, then check that every part can run in this simulator.",
-    meta: "Arduino Uno · digital simulation",
-  },
-];
-
 function uid(prefix: string) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
 function deepClone(project: CircuitProject): CircuitProject {
   return JSON.parse(JSON.stringify(project)) as CircuitProject;
-}
-
-function createTrafficLightProject(): CircuitProject {
-  const project = createDefaultBlinkProject();
-  project.id = uid("traffic-light");
-  project.name = "Three-light traffic signal";
-  project.description = "A timed red, amber, and green traffic signal driven by Arduino Uno.";
-  project.components = [
-    { id: "uno", type: "arduino-uno", label: "Arduino Uno", x: 96, y: 114, properties: createDefaultProperties("arduino-uno") },
-    { id: "red", type: "led", label: "RED", x: 548, y: 86, properties: { color: "#ff4e5c" } },
-    { id: "amber", type: "led", label: "AMBER", x: 548, y: 210, properties: { color: "#ffb547" } },
-    { id: "green", type: "led", label: "GREEN", x: 548, y: 334, properties: { color: "#43d9a3" } },
-    { id: "r1", type: "resistor", label: "R1 · 220 ohm", x: 386, y: 92, properties: { resistance: 220 } },
-    { id: "r2", type: "resistor", label: "R2 · 220 ohm", x: 386, y: 216, properties: { resistance: 220 } },
-    { id: "r3", type: "resistor", label: "R3 · 220 ohm", x: 386, y: 340, properties: { resistance: 220 } },
-  ];
-  project.connections = [
-    ["D10", "r1", "1", "red", "A", "#ff5b65"],
-    ["D11", "r2", "1", "amber", "A", "#ffb547"],
-    ["D12", "r3", "1", "green", "A", "#43d9a3"],
-  ].flatMap((item, index) => {
-    const [pin, resistor, resistorPin, led, ledPin, color] = item as string[];
-    return [
-      { id: `signal-${index}`, from: { componentId: "uno", pin }, to: { componentId: resistor, pin: resistorPin }, color },
-      { id: `lamp-${index}`, from: { componentId: resistor, pin: "2" }, to: { componentId: led, pin: ledPin }, color },
-      { id: `ground-${index}`, from: { componentId: led, pin: "K" }, to: { componentId: "uno", pin: "GND" }, color: "#526071" },
-    ];
-  });
-  project.code = `// Three-light traffic signal\nconst int RED = 10;\nconst int AMBER = 11;\nconst int GREEN = 12;\n\nvoid setup() {\n  pinMode(RED, OUTPUT);\n  pinMode(AMBER, OUTPUT);\n  pinMode(GREEN, OUTPUT);\n  Serial.begin(9600);\n}\n\nvoid loop() {\n  digitalWrite(RED, HIGH);\n  digitalWrite(AMBER, LOW);\n  digitalWrite(GREEN, LOW);\n  Serial.println("STOP");\n  delay(3000);\n  digitalWrite(RED, LOW);\n  digitalWrite(AMBER, HIGH);\n  delay(1000);\n  digitalWrite(AMBER, LOW);\n  digitalWrite(GREEN, HIGH);\n  Serial.println("GO");\n  delay(3000);\n  digitalWrite(GREEN, LOW);\n  digitalWrite(AMBER, HIGH);\n  delay(1000);\n}`;
-  return project;
-}
-
-function createBuzzerProject(): CircuitProject {
-  const project = createDefaultBlinkProject();
-  project.id = uid("buzzer");
-  project.name = "Interval alert buzzer";
-  project.description = "A piezo buzzer pulses every second and reports its state over Serial.";
-  project.components = [
-    { id: "uno", type: "arduino-uno", label: "Arduino Uno", x: 120, y: 118, properties: createDefaultProperties("arduino-uno") },
-    { id: "buzz", type: "buzzer", label: "BZ1 · Piezo", x: 524, y: 176 },
-  ];
-  project.connections = [
-    { id: "buzz-signal", from: { componentId: "uno", pin: "D9" }, to: { componentId: "buzz", pin: "+" }, color: "#b38cff" },
-    { id: "buzz-ground", from: { componentId: "buzz", pin: "-" }, to: { componentId: "uno", pin: "GND" }, color: "#526071" },
-  ];
-  project.code = `const int BUZZER = 9;\n\nvoid setup() {\n  pinMode(BUZZER, OUTPUT);\n  Serial.begin(9600);\n}\n\nvoid loop() {\n  digitalWrite(BUZZER, HIGH);\n  Serial.println("Alert on");\n  delay(300);\n  digitalWrite(BUZZER, LOW);\n  Serial.println("Alert off");\n  delay(700);\n}`;
-  return project;
-}
-
-function createDemoFromPrompt(prompt: string) {
-  const normalized = prompt.toLowerCase();
-  if (normalized.includes("traffic") || normalized.includes("three led") || normalized.includes("3 led")) return createTrafficLightProject();
-  if (normalized.includes("buzzer") || normalized.includes("alarm") || normalized.includes("alert")) return createBuzzerProject();
-  const project = createDefaultBlinkProject();
-  project.id = uid("blink");
-  const speed = normalized.includes("fast") || normalized.includes("500") ? 500 : 1000;
-  project.name = speed === 500 ? "Fast LED blinker" : "Blink an LED";
-  project.code = project.code.replaceAll("1000", String(speed));
-  return project;
 }
 
 function statusLabel(snapshot: SimulatorSnapshot) {
@@ -166,13 +227,17 @@ export function CircuitStudio() {
   const [historyIndex, setHistoryIndex] = useState(0);
   const [historyLength, setHistoryLength] = useState(1);
   const [hydrated, setHydrated] = useState(false);
-  const [selectedId, setSelectedId] = useState<string | null>("led1");
+  const [selectedIds, setSelectedIds] = useState<string[]>(["led1"]);
   const [pendingPin, setPendingPin] = useState<ConnectionEndpoint | null>(null);
+  const [highlightedWireId, setHighlightedWireId] = useState<string | null>(null);
   const [paletteCategory, setPaletteCategory] = useState<(typeof PALETTE_CATEGORIES)[number]>("all");
   const [paletteSearch, setPaletteSearch] = useState("");
   const [sideTab, setSideTab] = useState<SideTab>("assistant");
   const [bottomTab, setBottomTab] = useState<BottomTab>("code");
   const [bottomOpen, setBottomOpen] = useState(true);
+  const [panelSizes, setPanelSizes] = useState<PanelSizes>(DEFAULT_PANEL_SIZES);
+  const [layoutHydrated, setLayoutHydrated] = useState(false);
+  const [panelResize, setPanelResize] = useState<PanelResizeState | null>(null);
   const [zoom, setZoom] = useState(0.9);
   const [pan, setPan] = useState({ x: 72, y: 42 });
   const [panDrag, setPanDrag] = useState<{
@@ -183,9 +248,13 @@ export function CircuitStudio() {
     panY: number;
   } | null>(null);
   const [spaceHeld, setSpaceHeld] = useState(false);
+  const [canvasTool, setCanvasTool] = useState<CanvasTool>("select");
+  const [marquee, setMarquee] = useState<MarqueeState | null>(null);
   const [prompt, setPrompt] = useState("");
-  const [chat, setChat] = useState<ChatMessage[]>(initialChat);
+  const [aiModel, setAiModel] = useState<GeminiModel>(DEFAULT_GEMINI_MODEL);
+  const [chat, setChat] = useState<ChatMessage[]>([]);
   const [generating, setGenerating] = useState(false);
+  const [generationError, setGenerationError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [compileMessages, setCompileMessages] = useState<CompileMessage[]>([]);
   const [buildState, setBuildState] = useState<"idle" | "building" | "ready" | "error">("idle");
@@ -199,10 +268,65 @@ export function CircuitStudio() {
     projectRef.current = project;
   }, [project]);
 
+  useEffect(() => {
+    const savedModel = window.localStorage.getItem(MODEL_STORAGE_KEY);
+    if (!isGeminiModel(savedModel)) return;
+    const frame = window.requestAnimationFrame(() => setAiModel(savedModel));
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+
   const announce = useCallback((message: string) => {
     setToast(message);
     window.setTimeout(() => setToast(null), 2600);
   }, []);
+
+  const beginPanelResize = (target: ResizeTarget, event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.focus();
+    setPanelResize({
+      target,
+      startX: event.clientX,
+      startY: event.clientY,
+      startSize: panelSizes[target],
+    });
+  };
+
+  const setPanelSize = (target: ResizeTarget, requestedSize: number) => {
+    setPanelSizes((current) => resizePanel(
+      current,
+      target,
+      requestedSize,
+      window.innerWidth,
+      window.innerHeight,
+    ));
+  };
+
+  const resetPanelSize = (target: ResizeTarget) => {
+    setPanelSize(target, DEFAULT_PANEL_SIZES[target]);
+  };
+
+  const handlePanelResizeKey = (target: ResizeTarget, event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    const step = event.shiftKey ? 40 : 10;
+    let nextSize: number | null = null;
+    if (event.key === "Home") nextSize = PANEL_LIMITS[target].min;
+    if (event.key === "End") nextSize = PANEL_LIMITS[target].max;
+    if (target === "left") {
+      if (event.key === "ArrowLeft") nextSize = panelSizes.left - step;
+      if (event.key === "ArrowRight") nextSize = panelSizes.left + step;
+    } else if (target === "right") {
+      if (event.key === "ArrowLeft") nextSize = panelSizes.right + step;
+      if (event.key === "ArrowRight") nextSize = panelSizes.right - step;
+    } else {
+      if (event.key === "ArrowUp") nextSize = panelSizes.bottom + step;
+      if (event.key === "ArrowDown") nextSize = panelSizes.bottom - step;
+    }
+    if (nextSize === null) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setPanelSize(target, nextSize);
+  };
 
   const commitProject = useCallback((next: CircuitProject) => {
     const copy = deepClone(next);
@@ -241,13 +365,84 @@ export function CircuitStudio() {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(project));
   }, [hydrated, project]);
 
+  useEffect(() => {
+    let restored: Partial<PanelSizes> = DEFAULT_PANEL_SIZES;
+    try {
+      const saved = window.localStorage.getItem(LAYOUT_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved) as unknown;
+        if (parsed && typeof parsed === "object") restored = parsed as Partial<PanelSizes>;
+      }
+    } catch {
+      // Invalid layout preferences fall back to a balanced default layout.
+    }
+    const next = constrainPanelSizes(restored, window.innerWidth, window.innerHeight);
+    queueMicrotask(() => {
+      setPanelSizes(next);
+      setLayoutHydrated(true);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!layoutHydrated) return;
+    try {
+      window.localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(panelSizes));
+    } catch {
+      // The layout remains usable when storage is unavailable.
+    }
+  }, [layoutHydrated, panelSizes]);
+
+  useEffect(() => {
+    const keepLayoutInViewport = () => {
+      setPanelSizes((current) => constrainPanelSizes(current, window.innerWidth, window.innerHeight));
+    };
+    window.addEventListener("resize", keepLayoutInViewport);
+    return () => window.removeEventListener("resize", keepLayoutInViewport);
+  }, []);
+
+  useEffect(() => {
+    if (!panelResize) return;
+
+    const move = (event: PointerEvent) => {
+      const requestedSize = panelResize.target === "left"
+        ? panelResize.startSize + event.clientX - panelResize.startX
+        : panelResize.target === "right"
+          ? panelResize.startSize - (event.clientX - panelResize.startX)
+          : panelResize.startSize - (event.clientY - panelResize.startY);
+      setPanelSizes((current) => resizePanel(
+        current,
+        panelResize.target,
+        requestedSize,
+        window.innerWidth,
+        window.innerHeight,
+      ));
+    };
+    const stop = () => setPanelResize(null);
+    const resizeClass = panelResize.target === "bottom" ? "resizing-row" : "resizing-column";
+    document.body.classList.add("resizing-panels", resizeClass);
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+    window.addEventListener("blur", stop);
+    return () => {
+      document.body.classList.remove("resizing-panels", resizeClass);
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+      window.removeEventListener("blur", stop);
+    };
+  }, [panelResize]);
+
   useEffect(() => simulator.subscribe(setSnapshot), [simulator]);
 
   useEffect(() => {
     let frame = 0;
     let last = performance.now();
     const tick = (now: number) => {
-      const delta = Math.min(100, now - last);
+      // The first RAF timestamp can be a fraction behind performance.now() in
+      // some browser/runtime combinations. Never pass that negative sliver to
+      // the deterministic simulator clock.
+      const delta = Math.max(0, Math.min(100, now - last));
       last = now;
       simulator.advance(delta);
       frame = requestAnimationFrame(tick);
@@ -302,26 +497,44 @@ export function CircuitStudio() {
     setProject(deepClone(historyRef.current[index]));
   }, [historyIndex, historyLength]);
 
+  const removeComponent = useCallback((componentId: string) => {
+    const current = projectRef.current;
+    const component = current.components.find((item) => item.id === componentId);
+    if (!component) return;
+    commitProject(removeComponentFromProject(current, componentId));
+    setSelectedIds((selected) => selected.filter((id) => id !== componentId));
+    setPendingPin((endpoint) => endpoint?.componentId === componentId ? null : endpoint);
+    announce(`${component.label} removed`);
+  }, [announce, commitProject]);
+
+  const removeSelectedComponents = useCallback(() => {
+    const current = projectRef.current;
+    const existingIds = selectedIds.filter((id) =>
+      current.components.some((component) => component.id === id),
+    );
+    if (!existingIds.length) return;
+    commitProject(removeComponentsFromProject(current, existingIds));
+    setSelectedIds([]);
+    setPendingPin((endpoint) => endpoint && existingIds.includes(endpoint.componentId) ? null : endpoint);
+    announce(existingIds.length === 1 ? "Component removed" : `${existingIds.length} components removed`);
+  }, [announce, commitProject, selectedIds]);
+
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
-      const typing = target?.tagName === "INPUT" || target?.tagName === "TEXTAREA";
-      if (!typing && event.code === "Space") {
+      const editing = Boolean(target?.closest("input, textarea, [contenteditable='true']"));
+      const interactive = Boolean(target?.closest("input, textarea, button, select, [role='separator'], [contenteditable='true']"));
+      if (!interactive && event.code === "Space") {
         event.preventDefault();
         setSpaceHeld(true);
       }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+      if (!editing && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
         event.preventDefault();
         if (event.shiftKey) redo(); else undo();
       }
-      if (!typing && (event.key === "Delete" || event.key === "Backspace") && selectedId) {
-        const next = {
-          ...projectRef.current,
-          components: projectRef.current.components.filter((component) => component.id !== selectedId || component.type === "arduino-uno"),
-          connections: projectRef.current.connections.filter((connection) => connection.from.componentId !== selectedId && connection.to.componentId !== selectedId),
-        };
-        commitProject(next);
-        setSelectedId(null);
+      if (!interactive && (event.key === "Delete" || event.key === "Backspace") && selectedIds.length) {
+        event.preventDefault();
+        removeSelectedComponents();
       }
     };
     const keyup = (event: KeyboardEvent) => {
@@ -336,15 +549,20 @@ export function CircuitStudio() {
       window.removeEventListener("keyup", keyup);
       window.removeEventListener("blur", blur);
     };
-  }, [commitProject, redo, selectedId, undo]);
+  }, [redo, removeSelectedComponents, selectedIds.length, undo]);
 
+  const selectedId = selectedIds.length === 1 ? selectedIds[0] : null;
   const selected = project.components.find((component) => component.id === selectedId) ?? null;
   const selectedDefinition = selected ? getComponentDefinition(selected.type) : undefined;
-  const pin13 = snapshot.pins.find((pin) => pin.label === "D13");
+  const arduinoCount = project.components.filter((component) => component.type === "arduino-uno").length;
+  const ledCircuitBindings = useMemo(
+    () => resolveLedCircuitBindings(project),
+    [project],
+  );
 
   const parts = useMemo(() => {
     const search = paletteSearch.trim().toLowerCase();
-    return SUPPORTED_COMPONENT_TYPES.filter((type) => type !== "arduino-uno")
+    return SUPPORTED_COMPONENT_TYPES
       .map((type) => COMPONENT_CATALOG[type])
       .filter((definition) => paletteCategory === "all" || definition.category === paletteCategory)
       .filter((definition) => !search || `${definition.displayName} ${definition.description}`.toLowerCase().includes(search));
@@ -367,7 +585,7 @@ export function CircuitStudio() {
       properties: createDefaultProperties(type),
     };
     commitProject({ ...project, components: [...project.components, component] });
-    setSelectedId(component.id);
+    setSelectedIds([component.id]);
     setSideTab("inspector");
     announce(`${definition.displayName} added`);
   };
@@ -377,17 +595,38 @@ export function CircuitStudio() {
     if ((event.target as HTMLElement).closest(".schematic-pin")) return;
     event.preventDefault();
     event.stopPropagation();
-    setSelectedId(component.id);
+    setSelectedIds([component.id]);
     setDragState({ id: component.id, pointerX: event.clientX, pointerY: event.clientY, x: component.x, y: component.y });
   };
 
   const beginCanvasPan = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0 && event.button !== 1) return;
     const target = event.target as HTMLElement;
-    const forcedPan = spaceHeld || event.button === 1;
+    const forcedPan = spaceHeld || canvasTool === "pan" || event.button === 1;
     if (!forcedPan && target.closest(".circuit-node, .wire-segment, .minimap")) return;
     event.preventDefault();
-    setSelectedId(null);
+    if (!forcedPan) {
+      const rect = event.currentTarget.getBoundingClientRect();
+      const clientX = event.clientX - rect.left;
+      const clientY = event.clientY - rect.top;
+      const worldX = (clientX - pan.x) / zoom;
+      const worldY = (clientY - pan.y) / zoom;
+      setSelectedIds([]);
+      setMarquee({
+        pointerId: event.pointerId,
+        startClientX: clientX,
+        startClientY: clientY,
+        currentClientX: clientX,
+        currentClientY: clientY,
+        startWorldX: worldX,
+        startWorldY: worldY,
+        currentWorldX: worldX,
+        currentWorldY: worldY,
+      });
+      event.currentTarget.setPointerCapture(event.pointerId);
+      return;
+    }
+    setSelectedIds([]);
     setPanDrag({
       pointerId: event.pointerId,
       clientX: event.clientX,
@@ -399,6 +638,33 @@ export function CircuitStudio() {
   };
 
   const moveCanvasPan = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (marquee && event.pointerId === marquee.pointerId) {
+      const rect = event.currentTarget.getBoundingClientRect();
+      const clientX = event.clientX - rect.left;
+      const clientY = event.clientY - rect.top;
+      const worldX = (clientX - pan.x) / zoom;
+      const worldY = (clientY - pan.y) / zoom;
+      const left = Math.min(marquee.startWorldX, worldX);
+      const right = Math.max(marquee.startWorldX, worldX);
+      const top = Math.min(marquee.startWorldY, worldY);
+      const bottom = Math.max(marquee.startWorldY, worldY);
+      const nextSelectedIds = project.components
+        .filter((component) => {
+          const size = componentSize(component.type);
+          return component.x < right && component.x + size.width > left &&
+            component.y < bottom && component.y + size.height > top;
+        })
+        .map((component) => component.id);
+      setMarquee((current) => current ? {
+        ...current,
+        currentClientX: clientX,
+        currentClientY: clientY,
+        currentWorldX: worldX,
+        currentWorldY: worldY,
+      } : current);
+      setSelectedIds(nextSelectedIds);
+      return;
+    }
     if (!panDrag || event.pointerId !== panDrag.pointerId) return;
     setPan({
       x: panDrag.panX + event.clientX - panDrag.clientX,
@@ -407,6 +673,13 @@ export function CircuitStudio() {
   };
 
   const endCanvasPan = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (marquee && event.pointerId === marquee.pointerId) {
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+      setMarquee(null);
+      return;
+    }
     if (!panDrag || event.pointerId !== panDrag.pointerId) return;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
@@ -435,13 +708,18 @@ export function CircuitStudio() {
     zoomAt(zoom * factor, event.clientX, event.clientY);
   };
 
-  const fitCanvas = () => {
+  const fitComponentsInCanvas = (components: readonly CircuitComponent[]) => {
     const rect = viewportRef.current?.getBoundingClientRect();
     if (!rect) return;
-    const fitted = fitViewport(project.components, rect.width, rect.height, 64);
-    setZoom(Math.min(1.5, Math.max(0.2, fitted.zoom)));
+    const fitted = fitViewport(components, rect.width, rect.height, 64, {
+      minZoom: 0.2,
+      maxZoom: 1.5,
+    });
+    setZoom(fitted.zoom);
     setPan(fitted.pan);
   };
+
+  const fitCanvas = () => fitComponentsInCanvas(project.components);
 
   const connectPin = (endpoint: ConnectionEndpoint) => {
     if (!pendingPin) {
@@ -527,49 +805,63 @@ export function CircuitStudio() {
     setPrompt("");
     setSideTab("assistant");
     setGenerating(true);
+    setGenerationError(null);
     setChat((items) => [...items, { id: uid("user"), role: "user", text: clean }]);
     try {
       const response = await fetch("/api/ai/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: clean, currentProject: project }),
+        body: JSON.stringify({ prompt: clean, currentProject: project, model: aiModel }),
       });
       const result = await response.json() as {
         project?: unknown;
         explanation?: string;
         warnings?: string[];
+        model?: unknown;
         error?: { code?: string; message?: string };
       };
-      let nextProject: CircuitProject;
-      let explanation: string;
-      let meta: string;
-      const parsed = safeParseCircuitProject(result.project);
-      if (response.ok && parsed.success) {
-        nextProject = parsed.data;
-        explanation = result.explanation || `Created ${nextProject.name} with ${nextProject.components.length} components.`;
-        meta = result.warnings?.length ? result.warnings.join(" · ") : "Validated against the v1 parts catalog";
-      } else {
-        nextProject = createDemoFromPrompt(clean);
-        explanation = result.error?.code === "AI_NOT_CONFIGURED"
-          ? `I created a local simulation-ready draft for “${clean}”. Add a server-side Groq key to unlock open-ended generation.`
-          : `I created a safe, simulation-ready draft for “${clean}” using the local circuit planner.`;
-        meta = "Local planner · all parts validated";
+      if (!response.ok) {
+        throw new Error(
+          result.error?.message ||
+          `Gemini generation failed${result.error?.code ? ` (${result.error.code})` : ""}.`,
+        );
       }
+
+      const parsed = safeParseCircuitProject(result.project);
+      if (!parsed.success) {
+        throw new Error("Gemini returned circuit data that failed project validation.");
+      }
+      const explanation = typeof result.explanation === "string"
+        ? result.explanation.trim()
+        : "";
+      if (!explanation) {
+        throw new Error("Gemini returned a circuit without an explanation.");
+      }
+
+      const nextProject = {
+        ...parsed.data,
+        components: centerComponentsAtOrigin(parsed.data.components),
+      };
+      const responseModel = isGeminiModel(result.model) ? result.model : aiModel;
+      const metaParts = [GEMINI_MODEL_LABELS[responseModel], "schema validated"];
+      if (result.warnings?.length) metaParts.push(...result.warnings);
+      const meta = metaParts.join(" · ");
       commitProject(nextProject);
-      setSelectedId(nextProject.components.find((component) => component.type !== "arduino-uno")?.id ?? null);
+      fitComponentsInCanvas(nextProject.components);
+      setPendingPin(null);
+      const firstGeneratedPart = nextProject.components.find(
+        (component) => component.type !== "arduino-uno",
+      );
+      setSelectedIds(firstGeneratedPart ? [firstGeneratedPart.id] : []);
       setChat((items) => [...items, { id: uid("assistant"), role: "assistant", text: explanation, meta }]);
       simulator.load(nextProject.code);
-      announce("Circuit and code generated");
-    } catch {
-      const nextProject = createDemoFromPrompt(clean);
-      commitProject(nextProject);
-      setChat((items) => [...items, {
-        id: uid("assistant"),
-        role: "assistant",
-        text: `I created a simulation-ready ${nextProject.name.toLowerCase()} locally. The cloud model was unavailable, so I kept the design inside the supported parts catalog.`,
-        meta: "Local planner · offline-safe",
-      }]);
-      announce("Local circuit generated");
+      announce(`${GEMINI_MODEL_LABELS[responseModel]} generated the circuit and code`);
+    } catch (error) {
+      const message = error instanceof Error && error.message.trim()
+        ? error.message.trim()
+        : "The app could not reach Gemini. Try again.";
+      setGenerationError(message);
+      announce("Gemini generation failed — current circuit unchanged");
     } finally {
       setGenerating(false);
     }
@@ -593,21 +885,28 @@ export function CircuitStudio() {
       if (!parsed.success) throw new Error(parsed.issues[0]?.message);
       commitProject(parsed.data);
       simulator.load(parsed.data.code);
-      setSelectedId(null);
+      setSelectedIds([]);
       announce("Project imported");
     } catch {
-      announce("That file is not a valid AI Circuit Studio project");
+      announce("That file is not a valid Zircuit project");
     }
   };
 
   return (
-    <main className="studio-shell">
+    <main
+      className="studio-shell"
+      style={{
+        "--left-panel-width": `${panelSizes.left}px`,
+        "--right-panel-width": `${panelSizes.right}px`,
+        "--bottom-drawer-height": `${panelSizes.bottom}px`,
+      } as React.CSSProperties}
+    >
       <header className="topbar">
         <div className="brand-block">
           <div className="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
           <div>
-            <div className="brand-name">AI Circuit Studio</div>
-            <div className="brand-kicker">UNO WORKBENCH</div>
+            <div className="brand-name">Zircuit</div>
+            <div className="brand-owner">Founded by <strong>Ziad Sakr</strong></div>
           </div>
         </div>
 
@@ -636,10 +935,10 @@ export function CircuitStudio() {
       </header>
 
       <section className="workspace">
-        <aside className="parts-panel">
+        <aside className="parts-panel" id="components-panel">
           <div className="panel-heading">
             <div><span className="eyebrow">Library</span><h2>Components</h2></div>
-            <span className="count-badge">{SUPPORTED_COMPONENT_TYPES.length - 1}</span>
+            <span className="count-badge">{SUPPORTED_COMPONENT_TYPES.length}</span>
           </div>
           <label className="search-field">
             <span aria-hidden="true">⌕</span>
@@ -661,14 +960,30 @@ export function CircuitStudio() {
             ))}
             {!parts.length && <p className="empty-note">No supported parts match that search.</p>}
           </div>
-          <div className="library-note"><span>19</span><p><strong>Simulation-ready parts</strong><br />Every listed part is understood by the AI circuit schema.</p></div>
+          <div className="library-note"><span>{SUPPORTED_COMPONENT_TYPES.length}</span><p><strong>Simulation-ready parts</strong><br />Every listed part is understood by the AI circuit schema.</p></div>
+          <button
+            type="button"
+            role="separator"
+            aria-label="Resize Components panel"
+            aria-orientation="vertical"
+            aria-controls="components-panel"
+            aria-valuemin={PANEL_LIMITS.left.min}
+            aria-valuemax={PANEL_LIMITS.left.max}
+            aria-valuenow={Math.round(panelSizes.left)}
+            aria-valuetext={`${Math.round(panelSizes.left)} pixels wide`}
+            className={`panel-resizer panel-resizer-left ${panelResize?.target === "left" ? "active" : ""}`}
+            title="Drag to resize. Double-click to reset. Use Left/Right, Home, or End from the keyboard."
+            onPointerDown={(event) => beginPanelResize("left", event)}
+            onDoubleClick={(event) => { event.preventDefault(); resetPanelSize("left"); }}
+            onKeyDown={(event) => handlePanelResizeKey("left", event)}
+          />
         </aside>
 
         <section className="canvas-column">
           <div className="canvas-toolbar">
             <div className="tool-group">
-              <button className={`tool ${panDrag ? "" : "active"}`} title="Select and move parts">↖ <span>Select</span></button>
-              <button className={`tool ${spaceHeld || panDrag ? "active" : ""}`} title="Drag empty canvas, middle-drag, or hold Space">✋ <span>Pan</span></button>
+              <button className={`tool ${canvasTool === "select" && !spaceHeld ? "active" : ""}`} onClick={() => setCanvasTool("select")} title="Select, move, or drag a box around parts">↖ <span>Select</span></button>
+              <button className={`tool ${canvasTool === "pan" || spaceHeld || panDrag ? "active" : ""}`} onClick={() => setCanvasTool("pan")} title="Drag empty canvas to pan, or drag a component to move it. Middle-drag or hold Space to pan anywhere.">✋ <span>Pan</span></button>
               <button className={`tool ${pendingPin ? "active amber" : ""}`} onClick={() => setPendingPin(null)} title="Wire">⌁ <span>{pendingPin ? "Cancel wire" : "Wire"}</span></button>
             </div>
             <div className="canvas-title">
@@ -684,7 +999,7 @@ export function CircuitStudio() {
 
           <div
             ref={viewportRef}
-            className={`canvas-viewport ${panDrag ? "is-panning" : ""} ${spaceHeld ? "space-pan" : ""}`}
+            className={`canvas-viewport ${panDrag ? "is-panning" : ""} ${spaceHeld ? "space-pan" : ""} ${marquee ? "is-selecting" : ""}`}
             style={{
               "--grid-major": `${80 * zoom}px`,
               "--grid-minor": `${16 * zoom}px`,
@@ -707,27 +1022,39 @@ export function CircuitStudio() {
                 const from = pinPosition({ ...fromComponent, rotation: 0 }, connection.from.pin, fromDefinition);
                 const to = pinPosition({ ...toComponent, rotation: 0 }, connection.to.pin, toDefinition);
                 if (!from || !to) return null;
-                const segments = orthogonalWireSegments(from, to);
+                const fromPin = fromDefinition.pins.find((pin) => pin.id === connection.from.pin);
+                const toPin = toDefinition.pins.find((pin) => pin.id === connection.to.pin);
+                if (!fromPin || !toPin) return null;
+                const segments = pinAwareWireSegments(
+                  { point: from, side: fromPin.side },
+                  { point: to, side: toPin.side },
+                  project.components,
+                );
+                const wireTitle = `${fromComponent.label}: ${fromPin.label} → ${toComponent.label}: ${toPin.label}. Click to remove.`;
                 const removeWire = (event: React.MouseEvent) => {
                   event.stopPropagation();
                   commitProject({ ...project, connections: project.connections.filter((item) => item.id !== connection.id) });
                   announce("Wire removed");
                 };
                 return (
-                  <div className="wire-route" key={connection.id} style={{ "--wire-color": connection.color ?? "#47b86b" } as React.CSSProperties}>
+                  <div className={`wire-route ${highlightedWireId === connection.id ? "highlighted" : ""}`} key={connection.id} style={{ "--wire-color": connection.color ?? "#47b86b" } as React.CSSProperties}>
                     {segments.map((segment, index) => {
                       const horizontal = segment.from.y === segment.to.y;
                       return (
                         <button
                           key={index}
                           className={`wire-segment ${horizontal ? "horizontal" : "vertical"}`}
-                          title={`${connection.from.pin} → ${connection.to.pin}. Click to remove.`}
+                          title={wireTitle}
                           style={{
                             left: Math.min(segment.from.x, segment.to.x),
                             top: Math.min(segment.from.y, segment.to.y),
                             width: horizontal ? Math.max(1, Math.abs(segment.to.x - segment.from.x)) : 9,
                             height: horizontal ? 9 : Math.max(1, Math.abs(segment.to.y - segment.from.y)),
                           }}
+                          onPointerEnter={() => setHighlightedWireId(connection.id)}
+                          onPointerLeave={() => setHighlightedWireId((current) => current === connection.id ? null : current)}
+                          onFocus={() => setHighlightedWireId(connection.id)}
+                          onBlur={() => setHighlightedWireId((current) => current === connection.id ? null : current)}
                           onClick={removeWire}
                         />
                       );
@@ -741,15 +1068,18 @@ export function CircuitStudio() {
               {project.components.map((component) => {
                 const definition = getComponentDefinition(component.type);
                 const size = componentSize(component.type);
-                const isSelected = component.id === selectedId;
-                const isLedOn = component.type === "led" && pin13?.digitalValue === 1 && snapshot.status === "running";
+                const isSelected = selectedIds.includes(component.id);
+                const isLedOn = component.type === "led" && isLedCircuitPowered(
+                  ledCircuitBindings.get(component.id),
+                  snapshot,
+                );
                 return (
                   <article
                     key={component.id}
                     className={`circuit-node schematic-component component-${component.type} ${isSelected ? "selected" : ""} ${isLedOn ? "powered" : ""}`}
                     style={{ left: component.x, top: component.y, width: size.width, height: size.height, "--node-accent": definition?.accent ?? "#64748b" } as React.CSSProperties}
                     onPointerDown={(event) => beginDrag(event, component)}
-                    onDoubleClick={() => { setSelectedId(component.id); setSideTab("inspector"); }}
+                    onDoubleClick={() => { setSelectedIds([component.id]); setSideTab("inspector"); }}
                   >
                     <div className="symbol-caption"><strong>{component.label}</strong><small>{component.type === "arduino-uno" ? "ARDUINO UNO R3" : definition?.displayName}</small></div>
                     <SchematicSymbol type={component.type} properties={component.properties} powered={isLedOn || component.type === "arduino-uno"} />
@@ -757,7 +1087,13 @@ export function CircuitStudio() {
                         const localPoint = pinPosition({ ...component, x: 0, y: 0, rotation: 0 }, pin.id, definition);
                         if (!localPoint) return null;
                         const active = pendingPin?.componentId === component.id && pendingPin.pin === pin.id;
-                        return <button key={pin.id} className={`schematic-pin side-${pin.side} ${active ? "active" : ""}`} style={{ left: localPoint.x, top: localPoint.y }} title={`${pin.label} · click to wire`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); connectPin({ componentId: component.id, pin: pin.id }); }}><i /><span>{pin.label}</span></button>;
+                        const connectedWires = project.connections.filter((connection) =>
+                          (connection.from.componentId === component.id && connection.from.pin === pin.id) ||
+                          (connection.to.componentId === component.id && connection.to.pin === pin.id),
+                        );
+                        const highlightedWire = connectedWires.find((connection) => connection.id === highlightedWireId);
+                        const displayWire = highlightedWire ?? connectedWires[0];
+                        return <button key={pin.id} className={`schematic-pin side-${pin.side} ${active ? "active" : ""} ${displayWire ? "connected" : ""} ${highlightedWire ? "wire-highlighted" : ""}`} style={{ left: localPoint.x, top: localPoint.y, "--pin-wire-color": displayWire?.color ?? "#47b86b" } as React.CSSProperties} title={`${pin.label}${displayWire ? " · connected" : ""} · click to wire`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); connectPin({ componentId: component.id, pin: pin.id }); }}><i /><span>{pin.label}</span></button>;
                       })}
                   </article>
                 );
@@ -765,15 +1101,44 @@ export function CircuitStudio() {
               <div className="canvas-origin"><i></i><span>0,0</span></div>
             </div>
 
+            {marquee && (
+              <div
+                className="selection-marquee"
+                aria-hidden="true"
+                style={{
+                  left: Math.min(marquee.startClientX, marquee.currentClientX),
+                  top: Math.min(marquee.startClientY, marquee.currentClientY),
+                  width: Math.abs(marquee.currentClientX - marquee.startClientX),
+                  height: Math.abs(marquee.currentClientY - marquee.startClientY),
+                }}
+              />
+            )}
+
             <div className="canvas-help">
               <span className={pendingPin ? "active" : ""}>{pendingPin ? `Wiring from ${pendingPin.pin} — choose a destination pin` : "Click any pin to start a wire"}</span>
-              <span>Drag empty space to pan · Wheel to zoom · Space + drag anywhere</span>
+              <span>{selectedIds.length > 1 ? `${selectedIds.length} parts selected · Delete removes all` : "Drag empty space to select · Space or middle-drag to pan"}</span>
             </div>
             <div className="pan-readout" aria-hidden="true">X {Math.round(-pan.x / zoom)} &nbsp; Y {Math.round(-pan.y / zoom)}</div>
           </div>
         </section>
 
-        <aside className="ai-panel">
+        <aside className="ai-panel" id="ai-panel">
+          <button
+            type="button"
+            role="separator"
+            aria-label="Resize AI and Inspector panel"
+            aria-orientation="vertical"
+            aria-controls="ai-panel"
+            aria-valuemin={PANEL_LIMITS.right.min}
+            aria-valuemax={PANEL_LIMITS.right.max}
+            aria-valuenow={Math.round(panelSizes.right)}
+            aria-valuetext={`${Math.round(panelSizes.right)} pixels wide`}
+            className={`panel-resizer panel-resizer-right ${panelResize?.target === "right" ? "active" : ""}`}
+            title="Drag to resize. Double-click to reset. Use Left/Right, Home, or End from the keyboard."
+            onPointerDown={(event) => beginPanelResize("right", event)}
+            onDoubleClick={(event) => { event.preventDefault(); resetPanelSize("right"); }}
+            onKeyDown={(event) => handlePanelResizeKey("right", event)}
+          />
           <div className="side-tabs" role="tablist">
             <button className={sideTab === "assistant" ? "active" : ""} onClick={() => setSideTab("assistant")}>AI assistant <span className="spark">✦</span></button>
             <button className={sideTab === "inspector" ? "active" : ""} onClick={() => setSideTab("inspector")}>Inspector</button>
@@ -782,7 +1147,13 @@ export function CircuitStudio() {
           {sideTab === "assistant" ? (
             <>
               <div className="chat-scroll">
-                <div className="ai-model-line"><span></span> GROQ CIRCUIT PLANNER <i>SUPPORTED PARTS ONLY</i></div>
+                <div className="ai-model-line"><span></span> GEMINI CIRCUIT PLANNER <i>SUPPORTED PARTS ONLY</i></div>
+                {!chat.length && !generating && (
+                  <div className="ai-empty-state">
+                    <strong>AI-generated circuits only</strong>
+                    <p>Your prompt is sent to Gemini to generate the schematic, wiring, and Arduino code together.</p>
+                  </div>
+                )}
                 {chat.map((message) => (
                   <div className={`chat-message ${message.role}`} key={message.id}>
                     {message.role === "assistant" && <div className="avatar">✦</div>}
@@ -792,6 +1163,29 @@ export function CircuitStudio() {
                 {generating && <div className="chat-message assistant"><div className="avatar">✦</div><div className="thinking"><i></i><i></i><i></i><span>Planning circuit and checking pins…</span></div></div>}
               </div>
               <div className="prompt-zone">
+                {generationError && (
+                  <div className="generation-error" role="alert">
+                    <strong>Gemini generation failed</strong>
+                    <span>{generationError}</span>
+                    <small>Your current circuit was not changed.</small>
+                  </div>
+                )}
+                <label className="model-selector">
+                  <span>AI model</span>
+                  <select
+                    aria-label="Circuit generation model"
+                    value={aiModel}
+                    disabled={generating}
+                    onChange={(event) => {
+                      const nextModel = event.target.value;
+                      if (!isGeminiModel(nextModel)) return;
+                      setAiModel(nextModel);
+                      window.localStorage.setItem(MODEL_STORAGE_KEY, nextModel);
+                    }}
+                  >
+                    {GEMINI_MODELS.map((model) => <option key={model} value={model}>{GEMINI_MODEL_LABELS[model]}</option>)}
+                  </select>
+                </label>
                 <div className="suggestion-row">
                   {["Traffic light with 3 LEDs", "Buzzer alert every second", "Blink LED fast"].map((item) => <button key={item} onClick={() => submitPrompt(item)}>{item}</button>)}
                 </div>
@@ -804,7 +1198,14 @@ export function CircuitStudio() {
             </>
           ) : (
             <div className="inspector-content">
-              {selected && selectedDefinition ? (
+              {selectedIds.length > 1 ? (
+                <div className="multi-selection-inspector">
+                  <span>{selectedIds.length}</span>
+                  <h3>Components selected</h3>
+                  <p>Press Delete or remove them together. Attached wires will also be removed.</p>
+                  <button className="danger-button" onClick={removeSelectedComponents}>Remove selected components</button>
+                </div>
+              ) : selected && selectedDefinition ? (
                 <>
                   <div className="inspector-hero"><span style={{ "--part-accent": selectedDefinition.accent } as React.CSSProperties}>{PART_GLYPHS[selected.type] ?? "IC"}</span><div><small>SELECTED COMPONENT</small><h3>{selectedDefinition.displayName}</h3><p>{selectedDefinition.description}</p></div></div>
                   <label className="field-label">Reference label<input value={selected.label} onChange={(event) => setProject((current) => ({ ...current, components: current.components.map((component) => component.id === selected.id ? { ...component, label: event.target.value } : component) }))} onBlur={() => commitProject(projectRef.current)} /></label>
@@ -815,7 +1216,7 @@ export function CircuitStudio() {
                     </label>
                   ))}
                   <div className="pin-table"><header><span>Pin</span><span>Signals</span></header>{selectedDefinition.pins.slice(0, 14).map((pin) => <button key={pin.id} onClick={() => connectPin({ componentId: selected.id, pin: pin.id })}><strong>{pin.id}</strong><span>{pin.signals.join(" · ")}</span></button>)}</div>
-                  {selected.type !== "arduino-uno" && <button className="danger-button" onClick={() => { commitProject({ ...project, components: project.components.filter((component) => component.id !== selected.id), connections: project.connections.filter((connection) => connection.from.componentId !== selected.id && connection.to.componentId !== selected.id) }); setSelectedId(null); }}>Remove component</button>}
+                  <button className="danger-button" onClick={() => removeComponent(selected.id)}>Remove component</button>
                 </>
               ) : <div className="inspector-empty"><span>↖</span><h3>Select a component</h3><p>Click a part on the schematic to edit its label, values, pins, and placement.</p></div>}
             </div>
@@ -823,7 +1224,25 @@ export function CircuitStudio() {
         </aside>
       </section>
 
-      <section className={`bottom-drawer ${bottomOpen ? "open" : "closed"}`}>
+      <section className={`bottom-drawer ${bottomOpen ? "open" : "closed"}`} id="bottom-drawer">
+        {bottomOpen && (
+          <button
+            type="button"
+            role="separator"
+            aria-label="Resize Code and Serial drawer"
+            aria-orientation="horizontal"
+            aria-controls="bottom-drawer"
+            aria-valuemin={PANEL_LIMITS.bottom.min}
+            aria-valuemax={PANEL_LIMITS.bottom.max}
+            aria-valuenow={Math.round(panelSizes.bottom)}
+            aria-valuetext={`${Math.round(panelSizes.bottom)} pixels tall`}
+            className={`panel-resizer panel-resizer-bottom ${panelResize?.target === "bottom" ? "active" : ""}`}
+            title="Drag to resize. Double-click to reset. Use Up/Down, Home, or End from the keyboard."
+            onPointerDown={(event) => beginPanelResize("bottom", event)}
+            onDoubleClick={(event) => { event.preventDefault(); resetPanelSize("bottom"); }}
+            onKeyDown={(event) => handlePanelResizeKey("bottom", event)}
+          />
+        )}
         <div className="drawer-bar">
           <div className="bottom-tabs">
             <button className={bottomTab === "code" ? "active" : ""} onClick={() => { setBottomTab("code"); setBottomOpen(true); }}>Sketch.ino <span className="language-dot">C++</span></button>
@@ -850,7 +1269,7 @@ export function CircuitStudio() {
       </section>
 
       <footer className="statusbar">
-        <span><i className="status-ok"></i> Arduino Uno</span><span>Digital simulator</span><span>{project.components.length} components</span><span>{project.connections.length} nets</span><span className="status-spacer"></span><span>Schema v{project.schemaVersion}</span><span>Local project</span>
+        <span><i className={arduinoCount === 1 ? "status-ok" : "status-warning"}></i>{arduinoCount === 0 ? "No Arduino board" : arduinoCount === 1 ? "Arduino Uno" : `${arduinoCount} Arduino Uno boards`}</span><span>Digital simulator</span><span>{project.components.length} components</span><span>{project.connections.length} nets</span><span className="status-spacer"></span><span>Schema v{project.schemaVersion}</span><span>Local project</span>
       </footer>
       {toast && <div className="toast" role="status"><span>✓</span>{toast}</div>}
     </main>
