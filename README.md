@@ -1,6 +1,6 @@
-# Zircuit
+# Cirkitra
 
-Zircuit is a browser-based Arduino Uno workbench. Describe a circuit, review the generated schematic and C++ sketch, edit either one, then run the supported firmware subset in a deterministic digital simulator.
+Cirkitra is a browser-based Arduino Uno workbench. Describe a circuit, review the generated schematic and C++ sketch, edit either one, then run the supported firmware subset in a deterministic digital simulator.
 
 ## Included in v1
 

@@ -3,7 +3,7 @@ import { Analytics } from "@vercel/analytics/next";
 import "./globals.css";
 import "./schematic-symbols.css";
 
-const title = "Zircuit";
+const title = "Cirkitra";
 const description =
   "Design Arduino circuits with AI, edit the schematic and code, then simulate the result in your browser.";
 

@@ -5,14 +5,14 @@ import test from "node:test";
 import { POST as generateCircuit } from "../app/api/ai/generate/route.ts";
 import { POST as compileSketch } from "../app/api/compile/route.ts";
 
-test("the Zircuit workbench and metadata contain the production identity", async () => {
+test("the Cirkitra workbench and metadata contain the production identity", async () => {
   const [layout, studio] = await Promise.all([
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/studio.tsx", import.meta.url), "utf8"),
   ]);
   const source = `${layout}\n${studio}`;
 
-  assert.match(source, /const title = "Zircuit"/);
+  assert.match(source, /const title = "Cirkitra"/);
   assert.match(source, /import \{ Analytics \} from "@vercel\/analytics\/next"/);
   assert.match(source, /<Analytics\s*\/>/);
   assert.doesNotMatch(source, /IMAGINE · WIRE · RUN/);

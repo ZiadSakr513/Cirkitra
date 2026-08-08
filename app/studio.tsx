@@ -899,7 +899,7 @@ export function CircuitStudio() {
       setSelectedIds([]);
       announce("Project imported");
     } catch {
-      announce("That file is not a valid Zircuit project");
+      announce("That file is not a valid Cirkitra project");
     }
   };
 
@@ -916,7 +916,7 @@ export function CircuitStudio() {
         <div className="brand-block">
           <div className="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
           <div>
-            <div className="brand-name">Zircuit</div>
+            <div className="brand-name">Cirkitra</div>
             <div className="brand-owner">Founded by <strong>Ziad Sakr</strong></div>
           </div>
         </div>

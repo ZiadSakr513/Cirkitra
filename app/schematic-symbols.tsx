@@ -198,7 +198,7 @@ function SevenSegmentSymbol({ color, powered }: { color: string; powered: boolea
 
 function LcdSymbol({ powered, text }: { powered: boolean; text: string }) {
   const normalizedText = text.replace(/\s+/g, " ").trim();
-  const firstLine = (normalizedText || "ZIRCUIT").slice(0, 16);
+  const firstLine = (normalizedText || "CIRKITRA").slice(0, 16);
   const secondLine = normalizedText.slice(16, 32) || (powered ? "READY_" : "");
   return (
     <div className={symbolClass("lcd-16x2", powered)} aria-hidden="true">
