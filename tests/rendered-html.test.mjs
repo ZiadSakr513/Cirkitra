@@ -13,6 +13,8 @@ test("the Zircuit workbench and metadata contain the production identity", async
   const source = `${layout}\n${studio}`;
 
   assert.match(source, /const title = "Zircuit"/);
+  assert.match(source, /import \{ Analytics \} from "@vercel\/analytics\/next"/);
+  assert.match(source, /<Analytics\s*\/>/);
   assert.doesNotMatch(source, /IMAGINE · WIRE · RUN/);
   assert.match(source, /Founded by/);
   assert.match(source, /Ziad Sakr/);
