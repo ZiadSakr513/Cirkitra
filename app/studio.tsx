@@ -834,19 +834,19 @@ export function CircuitStudio() {
       if (!response.ok) {
         throw new Error(
           result.error?.message ||
-          `Gemini generation failed${result.error?.code ? ` (${result.error.code})` : ""}.`,
+          `AI generation failed${result.error?.code ? ` (${result.error.code})` : ""}.`,
         );
       }
 
       const parsed = safeParseCircuitProject(result.project);
       if (!parsed.success) {
-        throw new Error("Gemini returned circuit data that failed project validation.");
+        throw new Error("AI returned circuit data that failed project validation.");
       }
       const explanation = typeof result.explanation === "string"
         ? result.explanation.trim()
         : "";
       if (!explanation) {
-        throw new Error("Gemini returned a circuit without an explanation.");
+        throw new Error("AI returned a circuit without an explanation.");
       }
 
       const nextProject = {
@@ -870,9 +870,9 @@ export function CircuitStudio() {
     } catch (error) {
       const message = error instanceof Error && error.message.trim()
         ? error.message.trim()
-        : "The app could not reach Gemini. Try again.";
+        : "The app could not reach the AI service. Try again.";
       setGenerationError(message);
-      announce("Gemini generation failed — current circuit unchanged");
+      announce("AI generation failed — current circuit unchanged");
     } finally {
       setGenerating(false);
     }
@@ -1157,11 +1157,10 @@ export function CircuitStudio() {
           {sideTab === "assistant" ? (
             <>
               <div className="chat-scroll">
-                <div className="ai-model-line"><span></span> GEMINI CIRCUIT PLANNER <i>SUPPORTED PARTS ONLY</i></div>
+                <div className="ai-model-line"><span></span> AI CIRCUIT PLANNER <i>SUPPORTED PARTS ONLY</i></div>
                 {!chat.length && !generating && (
                   <div className="ai-empty-state">
-                    <strong>AI-generated circuits only</strong>
-                    <p>Your prompt is sent to Gemini to generate the schematic, wiring, and Arduino code together.</p>
+                    <p>Your prompt is sent to AI to generate the schematic, wiring, and Arduino code together.</p>
                   </div>
                 )}
                 {chat.map((message) => (
@@ -1175,7 +1174,7 @@ export function CircuitStudio() {
               <div className="prompt-zone">
                 {generationError && (
                   <div className="generation-error" role="alert">
-                    <strong>Gemini generation failed</strong>
+                    <strong>AI generation failed</strong>
                     <span>{generationError}</span>
                     <small>Your current circuit was not changed.</small>
                   </div>

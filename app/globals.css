@@ -623,8 +623,7 @@ select:focus-visible {
 .ai-model-line > span { width: 6px; height: 6px; border-radius: 50%; background: var(--teal); box-shadow: 0 0 7px #42d7bd88; }
 .ai-model-line i { margin-left: auto; color: #4b5c69; font-size: 7px; font-style: normal; }
 .ai-empty-state { display: grid; min-height: 190px; place-content: center; padding: 24px; text-align: center; }
-.ai-empty-state strong { color: #c4d2da; font-size: 11px; }
-.ai-empty-state p { max-width: 235px; margin: 7px auto 0; color: #657583; font-size: 9px; line-height: 1.55; }
+.ai-empty-state p { max-width: 235px; margin: 0 auto; color: #657583; font-size: 9px; line-height: 1.55; }
 
 .chat-message { display: flex; gap: 9px; margin-bottom: 14px; }
 .chat-message.user { justify-content: flex-end; }

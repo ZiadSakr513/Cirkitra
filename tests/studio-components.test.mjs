@@ -54,6 +54,11 @@ test("Gemini model selection defaults, persists, and is sent with prompts", asyn
   assert.match(source, /localStorage\.setItem\(MODEL_STORAGE_KEY, nextModel\)/);
   assert.match(source, /JSON\.stringify\(\{ prompt: clean, currentProject: project, model: aiModel \}\)/);
   assert.match(source, /aria-label="Circuit generation model"/);
+  assert.match(source, /AI CIRCUIT PLANNER/);
+  assert.match(source, /"gemini-3\.5-flash": "Gemini 3\.5 Flash"/);
+  assert.doesNotMatch(source, />\s*GEMINI CIRCUIT PLANNER/);
+  assert.doesNotMatch(source, /sent to Gemini|Gemini generation failed/);
+  assert.doesNotMatch(source, /AI-generated circuits only/);
 });
 
 test("canvas marquee selects and deletes multiple components", async () => {
