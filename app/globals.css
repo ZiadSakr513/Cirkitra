@@ -497,6 +497,26 @@ select:focus-visible {
 .wire-route.highlighted .wire-segment.horizontal::before { inset: 2px 0; }
 .wire-route.highlighted .wire-segment.vertical::before { inset: 0 2px; }
 
+.wire-bridge {
+  position: absolute;
+  z-index: 4;
+  width: 16px;
+  height: 10px;
+  border: 3px solid var(--wire-color, #42d7bd);
+  border-bottom: 0;
+  border-radius: 10px 10px 0 0;
+  background: #09131d;
+  box-shadow: 0 -2px 5px color-mix(in srgb, var(--wire-color, #42d7bd) 35%, transparent);
+  pointer-events: none;
+  transform: translate(-50%, -70%);
+}
+
+.wire-bridge.vertical { transform: translate(-50%, -50%) rotate(90deg); }
+.wire-route.highlighted .wire-bridge {
+  border-color: color-mix(in srgb, var(--wire-color, #42d7bd) 76%, white);
+  box-shadow: 0 -2px 8px color-mix(in srgb, var(--wire-color, #42d7bd) 70%, transparent);
+}
+
 .wire-junction {
   position: absolute;
   z-index: 2;

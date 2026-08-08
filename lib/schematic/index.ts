@@ -1,11 +1,14 @@
 export {
   centerComponentsAtOrigin,
   componentSize,
+  coordinatedWireRoutes,
   fitViewport,
   orthogonalWireSegments,
   pinAwareWireSegments,
   pinPosition,
   type ComponentSize,
+  type CoordinatedWireInput,
+  type CoordinatedWireRoute,
   type Point,
   type SchematicComponentLike,
   type SchematicDefinitionLike,
@@ -15,4 +18,5 @@ export {
   type ViewportZoomLimits,
   type WireSegment,
   type WireRouteEndpoint,
+  type WireBridge,
 } from "./geometry.ts";

@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   centerComponentsAtOrigin,
   componentSize,
+  coordinatedWireRoutes,
   fitViewport,
   orthogonalWireSegments,
   pinAwareWireSegments,
@@ -137,6 +138,42 @@ test("pin-aware routing does not tunnel through component bodies", () => {
       ? segment.from.y > 0 && segment.from.y < 350 && Math.max(segment.from.x, segment.to.x) > 0 && Math.min(segment.from.x, segment.to.x) < 320
       : segment.from.x > 0 && segment.from.x < 320 && Math.max(segment.from.y, segment.to.y) > 0 && Math.min(segment.from.y, segment.to.y) < 350;
     assert.equal(crossesBoardInterior, false, "wire must not cross the Arduino body");
+  }
+});
+
+test("coordinated routing assigns separate lanes and remains deterministic", () => {
+  const wires = [
+    {
+      id: "upper",
+      from: { point: { x: 0, y: 0 }, side: "right" as const },
+      to: { point: { x: 300, y: 100 }, side: "left" as const },
+    },
+    {
+      id: "lower",
+      from: { point: { x: 0, y: 20 }, side: "right" as const },
+      to: { point: { x: 300, y: 120 }, side: "left" as const },
+    },
+  ];
+  const first = coordinatedWireRoutes(wires, []);
+  const second = coordinatedWireRoutes(wires, []);
+
+  assert.deepEqual(first, second, "the same schematic must always produce the same routes");
+  const [upper, lower] = first;
+  for (const a of upper.segments) {
+    for (const b of lower.segments) {
+      const bothHorizontal = a.from.y === a.to.y && b.from.y === b.to.y;
+      const bothVertical = a.from.x === a.to.x && b.from.x === b.to.x;
+      if (bothHorizontal && a.from.y === b.from.y) {
+        const overlap = Math.min(Math.max(a.from.x, a.to.x), Math.max(b.from.x, b.to.x)) -
+          Math.max(Math.min(a.from.x, a.to.x), Math.min(b.from.x, b.to.x));
+        assert.ok(overlap <= 0, "unrelated horizontal wire segments must not share a lane");
+      }
+      if (bothVertical && a.from.x === b.from.x) {
+        const overlap = Math.min(Math.max(a.from.y, a.to.y), Math.max(b.from.y, b.to.y)) -
+          Math.max(Math.min(a.from.y, a.to.y), Math.min(b.from.y, b.to.y));
+        assert.ok(overlap <= 0, "unrelated vertical wire segments must not share a lane");
+      }
+    }
   }
 });
 

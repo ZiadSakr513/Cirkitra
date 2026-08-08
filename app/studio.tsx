@@ -32,8 +32,8 @@ import {
 import {
   centerComponentsAtOrigin,
   componentSize,
+  coordinatedWireRoutes,
   fitViewport,
-  pinAwareWireSegments,
   pinPosition,
 } from "../lib/schematic";
 import { SchematicSymbol } from "./schematic-symbols";
@@ -570,6 +570,22 @@ export function CircuitStudio() {
     () => resolveLedCircuitBindings(project),
     [project],
   );
+  const wireRoutes = useMemo(() => {
+    const inputs = project.connections.flatMap((connection) => {
+      const fromComponent = project.components.find((component) => component.id === connection.from.componentId);
+      const toComponent = project.components.find((component) => component.id === connection.to.componentId);
+      const fromDefinition = fromComponent ? getComponentDefinition(fromComponent.type) : undefined;
+      const toDefinition = toComponent ? getComponentDefinition(toComponent.type) : undefined;
+      if (!fromComponent || !toComponent || !fromDefinition || !toDefinition) return [];
+      const fromPin = fromDefinition.pins.find((pin) => pin.id === connection.from.pin);
+      const toPin = toDefinition.pins.find((pin) => pin.id === connection.to.pin);
+      const from = pinPosition({ ...fromComponent, rotation: 0 }, connection.from.pin, fromDefinition);
+      const to = pinPosition({ ...toComponent, rotation: 0 }, connection.to.pin, toDefinition);
+      if (!fromPin || !toPin || !from || !to) return [];
+      return [{ id: connection.id, from: { point: from, side: fromPin.side }, to: { point: to, side: toPin.side } }];
+    });
+    return new Map(coordinatedWireRoutes(inputs, project.components).map((route) => [route.id, route]));
+  }, [project.components, project.connections]);
 
   const parts = useMemo(() => {
     const search = paletteSearch.trim().toLowerCase();
@@ -1035,11 +1051,9 @@ export function CircuitStudio() {
                 const fromPin = fromDefinition.pins.find((pin) => pin.id === connection.from.pin);
                 const toPin = toDefinition.pins.find((pin) => pin.id === connection.to.pin);
                 if (!fromPin || !toPin) return null;
-                const segments = pinAwareWireSegments(
-                  { point: from, side: fromPin.side },
-                  { point: to, side: toPin.side },
-                  project.components,
-                );
+                const route = wireRoutes.get(connection.id);
+                if (!route) return null;
+                const segments = route.segments;
                 const wireTitle = `${fromComponent.label}: ${fromPin.label} → ${toComponent.label}: ${toPin.label}. Click to remove.`;
                 const removeWire = (event: React.MouseEvent) => {
                   event.stopPropagation();
@@ -1069,6 +1083,13 @@ export function CircuitStudio() {
                         />
                       );
                     })}
+                    {route.bridges.map((bridge, index) => (
+                      <i
+                        className={`wire-bridge ${bridge.orientation}`}
+                        key={`bridge-${index}`}
+                        style={{ left: bridge.point.x, top: bridge.point.y }}
+                      />
+                    ))}
                     <i className="wire-junction from" style={{ left: from.x, top: from.y }} />
                     <i className="wire-junction to" style={{ left: to.x, top: to.y }} />
                   </div>

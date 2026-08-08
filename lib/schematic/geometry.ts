@@ -46,6 +46,24 @@ export interface WireRouteEndpoint {
   side: SchematicPinSide;
 }
 
+export interface CoordinatedWireInput {
+  id: string;
+  from: WireRouteEndpoint;
+  to: WireRouteEndpoint;
+}
+
+export interface WireBridge {
+  point: Point;
+  segmentIndex: number;
+  orientation: "horizontal" | "vertical";
+}
+
+export interface CoordinatedWireRoute {
+  id: string;
+  segments: WireSegment[];
+  bridges: WireBridge[];
+}
+
 /**
  * A transform where `screenPoint = worldPoint * zoom + pan`.
  */
@@ -245,6 +263,117 @@ function segmentsFromPoints(points: readonly Point[]): WireSegment[] {
   return compact.slice(1).map((point, index) => ({ from: compact[index], to: point }));
 }
 
+function rangesOverlap(a1: number, a2: number, b1: number, b2: number) {
+  return Math.max(Math.min(a1, a2), Math.min(b1, b2)) < Math.min(Math.max(a1, a2), Math.max(b1, b2));
+}
+
+function collinearOverlap(a: WireSegment, b: WireSegment) {
+  const aHorizontal = a.from.y === a.to.y;
+  const bHorizontal = b.from.y === b.to.y;
+  if (aHorizontal !== bHorizontal) return false;
+  return aHorizontal
+    ? a.from.y === b.from.y && rangesOverlap(a.from.x, a.to.x, b.from.x, b.to.x)
+    : a.from.x === b.from.x && rangesOverlap(a.from.y, a.to.y, b.from.y, b.to.y);
+}
+
+function perpendicularIntersection(a: WireSegment, b: WireSegment): Point | undefined {
+  const aHorizontal = a.from.y === a.to.y;
+  const bHorizontal = b.from.y === b.to.y;
+  if (aHorizontal === bHorizontal) return undefined;
+  const horizontal = aHorizontal ? a : b;
+  const vertical = aHorizontal ? b : a;
+  const point = { x: vertical.from.x, y: horizontal.from.y };
+  const insideHorizontal = point.x > Math.min(horizontal.from.x, horizontal.to.x) && point.x < Math.max(horizontal.from.x, horizontal.to.x);
+  const insideVertical = point.y > Math.min(vertical.from.y, vertical.to.y) && point.y < Math.max(vertical.from.y, vertical.to.y);
+  return insideHorizontal && insideVertical ? point : undefined;
+}
+
+function candidateMiddleRoutes(
+  start: Point,
+  end: Point,
+  obstacles: readonly Bounds[],
+  clearance: number,
+) {
+  const minLeft = Math.min(start.x, end.x, ...obstacles.map((bounds) => bounds.left)) - clearance;
+  const maxRight = Math.max(start.x, end.x, ...obstacles.map((bounds) => bounds.right)) + clearance;
+  const minTop = Math.min(start.y, end.y, ...obstacles.map((bounds) => bounds.top)) - clearance;
+  const maxBottom = Math.max(start.y, end.y, ...obstacles.map((bounds) => bounds.bottom)) + clearance;
+  const xBases = [start.x, end.x, (start.x + end.x) / 2, minLeft, maxRight, ...obstacles.flatMap((bounds) => [bounds.left, bounds.right])];
+  const yBases = [start.y, end.y, (start.y + end.y) / 2, minTop, maxBottom, ...obstacles.flatMap((bounds) => [bounds.top, bounds.bottom])];
+  const laneOffsets = [0, -12, 12, -24, 24, -36, 36, -48, 48];
+  const xChannels = [...new Set(xBases.flatMap((value) => laneOffsets.map((offset) => value + offset)))];
+  const yChannels = [...new Set(yBases.flatMap((value) => laneOffsets.map((offset) => value + offset)))];
+  const candidates: Point[][] = [
+    [start, { x: end.x, y: start.y }, end],
+    [start, { x: start.x, y: end.y }, end],
+  ];
+  for (const x of xChannels) candidates.push([start, { x, y: start.y }, { x, y: end.y }, end]);
+  for (const y of yChannels) candidates.push([start, { x: start.x, y }, { x: end.x, y }, end]);
+  return candidates
+    .map(segmentsFromPoints)
+    .filter((segments) => segments.every((segment) => obstacles.every((bounds) => !segmentCrossesBounds(segment, bounds))));
+}
+
+function routeScore(candidate: readonly WireSegment[], occupied: readonly WireSegment[]) {
+  const length = candidate.reduce((sum, segment) => sum + segmentLength(segment), 0);
+  let overlaps = 0;
+  let crossings = 0;
+  for (const segment of candidate) {
+    for (const other of occupied) {
+      if (collinearOverlap(segment, other)) overlaps += 1;
+      else if (perpendicularIntersection(segment, other)) crossings += 1;
+    }
+  }
+  return overlaps * 1_000_000 + crossings * 4_000 + candidate.length * 32 + length;
+}
+
+/** Route all wires together so later wires avoid lanes already in use. */
+export function coordinatedWireRoutes(
+  wires: readonly CoordinatedWireInput[],
+  components: readonly SchematicComponentLike[],
+  clearance = 18,
+): CoordinatedWireRoute[] {
+  const safeClearance = Number.isFinite(clearance) ? Math.max(8, clearance) : 18;
+  const obstacles = components.map((component) => {
+    const bounds = componentBounds(component);
+    return { left: bounds.left - safeClearance, top: bounds.top - safeClearance, right: bounds.right + safeClearance, bottom: bounds.bottom + safeClearance };
+  });
+  const routes: CoordinatedWireRoute[] = [];
+  const occupied: WireSegment[] = [];
+
+  for (const wire of wires) {
+    const start = escapePoint(wire.from, safeClearance);
+    const end = escapePoint(wire.to, safeClearance);
+    const startLead = { from: { ...wire.from.point }, to: start };
+    const endLead = { from: end, to: { ...wire.to.point } };
+    const candidates = candidateMiddleRoutes(start, end, obstacles, safeClearance)
+      .sort((a, b) => routeScore(a, occupied) - routeScore(b, occupied));
+    const middle = candidates[0] ?? segmentsFromPoints([start, { x: start.x, y: end.y }, end]);
+    const segments = [startLead, ...middle, endLead].filter((segment) => segmentLength(segment) > 0);
+    routes.push({ id: wire.id, segments, bridges: [] });
+    occupied.push(...segments);
+  }
+
+  for (let routeIndex = 0; routeIndex < routes.length; routeIndex += 1) {
+    const route = routes[routeIndex];
+    for (let earlierIndex = 0; earlierIndex < routeIndex; earlierIndex += 1) {
+      for (let segmentIndex = 0; segmentIndex < route.segments.length; segmentIndex += 1) {
+        const segment = route.segments[segmentIndex];
+        for (const earlierSegment of routes[earlierIndex].segments) {
+          const point = perpendicularIntersection(segment, earlierSegment);
+          if (!point) continue;
+          route.bridges.push({
+            point,
+            segmentIndex,
+            orientation: segment.from.y === segment.to.y ? "horizontal" : "vertical",
+          });
+        }
+      }
+    }
+  }
+  return routes;
+}
+
 /**
  * Route a wire away from each pin in the direction that pin faces, then choose
  * the shortest orthogonal channel that does not cross a component body.
@@ -268,28 +397,8 @@ export function pinAwareWireSegments(
     };
   });
   const minLeft = Math.min(start.x, end.x, ...obstacles.map((bounds) => bounds.left)) - safeClearance;
-  const maxRight = Math.max(start.x, end.x, ...obstacles.map((bounds) => bounds.right)) + safeClearance;
   const minTop = Math.min(start.y, end.y, ...obstacles.map((bounds) => bounds.top)) - safeClearance;
-  const maxBottom = Math.max(start.y, end.y, ...obstacles.map((bounds) => bounds.bottom)) + safeClearance;
-  const xChannels = new Set([start.x, end.x, (start.x + end.x) / 2, minLeft, maxRight]);
-  const yChannels = new Set([start.y, end.y, (start.y + end.y) / 2, minTop, maxBottom]);
-  for (const bounds of obstacles) {
-    xChannels.add(bounds.left);
-    xChannels.add(bounds.right);
-    yChannels.add(bounds.top);
-    yChannels.add(bounds.bottom);
-  }
-
-  const candidates: Point[][] = [
-    [start, { x: end.x, y: start.y }, end],
-    [start, { x: start.x, y: end.y }, end],
-  ];
-  for (const x of xChannels) candidates.push([start, { x, y: start.y }, { x, y: end.y }, end]);
-  for (const y of yChannels) candidates.push([start, { x: start.x, y }, { x: end.x, y }, end]);
-
-  const validRoutes = candidates
-    .map(segmentsFromPoints)
-    .filter((segments) => segments.every((segment) => obstacles.every((bounds) => !segmentCrossesBounds(segment, bounds))))
+  const validRoutes = candidateMiddleRoutes(start, end, obstacles, safeClearance)
     .sort((a, b) => {
       const lengthDifference = a.reduce((sum, segment) => sum + segmentLength(segment), 0) -
         b.reduce((sum, segment) => sum + segmentLength(segment), 0);
