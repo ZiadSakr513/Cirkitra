@@ -108,4 +108,7 @@ test("mobile users can open both workspace side panels", async () => {
   assert.match(styles, /\.parts-panel\.mobile-open \{ display: flex/);
   assert.match(styles, /\.ai-panel\.mobile-open \{ display: grid/);
   assert.match(styles, /\.mobile-panel-backdrop/);
+  assert.match(styles, /\.canvas-column \{ grid-template-rows: 72px minmax\(0, 1fr\); \}/);
+  assert.doesNotMatch(styles, /\.zoom-controls button:first-child[\s\S]*?display: none/);
+  assert.doesNotMatch(styles, /\.zoom-controls button:nth-child\(3\)[\s\S]*?display: none/);
 });
