@@ -93,3 +93,19 @@ test("pan mode still allows components to be dragged", async () => {
   assert.match(beginDrag, /setDragState/);
   assert.match(source, /Drag empty canvas to pan, or drag a component to move it/);
 });
+
+test("mobile users can open both workspace side panels", async () => {
+  const [source, styles] = await Promise.all([
+    readFile(studioUrl, "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(source, /type MobilePanel = "library" \| "assistant" \| null/);
+  assert.match(source, /setMobilePanel\("library"\)/);
+  assert.match(source, /setMobilePanel\("assistant"\)/);
+  assert.match(source, /aria-controls="components-panel"/);
+  assert.match(source, /aria-controls="ai-panel"/);
+  assert.match(styles, /\.parts-panel\.mobile-open \{ display: flex/);
+  assert.match(styles, /\.ai-panel\.mobile-open \{ display: grid/);
+  assert.match(styles, /\.mobile-panel-backdrop/);
+});

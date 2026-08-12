@@ -65,6 +65,7 @@ type PanelResizeState = {
   startSize: number;
 };
 type CanvasTool = "select" | "pan";
+type MobilePanel = "library" | "assistant" | null;
 type MarqueeState = {
   pointerId: number;
   startClientX: number;
@@ -236,6 +237,7 @@ export function CircuitStudio() {
   const [paletteCategory, setPaletteCategory] = useState<(typeof PALETTE_CATEGORIES)[number]>("all");
   const [paletteSearch, setPaletteSearch] = useState("");
   const [sideTab, setSideTab] = useState<SideTab>("assistant");
+  const [mobilePanel, setMobilePanel] = useState<MobilePanel>(null);
   const [bottomTab, setBottomTab] = useState<BottomTab>("code");
   const [bottomOpen, setBottomOpen] = useState(true);
   const [panelSizes, setPanelSizes] = useState<PanelSizes>(DEFAULT_PANEL_SIZES);
@@ -967,10 +969,13 @@ export function CircuitStudio() {
       </header>
 
       <section className="workspace">
-        <aside className="parts-panel" id="components-panel">
+        <aside className={`parts-panel ${mobilePanel === "library" ? "mobile-open" : ""}`} id="components-panel">
           <div className="panel-heading">
             <div><span className="eyebrow">Library</span><h2>Components</h2></div>
-            <span className="count-badge">{SUPPORTED_COMPONENT_TYPES.length}</span>
+            <div className="panel-heading-actions">
+              <span className="count-badge">{SUPPORTED_COMPONENT_TYPES.length}</span>
+              <button className="mobile-panel-close" onClick={() => setMobilePanel(null)} aria-label="Close component library">×</button>
+            </div>
           </div>
           <label className="search-field">
             <span aria-hidden="true">⌕</span>
@@ -984,7 +989,7 @@ export function CircuitStudio() {
           </div>
           <div className="parts-list">
             {parts.map((part) => (
-              <button className="part-card" key={part.id} onClick={() => addPart(part.id)} title={`Add ${part.displayName}`}>
+              <button className="part-card" key={part.id} onClick={() => { addPart(part.id); setMobilePanel(null); }} title={`Add ${part.displayName}`}>
                 <span className="part-glyph" style={{ "--part-accent": part.accent } as React.CSSProperties}>{PART_GLYPHS[part.id] ?? "IC"}</span>
                 <span><strong>{part.displayName}</strong><small>{part.category}</small></span>
                 <i>+</i>
@@ -1016,6 +1021,10 @@ export function CircuitStudio() {
               <button className={`tool ${canvasTool === "select" && !spaceHeld ? "active" : ""}`} onClick={() => setCanvasTool("select")} title="Select, move, or drag a box around parts">↖ <span>Select</span></button>
               <button className={`tool ${canvasTool === "pan" || spaceHeld || panDrag ? "active" : ""}`} onClick={() => setCanvasTool("pan")} title="Drag empty canvas to pan, or drag a component to move it. Middle-drag or hold Space to pan anywhere.">✋ <span>Pan</span></button>
               <button className={`tool ${pendingPin ? "active amber" : ""}`} onClick={() => setPendingPin(null)} title="Wire">⌁ <span>{pendingPin ? "Cancel wire" : "Wire"}</span></button>
+            </div>
+            <div className="mobile-panel-buttons" aria-label="Workspace panels">
+              <button onClick={() => setMobilePanel("library")} aria-controls="components-panel" aria-expanded={mobilePanel === "library"}>Components</button>
+              <button onClick={() => { setSideTab("assistant"); setMobilePanel("assistant"); }} aria-controls="ai-panel" aria-expanded={mobilePanel === "assistant"}>AI assistant</button>
             </div>
             <div className="canvas-title">
               <strong>Schematic</strong><span>{project.components.length} parts · {project.connections.length} wires</span>
@@ -1158,7 +1167,7 @@ export function CircuitStudio() {
           </div>
         </section>
 
-        <aside className="ai-panel" id="ai-panel">
+        <aside className={`ai-panel ${mobilePanel === "assistant" ? "mobile-open" : ""}`} id="ai-panel">
           <button
             type="button"
             role="separator"
@@ -1178,6 +1187,7 @@ export function CircuitStudio() {
           <div className="side-tabs" role="tablist">
             <button className={sideTab === "assistant" ? "active" : ""} onClick={() => setSideTab("assistant")}>AI assistant <span className="spark">✦</span></button>
             <button className={sideTab === "inspector" ? "active" : ""} onClick={() => setSideTab("inspector")}>Inspector</button>
+            <button className="mobile-panel-close" onClick={() => setMobilePanel(null)} aria-label="Close AI assistant">×</button>
           </div>
 
           {sideTab === "assistant" ? (
@@ -1257,6 +1267,8 @@ export function CircuitStudio() {
             </div>
           )}
         </aside>
+
+        {mobilePanel && <button className="mobile-panel-backdrop" onClick={() => setMobilePanel(null)} aria-label="Close open panel" />}
       </section>
 
       <section className={`bottom-drawer ${bottomOpen ? "open" : "closed"}`} id="bottom-drawer">
