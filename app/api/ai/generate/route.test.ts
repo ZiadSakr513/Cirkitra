@@ -11,6 +11,20 @@ const generatedEnvelope = {
   warnings: [],
 };
 
+function modelResponse(text: string, finishReason = "STOP") {
+  return Response.json({
+    candidates: [{ finishReason, content: { parts: [{ text }] } }],
+  });
+}
+
+function generationRequest(model?: string) {
+  return new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompt: "Blink an LED", ...(model ? { model } : {}) }),
+  });
+}
+
 test("forwards only the default and selected Gemini models", async (context) => {
   const originalFetch = globalThis.fetch;
   const originalKey = process.env.GEMINI_API_KEY;
@@ -55,7 +69,148 @@ test("forwards only the default and selected Gemini models", async (context) => 
     const headers = new Headers(request.init?.headers);
     const body = JSON.parse(String(request.init?.body));
     assert.equal(headers.get("x-goog-api-key"), "test-secret");
+    assert.equal(body.generationConfig.maxOutputTokens, 8_192);
     assert.equal(body.generationConfig.responseMimeType, "application/json");
+    assert.equal(body.generationConfig.responseSchema.type, "object");
+    assert.ok(body.generationConfig.responseSchema.properties.project);
     assert.equal("temperature" in body.generationConfig, false);
   }
+});
+
+test("repairs malformed JSON before returning a circuit", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const requests: RequestInit[] = [];
+  const responses = [
+    modelResponse('{"project":'),
+    modelResponse(JSON.stringify(generatedEnvelope)),
+  ];
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    requests.push(init ?? {});
+    return responses.shift() ?? modelResponse("");
+  };
+
+  const response = await POST(generationRequest("gemini-3.5-flash-lite"));
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).model, "gemini-3.5-flash-lite");
+  assert.equal(requests.length, 2);
+  const repairBody = JSON.parse(String(requests[1].body));
+  const repairData = JSON.parse(repairBody.contents[0].parts[0].text);
+  assert.match(repairData.task, /Repair the rejected circuit proposal/);
+  assert.deepEqual(repairData.validationIssues, ["response invalid_json"]);
+  assert.equal(repairData.rejectedResponse, '{"project":');
+});
+
+test("passes schema issues into the repair attempt", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const requests: RequestInit[] = [];
+  const responses = [
+    modelResponse(JSON.stringify({ project: {} })),
+    modelResponse(JSON.stringify(generatedEnvelope)),
+  ];
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    requests.push(init ?? {});
+    return responses.shift() ?? modelResponse("");
+  };
+
+  const response = await POST(generationRequest());
+  assert.equal(response.status, 200);
+  const repairBody = JSON.parse(String(requests[1].body));
+  const repairData = JSON.parse(repairBody.contents[0].parts[0].text);
+  assert.ok(repairData.validationIssues.includes("project.schemaVersion must be 1"));
+  assert.equal("details" in (await response.json()), false);
+});
+
+test("regenerates cleanly when repair is also malformed", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const requests: RequestInit[] = [];
+  const responses = [
+    modelResponse("not json"),
+    modelResponse("still not json"),
+    modelResponse(JSON.stringify(generatedEnvelope)),
+  ];
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    requests.push(init ?? {});
+    return responses.shift() ?? modelResponse("");
+  };
+
+  const response = await POST(generationRequest());
+  assert.equal(response.status, 200);
+  assert.equal(requests.length, 3);
+  const firstBody = JSON.parse(String(requests[0].body));
+  const repairBody = JSON.parse(String(requests[1].body));
+  const regeneratedBody = JSON.parse(String(requests[2].body));
+  assert.equal(
+    regeneratedBody.contents[0].parts[0].text,
+    firstBody.contents[0].parts[0].text,
+  );
+  assert.notEqual(
+    repairBody.contents[0].parts[0].text,
+    firstBody.contents[0].parts[0].text,
+  );
+});
+
+test("returns one friendly error after all recovery attempts fail", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  let calls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async () => {
+    calls += 1;
+    return modelResponse("malformed");
+  };
+
+  const response = await POST(generationRequest());
+  const body = await response.json();
+  assert.equal(response.status, 502);
+  assert.equal(calls, 3);
+  assert.equal(body.error.code, "AI_GENERATION_INCOMPLETE");
+  assert.equal(body.error.message, "We couldn’t finish this circuit right now. Please try again.");
+  assert.equal("details" in body.error, false);
+});
+
+test("terminal provider failures do not trigger recovery calls", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  let calls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async () => {
+    calls += 1;
+    return Response.json({ error: { message: "rate limited" } }, { status: 429 });
+  };
+
+  const response = await POST(generationRequest());
+  assert.equal(response.status, 429);
+  assert.equal(calls, 1);
+  assert.equal((await response.json()).error.code, "AI_RATE_LIMITED");
 });

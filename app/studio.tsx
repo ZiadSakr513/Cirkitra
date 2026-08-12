@@ -1205,7 +1205,7 @@ export function CircuitStudio() {
                     <div><p>{message.text}</p>{message.meta && <small>{message.meta}</small>}</div>
                   </div>
                 ))}
-                {generating && <div className="chat-message assistant"><div className="avatar">✦</div><div className="thinking"><i></i><i></i><i></i><span>Planning circuit and checking pins…</span></div></div>}
+                {generating && <div className="chat-message assistant"><div className="avatar">✦</div><div className="thinking"><i></i><i></i><i></i><span>Checking and finalizing the circuit…</span></div></div>}
               </div>
               <div className="prompt-zone">
                 {generationError && (
