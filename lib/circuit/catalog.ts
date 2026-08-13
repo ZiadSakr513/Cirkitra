@@ -455,8 +455,13 @@ export const COMPONENT_CATALOG = {
         kind: "boolean",
         defaultValue: false,
       },
+      pressed: {
+        label: "Pressed",
+        kind: "boolean",
+        defaultValue: false,
+      },
     },
-    defaultProperties: { normallyClosed: false },
+    defaultProperties: { normallyClosed: false, pressed: false },
   },
   "toggle-switch": {
     id: "toggle-switch",
@@ -493,8 +498,14 @@ export const COMPONENT_CATALOG = {
         order: 1,
       },
     ],
-    properties: {},
-    defaultProperties: {},
+    properties: {
+      position: {
+        label: "Position",
+        kind: "boolean",
+        defaultValue: false,
+      },
+    },
+    defaultProperties: { position: false },
   },
   potentiometer: {
     id: "potentiometer",
@@ -912,6 +923,25 @@ export const COMPONENT_CATALOG = {
       },
     },
     defaultProperties: { distanceCm: 100 },
+  },
+  "temperature-sensor": {
+    id: "temperature-sensor",
+    displayName: "Temperature Sensor",
+    category: "sensors",
+    description: "Interactive analog temperature sensor.",
+    width: 96,
+    height: 88,
+    accent: "#f97316",
+    simulated: true,
+    pins: [
+      { id: "VCC", label: "VCC", direction: "power", signals: ["power"], side: "bottom", order: 0 },
+      { id: "OUT", label: "OUT", direction: "output", signals: ["analog"], side: "bottom", order: 1 },
+      { id: "GND", label: "GND", direction: "power", signals: ["ground"], side: "bottom", order: 2 },
+    ],
+    properties: {
+      temperatureC: { label: "Temperature", kind: "number", defaultValue: 24, unit: "°C", min: -40, max: 125 },
+    },
+    defaultProperties: { temperatureC: 24 },
   },
   "pir-sensor": {
     id: "pir-sensor",

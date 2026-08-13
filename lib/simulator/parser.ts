@@ -408,9 +408,13 @@ class ExpressionParser {
         this.cursor += 1;
         const args: number[] = [];
         if (!this.peek(")")) {
-          const argument = this.parseConditional();
-          if (argument === undefined) return undefined;
-          args.push(argument);
+          while (true) {
+            const argument = this.parseConditional();
+            if (argument === undefined) return undefined;
+            args.push(argument);
+            if (!this.peek(",")) break;
+            this.cursor += 1;
+          }
         }
         if (!this.peek(")")) return undefined;
         this.cursor += 1;
@@ -770,10 +774,28 @@ function compileExecutableBody(
     }
     return undefined;
   };
+  const conditionalEnd = (start: number): number | undefined => {
+    if (!/^if\b/.test(text.slice(start))) return undefined;
+    const openParen = skipWhitespace(start + 2);
+    if (text[openParen] !== "(") return undefined;
+    const closeParen = matching(openParen, "(", ")");
+    if (closeParen === undefined) return undefined;
+    const openBrace = skipWhitespace(closeParen + 1);
+    if (text[openBrace] !== "{") return undefined;
+    const closeBrace = matching(openBrace, "{", "}");
+    if (closeBrace === undefined) return undefined;
+    const afterThen = skipWhitespace(closeBrace + 1);
+    if (!/^else\b/.test(text.slice(afterThen))) return closeBrace + 1;
+    const elseStart = skipWhitespace(afterThen + 4);
+    if (/^if\b/.test(text.slice(elseStart))) return conditionalEnd(elseStart);
+    if (text[elseStart] !== "{") return elseStart;
+    const elseClose = matching(elseStart, "{", "}");
+    return elseClose === undefined ? undefined : elseClose + 1;
+  };
   const compileSimple = (statement: string, localStart: number) => {
     const trimmed = statement.trim();
     const sourceInfo = { line: lineAt(source, body.startIndex + localStart), source: trimmed };
-    const declaration = /^(?:(?:const\s+)?(?:unsigned\s+)?(?:int|long|short|byte|uint8_t|uint16_t|size_t|bool))\s+([A-Za-z_]\w*)(?:\s*=\s*([^;]+))?\s*;$/.exec(trimmed);
+    const declaration = /^(?:(?:const\s+)?(?:unsigned\s+)?(?:int|long|short|byte|uint8_t|uint16_t|size_t|bool|float|double))\s+([A-Za-z_]\w*)(?:\s*=\s*([^;]+))?\s*;$/.exec(trimmed);
     if (declaration) {
       instructions.push({ kind: "declare", name: declaration[1], expression: declaration[2]?.trim() ?? "0", ...sourceInfo });
       return;
@@ -791,6 +813,37 @@ function compileExecutableBody(
       instructions.push({ kind: "assign", name, expression: `${name} ${delta > 0 ? "+" : "-"} 1`, ...sourceInfo });
       return;
     }
+    const methodCall = /^([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*\(([\s\S]*)\)\s*;$/.exec(trimmed);
+    if (methodCall) {
+      const [, instance, method, rawArgs] = methodCall;
+      const args = splitArguments(rawArgs);
+      if (!args) {
+        addArgumentError(diagnostics, sourceInfo.line, `${instance}.${method}`, "well-formed arguments");
+        return;
+      }
+      if (instance === "Serial" && method === "begin") return;
+      if (instance === "Serial" && (method === "print" || method === "println") && args.length >= 1) {
+        const value = printValue(args[0], constants);
+        if (value !== undefined) instructions.push({ kind: "serialPrint", value, newline: method === "println", ...sourceInfo });
+        else diagnostics.push({ severity: "warning", code: "DYNAMIC_SERIAL_VALUE", message: `Serial.${method} currently supports strings and static numeric expressions.`, line: sourceInfo.line });
+      }
+      else if (method === "attach" && args.length === 1) instructions.push({ kind: "servoAttach", instance, expression: args[0], ...sourceInfo });
+      else if (method === "write" && args.length === 1) instructions.push({ kind: "servoWrite", instance, expression: args[0], ...sourceInfo });
+      else if (method === "begin" && args.length === 2) instructions.push({ kind: "lcdBegin", instance, columns: args[0], rows: args[1], ...sourceInfo });
+      else if (method === "clear" && args.length === 0) instructions.push({ kind: "lcdClear", instance, ...sourceInfo });
+      else if (method === "setCursor" && args.length === 2) instructions.push({ kind: "lcdCursor", instance, column: args[0], row: args[1], ...sourceInfo });
+      else if ((method === "print" || method === "println") && args.length >= 1) instructions.push({ kind: "lcdPrint", instance, expression: args[0], newline: method === "println", ...sourceInfo });
+      else diagnostics.push({ severity: "error", code: "UNSUPPORTED_CALL", message: `${instance}.${method}() is outside the simulator subset.`, line: sourceInfo.line });
+      return;
+    }
+    const toneCall = /^(tone|noTone)\s*\(([\s\S]*)\)\s*;$/.exec(trimmed);
+    if (toneCall) {
+      const args = splitArguments(toneCall[2]);
+      if (args && ((toneCall[1] === "tone" && args.length >= 2) || (toneCall[1] === "noTone" && args.length === 1))) {
+        instructions.push({ kind: "tone", pinExpression: args[0], ...(toneCall[1] === "tone" ? { frequencyExpression: args[1] } : {}), ...sourceInfo });
+      } else addArgumentError(diagnostics, sourceInfo.line, toneCall[1], toneCall[1] === "tone" ? "a pin and frequency" : "a pin");
+      return;
+    }
     const compiled = compileBody(source, { body: trimmed, startIndex: body.startIndex + localStart }, constants, diagnostics);
     instructions.push(...compiled);
   };
@@ -798,6 +851,39 @@ function compileExecutableBody(
   const compileRange = (rangeStart: number, rangeEnd: number) => {
     let cursor = rangeStart;
     while ((cursor = skipWhitespace(cursor)) < rangeEnd) {
+      if (/^(?:while|for)\b/.test(text.slice(cursor))) {
+        const isFor = /^for\b/.test(text.slice(cursor));
+        const keywordLength = isFor ? 3 : 5;
+        const openParen = skipWhitespace(cursor + keywordLength);
+        if (text[openParen] !== "(") break;
+        const closeParen = matching(openParen, "(", ")");
+        if (closeParen === undefined) break;
+        const openBrace = skipWhitespace(closeParen + 1);
+        if (text[openBrace] !== "{") break;
+        const closeBrace = matching(openBrace, "{", "}");
+        if (closeBrace === undefined) break;
+        let condition = text.slice(openParen + 1, closeParen).trim();
+        let increment = "";
+        if (isFor) {
+          const clauses = splitArguments(condition.replace(/;/g, ","));
+          if (!clauses || clauses.length !== 3) {
+            diagnostics.push({ severity: "error", code: "INVALID_FOR_LOOP", message: "for loops require initializer, condition, and increment clauses.", line: lineAt(source, body.startIndex + cursor) });
+            break;
+          }
+          if (clauses[0]) compileSimple(`${clauses[0]};`, cursor);
+          condition = clauses[1] || "1";
+          increment = clauses[2];
+        }
+        const loopStart = instructions.length;
+        const jumpIfIndex = instructions.length;
+        instructions.push({ kind: "jumpIfFalse", expression: condition, target: 0, line: lineAt(source, body.startIndex + cursor), source: `${isFor ? "for" : "while"} (${condition})` });
+        compileRange(openBrace + 1, closeBrace);
+        if (increment) compileSimple(`${increment};`, closeBrace);
+        instructions.push({ kind: "jump", target: loopStart, line: lineAt(source, body.startIndex + closeBrace), source: "loop" });
+        (instructions[jumpIfIndex] as Extract<SketchInstruction, { kind: "jumpIfFalse" }>).target = instructions.length;
+        cursor = closeBrace + 1;
+        continue;
+      }
       if (/^if\b/.test(text.slice(cursor))) {
         const openParen = skipWhitespace(cursor + 2);
         if (text[openParen] !== "(") break;
@@ -822,6 +908,11 @@ function compileExecutableBody(
             if (elseClose === undefined) break;
             compileRange(elseBrace + 1, elseClose);
             next = elseClose + 1;
+          } else if (/^if\b/.test(text.slice(elseBrace))) {
+            const elseIfEnd = conditionalEnd(elseBrace);
+            if (elseIfEnd === undefined) break;
+            compileRange(elseBrace, elseIfEnd);
+            next = elseIfEnd;
           }
           (instructions[jumpIndex] as Extract<SketchInstruction, { kind: "jump" }>).target = instructions.length;
         } else {
@@ -845,7 +936,7 @@ function collectGlobalVariables(source: string): Record<string, number> {
   const setupIndex = source.search(/\bvoid\s+setup\s*\(/);
   const prefix = setupIndex >= 0 ? source.slice(0, setupIndex) : source;
   const constants = defaultConstants();
-  for (const match of prefix.matchAll(/\b(?:unsigned\s+)?(?:int|long|short|byte|uint8_t|uint16_t|size_t|bool)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g)) {
+  for (const match of prefix.matchAll(/\b(?:unsigned\s+)?(?:int|long|short|byte|uint8_t|uint16_t|size_t|bool|float|double)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g)) {
     const value = evaluateStatic(match[2], new Map([...constants, ...Object.entries(globals)]));
     if (value !== undefined) globals[match[1]] = value;
   }

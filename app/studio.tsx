@@ -29,7 +29,11 @@ import {
   isBuzzerCircuitPowered,
   isLedCircuitPowered,
   resolveBuzzerCircuitBindings,
+  resolveComponentBoardPins,
+  resolveComponentIoPins,
   resolveLedCircuitBindings,
+  solveCircuit,
+  parseUnoPinLabel,
   type SimulatorSnapshot,
 } from "../lib/simulator";
 import {
@@ -204,6 +208,7 @@ const PART_GLYPHS: Record<string, string> = {
   "logic-nor": "!>1",
   "logic-not": "!1",
   "hc-sr04": "SON",
+  "temperature-sensor": "TMP",
   "pir-sensor": "PIR",
   "arduino-uno": "UNO",
   ground: "GND",
@@ -453,12 +458,14 @@ export function CircuitStudio() {
       // the deterministic simulator clock.
       const delta = Math.max(0, Math.min(100, now - last));
       last = now;
+      const solved = solveCircuit(project, simulator.getSnapshot());
+      simulator.applyCircuitState({ digital: solved.digitalInputs, analog: solved.analogInputs, components: solved.componentStates });
       simulator.advance(delta);
       frame = requestAnimationFrame(tick);
     };
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
-  }, [simulator]);
+  }, [project, simulator]);
 
   useEffect(() => {
     if (!dragState) return;
@@ -583,6 +590,31 @@ export function CircuitStudio() {
     () => resolveBuzzerCircuitBindings(project),
     [project],
   );
+  const circuitMessages = useMemo<CompileMessage[]>(() => solveCircuit(project, snapshot).diagnostics.map((item) => ({ severity: item.severity, message: item.message })), [project, snapshot]);
+  const problemMessages = useMemo(() => [...compileMessages, ...circuitMessages], [compileMessages, circuitMessages]);
+  useEffect(() => {
+    project.components.forEach((component) => {
+      if (component.type === "pir-sensor") {
+        resolveComponentIoPins(project, component.id, "OUT").forEach((pin) => simulator.setDigitalInput(pin, component.properties?.motion === true));
+      }
+      if (component.type === "temperature-sensor") {
+        const temperature = Number(component.properties?.temperatureC ?? 24);
+        const analogValue = Math.round(((temperature / 100 + 0.5) / 5) * 1023);
+        resolveComponentIoPins(project, component.id, "OUT").forEach((pin) => simulator.setAnalogInput(pin, analogValue));
+      }
+      if (component.type === "hc-sr04") {
+        const distance = Number(component.properties?.distanceCm ?? 100);
+        resolveComponentIoPins(project, component.id, "ECHO").forEach((pin) => simulator.setPulseInput(pin, distance * 58.3));
+      }
+      if (component.type === "push-button") {
+        const pressed = component.properties?.pressed === true;
+        const normallyClosed = component.properties?.normallyClosed === true;
+        const level = pressed !== normallyClosed ? 0 : 1;
+        ["1", "2"].flatMap((terminal) => resolveComponentIoPins(project, component.id, terminal))
+          .forEach((pin) => simulator.setDigitalInput(pin, level));
+      }
+    });
+  }, [project, simulator]);
   const wireRoutes = useMemo(() => {
     const inputs = project.connections.flatMap((connection) => {
       const fromComponent = project.components.find((component) => component.id === connection.from.componentId);
@@ -1143,7 +1175,21 @@ export function CircuitStudio() {
                   buzzerCircuitBindings.get(component.id),
                   snapshot,
                 );
-                const isPowered = isLedOn || isBuzzerOn;
+                const componentPins = component.type === "buzzer"
+                  ? resolveComponentBoardPins(project, component.id, "+").map(parseUnoPinLabel).filter((pin): pin is number => pin !== undefined)
+                  : [];
+                const toneOn = component.type === "buzzer" && snapshot.tones.some((tone) => tone.active && componentPins.includes(tone.pin));
+                const servoState = component.type === "servo"
+                  ? snapshot.servos.find((servo) => resolveComponentBoardPins(project, component.id, "SIG").some((pin) => parseUnoPinLabel(pin) === servo.pin))
+                  : undefined;
+                const lcdState = component.type === "lcd-16x2" ? snapshot.lcds[0] : undefined;
+                const electricalState = snapshot.componentStates[component.id];
+                const symbolProperties = component.type === "servo" && servoState
+                  ? { ...component.properties, angle: servoState.angle }
+                  : component.type === "lcd-16x2" && lcdState
+                    ? { ...component.properties, text: lcdState.lines.join("\n") }
+                    : { ...component.properties, __electricalState: JSON.stringify(electricalState ?? null) };
+                const isPowered = isLedOn || isBuzzerOn || toneOn || Boolean(servoState?.attached) || Boolean(lcdState) || Boolean(electricalState?.powered);
                 return (
                   <article
                     key={component.id}
@@ -1153,7 +1199,7 @@ export function CircuitStudio() {
                     onDoubleClick={() => { setSelectedIds([component.id]); setSideTab("inspector"); }}
                   >
                     <div className="symbol-caption"><strong>{component.label}</strong><small>{component.type === "arduino-uno" ? "ARDUINO UNO R3" : definition?.displayName}</small></div>
-                    <SchematicSymbol type={component.type} properties={component.properties} powered={isPowered || component.type === "arduino-uno"} />
+                    <SchematicSymbol type={component.type} properties={symbolProperties} powered={isPowered || component.type === "arduino-uno"} />
                     {definition?.pins.map((pin) => {
                         const localPoint = pinPosition({ ...component, x: 0, y: 0, rotation: 0 }, pin.id, definition);
                         if (!localPoint) return null;
@@ -1320,7 +1366,7 @@ export function CircuitStudio() {
           <div className="bottom-tabs">
             <button className={bottomTab === "code" ? "active" : ""} onClick={() => { setBottomTab("code"); setBottomOpen(true); }}>Sketch.ino <span className="language-dot">C++</span></button>
             <button className={bottomTab === "serial" ? "active" : ""} onClick={() => { setBottomTab("serial"); setBottomOpen(true); }}>Serial monitor <i>{snapshot.serial.length}</i></button>
-            <button className={bottomTab === "problems" ? "active" : ""} onClick={() => { setBottomTab("problems"); setBottomOpen(true); }}>Problems <i className={compileMessages.some((message) => message.severity === "error") ? "error" : ""}>{compileMessages.length}</i></button>
+            <button className={bottomTab === "problems" ? "active" : ""} onClick={() => { setBottomTab("problems"); setBottomOpen(true); }}>Problems <i className={problemMessages.some((message) => message.severity === "error") ? "error" : ""}>{problemMessages.length}</i></button>
           </div>
           <div className="simulation-controls">
             <span className={`sim-status ${snapshot.status}`}><i></i>{statusLabel(snapshot)}</span>
@@ -1336,7 +1382,7 @@ export function CircuitStudio() {
           <div className="drawer-content">
             {bottomTab === "code" && <div className="code-editor"><pre aria-hidden="true">{project.code.split("\n").map((_, index) => <span key={index}>{index + 1}</span>)}</pre><textarea spellCheck={false} aria-label="Arduino code" value={project.code} onChange={(event) => { setProject((current) => ({ ...current, code: event.target.value })); setBuildState("idle"); }} onBlur={() => commitProject(projectRef.current)} /></div>}
             {bottomTab === "serial" && <div className="serial-console"><header><span>9600 baud</span><button onClick={() => simulator.clearSerial()}>Clear output</button></header><div>{snapshot.serial.length ? snapshot.serial.map((entry) => <p key={entry.id}><time>{(entry.timestampMs / 1000).toFixed(2)}s</time><span>{entry.text}{entry.newline ? "" : "_"}</span></p>) : <div className="console-empty">Run the simulation to see Serial output here.<small>Serial.begin(9600) detected automatically</small></div>}</div></div>}
-            {bottomTab === "problems" && <div className="problems-list">{compileMessages.length ? compileMessages.map((message, index) => <button key={index} onClick={() => setBottomTab("code")}><span className={message.severity}>{message.severity === "error" ? "×" : "!"}</span><strong>{message.message}</strong><small>{message.line ? `Sketch.ino:${message.line}` : "Sketch.ino"}</small></button>) : <div className="console-empty"><span className="success-check">✓</span>No build problems detected.<small>The supported simulation subset is ready.</small></div>}</div>}
+            {bottomTab === "problems" && <div className="problems-list">{problemMessages.length ? problemMessages.map((message, index) => <button key={index} onClick={() => setBottomTab("code")}><span className={message.severity}>{message.severity === "error" ? "×" : "!"}</span><strong>{message.message}</strong><small>{message.line ? `Sketch.ino:${message.line}` : "Circuit"}</small></button>) : <div className="console-empty"><span className="success-check">✓</span>No build problems detected.<small>The supported simulation subset is ready.</small></div>}</div>}
           </div>
         )}
       </section>

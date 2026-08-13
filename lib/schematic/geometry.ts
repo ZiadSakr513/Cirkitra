@@ -109,6 +109,7 @@ const COMPONENT_SIZES: Readonly<Record<string, Readonly<ComponentSize>>> = {
   "logic-nor": { width: 120, height: 80 },
   "logic-not": { width: 104, height: 72 },
   "hc-sr04": { width: 176, height: 96 },
+  "temperature-sensor": { width: 112, height: 104 },
   "pir-sensor": { width: 112, height: 112 },
 };
 

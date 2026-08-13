@@ -4,9 +4,12 @@ export {
   isBuzzerCircuitPowered,
   isLedCircuitPowered,
   resolveBuzzerCircuitBindings,
+  resolveComponentBoardPins,
+  resolveComponentIoPins,
   resolveLedCircuitBindings,
+  solveCircuit,
 } from "./circuit-state.ts";
-export type { BuzzerCircuitBinding, LedCircuitBinding } from "./circuit-state.ts";
+export type { BuzzerCircuitBinding, CircuitSolution, LedCircuitBinding } from "./circuit-state.ts";
 export {
   createInitialPinStates,
   isUnoPin,
@@ -30,6 +33,7 @@ export type {
   SimulatorPhase,
   SimulatorSnapshot,
   SimulatorStatus,
+  SimulatedComponentState,
   SketchInstruction,
   UnoPinMode,
   UnoPinState,

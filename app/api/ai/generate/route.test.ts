@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createDefaultBlinkProject } from "../../../../lib/circuit/default-project.ts";
-import { POST } from "./route.ts";
+import { maxDuration, POST } from "./route.ts";
 
 const generatedEnvelope = {
   project: createDefaultBlinkProject(),
@@ -10,6 +10,10 @@ const generatedEnvelope = {
   assumptions: [],
   warnings: [],
 };
+
+test("allows complex generation to use the five-minute route window", () => {
+  assert.equal(maxDuration, 300);
+});
 
 function modelResponse(text: string, finishReason = "STOP") {
   return Response.json({
@@ -163,7 +167,7 @@ test("forwards only the default and selected Gemini models", async (context) => 
     const headers = new Headers(request.init?.headers);
     const body = JSON.parse(String(request.init?.body));
     assert.equal(headers.get("x-goog-api-key"), "test-secret");
-    assert.equal(body.generationConfig.maxOutputTokens, 8_192);
+    assert.equal(body.generationConfig.maxOutputTokens, 65_536);
     assert.equal(body.generationConfig.responseMimeType, "application/json");
     assert.equal(body.generationConfig.responseSchema.type, "object");
     assert.ok(body.generationConfig.responseSchema.properties.project);
@@ -227,6 +231,33 @@ test("passes schema issues into the repair attempt", async (context) => {
   const repairData = JSON.parse(repairBody.contents[0].parts[0].text);
   assert.ok(repairData.validationIssues.includes("project.schemaVersion must be 1"));
   assert.equal("details" in (await response.json()), false);
+});
+
+test("repairs simulator-unsupported Arduino code before accepting a project", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const requests: RequestInit[] = [];
+  const unsupported = {
+    ...generatedEnvelope,
+    project: { ...generatedEnvelope.project, code: "void setup(){ lcd.unsupported(); } void loop(){}" },
+  };
+  const responses = [modelResponse(JSON.stringify(unsupported)), modelResponse(JSON.stringify(generatedEnvelope))];
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    requests.push(init ?? {});
+    return responses.shift() ?? modelResponse("");
+  };
+  const response = await POST(generationRequest());
+  assert.equal(response.status, 200);
+  assert.equal(requests.length, 2);
+  const repairBody = JSON.parse(String(requests[1].body));
+  const repairData = JSON.parse(repairBody.contents[0].parts[0].text);
+  assert.ok(repairData.validationIssues.some((issue: string) => issue.includes("project.code simulator UNSUPPORTED_CALL")));
 });
 
 test("regenerates cleanly when repair is also malformed", async (context) => {

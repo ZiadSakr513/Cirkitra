@@ -150,9 +150,9 @@ function PushButtonSymbol({ powered, normallyClosed }: { powered: boolean; norma
   );
 }
 
-function ToggleSwitchSymbol({ powered }: { powered: boolean }) {
+function ToggleSwitchSymbol({ powered, position }: { powered: boolean; position: boolean }) {
   return (
-    <div className={symbolClass("toggle-switch", powered)} aria-hidden="true">
+    <div className={symbolClass("toggle-switch", powered)} data-position={position ? "no" : "nc"} aria-hidden="true">
       <span className="symbol-toggle__terminal symbol-toggle__terminal--left" />
       <span className="symbol-toggle__terminal symbol-toggle__terminal--center" />
       <span className="symbol-toggle__terminal symbol-toggle__terminal--right" />
@@ -181,14 +181,14 @@ function PotentiometerSymbol({ powered, value }: { powered: boolean; value: numb
   );
 }
 
-function SevenSegmentSymbol({ color, powered }: { color: string; powered: boolean }) {
+function SevenSegmentSymbol({ color, powered, segments }: { color: string; powered: boolean; segments: ReadonlyArray<string> }) {
   const style = { "--symbol-display-color": color } as SymbolStyle;
   return (
     <div className={symbolClass("seven-segment", powered)} style={style} aria-hidden="true">
       <span className="symbol-seven-segment__case">
         <i className="symbol-seven-segment__digit">
           {SEVEN_SEGMENTS.map((segment) => (
-            <b key={segment} className={`symbol-seven-segment__segment symbol-seven-segment__segment--${segment}`} />
+            <b key={segment} className={`symbol-seven-segment__segment symbol-seven-segment__segment--${segment} ${segments.includes(segment.toUpperCase()) ? "active" : ""}`} />
           ))}
         </i>
       </span>
@@ -197,9 +197,10 @@ function SevenSegmentSymbol({ color, powered }: { color: string; powered: boolea
 }
 
 function LcdSymbol({ powered, text }: { powered: boolean; text: string }) {
+  const explicitLines = text.split(/\r?\n/);
   const normalizedText = text.replace(/\s+/g, " ").trim();
-  const firstLine = (normalizedText || "CIRKITRA").slice(0, 16);
-  const secondLine = normalizedText.slice(16, 32) || (powered ? "READY_" : "");
+  const firstLine = (explicitLines.length > 1 ? explicitLines[0] : normalizedText || "CIRKITRA").slice(0, 16);
+  const secondLine = (explicitLines.length > 1 ? explicitLines[1] : normalizedText.slice(16, 32) || (powered ? "READY_" : "")).slice(0, 16);
   return (
     <div className={symbolClass("lcd-16x2", powered)} aria-hidden="true">
       <span className="symbol-lcd__pcb">
@@ -253,9 +254,9 @@ function ServoSymbol({ powered, angle }: { powered: boolean; angle: number }) {
   );
 }
 
-function DcMotorSymbol({ powered }: { powered: boolean }) {
+function DcMotorSymbol({ powered, direction, speed }: { powered: boolean; direction?: string; speed?: number }) {
   return (
-    <div className={symbolClass("dc-motor", powered)} aria-hidden="true">
+    <div className={symbolClass("dc-motor", powered)} data-direction={direction} style={{ "--symbol-motor-speed": `${Math.max(0.15, 1 - (speed ?? 0) * 0.85)}s` } as SymbolStyle} aria-hidden="true">
       <span className="symbol-motor__terminal symbol-motor__terminal--positive" />
       <span className="symbol-motor__terminal symbol-motor__terminal--negative" />
       <span className="symbol-motor__can">
@@ -288,7 +289,7 @@ function L293dSymbol({ powered }: { powered: boolean }) {
   );
 }
 
-function LogicGateSymbol({ type, powered }: { type: LogicGateType; powered: boolean }) {
+function LogicGateSymbol({ type, powered, outputHigh }: { type: LogicGateType; powered: boolean; outputHigh: boolean }) {
   const inverted = type === "logic-nand" || type === "logic-nor" || type === "logic-not";
   const gateLabel: Record<LogicGateType, string> = {
     "logic-and": "&",
@@ -299,7 +300,7 @@ function LogicGateSymbol({ type, powered }: { type: LogicGateType; powered: bool
     "logic-not": "1",
   };
   return (
-    <div className={symbolClass(type, powered)} aria-hidden="true">
+    <div className={symbolClass(type, powered)} data-output={outputHigh ? "high" : "low"} aria-hidden="true">
       {type !== "logic-not" && <span className="symbol-gate__input symbol-gate__input--a" />}
       <span className={`symbol-gate__input ${type === "logic-not" ? "symbol-gate__input--single" : "symbol-gate__input--b"}`} />
       <span className={`symbol-gate__body symbol-gate__body--${type.replace("logic-", "")}`}>
@@ -343,6 +344,14 @@ function PirSymbol({ powered, motion }: { powered: boolean; motion: boolean }) {
   );
 }
 
+function TemperatureSymbol({ powered, temperature }: { powered: boolean; temperature: number }) {
+  return (
+    <div className={symbolClass("temperature-sensor", powered)} aria-hidden="true">
+      <span style={{ position: "absolute", inset: 15, border: "2px solid #f97316", borderRadius: 12, background: "#29140c", display: "grid", placeItems: "center", color: "#fdba74", font: "700 13px var(--font-mono)" }}>{Math.round(temperature)}°</span>
+    </div>
+  );
+}
+
 function GenericSymbol({ type, powered }: { type: string; powered: boolean }) {
   const label = type.replace(/[-_]+/g, " ").trim().toUpperCase().slice(0, 14) || "PART";
   return (
@@ -373,6 +382,12 @@ export function SchematicSymbol({
   properties = {},
   powered = false,
 }: SchematicSymbolProps) {
+  let electrical: { channels?: Record<string, number>; segments?: string[]; direction?: string; speed?: number; position?: boolean; level?: string } = {};
+  try {
+    electrical = JSON.parse(typeof properties.__electricalState === "string" ? properties.__electricalState : "null") ?? {};
+  } catch {
+    electrical = {};
+  }
   switch (type) {
     case "ground":
       return <GroundSymbol />;
@@ -381,17 +396,17 @@ export function SchematicSymbol({
     case "led":
       return <LedSymbol color={safeColor(properties.color, "#ef4444")} powered={powered} />;
     case "rgb-led":
-      return <LedSymbol color={safeColor(properties.color, "#f8fafc")} powered={powered} rgb />;
+      return <LedSymbol color={`rgb(${Math.round((electrical.channels?.R ?? 0) * 255)}, ${Math.round((electrical.channels?.G ?? 0) * 255)}, ${Math.round((electrical.channels?.B ?? 0) * 255)})`} powered={powered} rgb />;
     case "resistor":
       return <ResistorSymbol powered={powered} />;
     case "push-button":
       return <PushButtonSymbol powered={powered} normallyClosed={properties.normallyClosed === true} />;
     case "toggle-switch":
-      return <ToggleSwitchSymbol powered={powered} />;
+      return <ToggleSwitchSymbol powered={powered} position={electrical.position ?? properties.position === true} />;
     case "potentiometer":
       return <PotentiometerSymbol powered={powered} value={numericProperty(properties, "value", 50, 0, 100)} />;
     case "seven-segment":
-      return <SevenSegmentSymbol color={safeColor(properties.color, "#ef4444")} powered={powered} />;
+      return <SevenSegmentSymbol color={safeColor(properties.color, "#ef4444")} powered={powered} segments={electrical.segments ?? []} />;
     case "lcd-16x2":
       return <LcdSymbol powered={powered} text={typeof properties.text === "string" ? properties.text : ""} />;
     case "buzzer":
@@ -399,7 +414,7 @@ export function SchematicSymbol({
     case "servo":
       return <ServoSymbol powered={powered} angle={numericProperty(properties, "angle", 90, 0, 180)} />;
     case "dc-motor":
-      return <DcMotorSymbol powered={powered} />;
+      return <DcMotorSymbol powered={powered} direction={electrical.direction} speed={electrical.speed} />;
     case "l293d":
       return <L293dSymbol powered={powered} />;
     case "logic-and":
@@ -408,11 +423,13 @@ export function SchematicSymbol({
     case "logic-nand":
     case "logic-nor":
     case "logic-not":
-      return <LogicGateSymbol type={type} powered={powered} />;
+      return <LogicGateSymbol type={type} powered={powered} outputHigh={electrical.level === "high"} />;
     case "hc-sr04":
       return <UltrasonicSymbol powered={powered} />;
     case "pir-sensor":
       return <PirSymbol powered={powered} motion={properties.motion === true} />;
+    case "temperature-sensor":
+      return <TemperatureSymbol powered={powered} temperature={numericProperty(properties, "temperatureC", 24, -40, 125)} />;
     default:
       return <GenericSymbol type={type} powered={powered} />;
   }

@@ -60,7 +60,7 @@ function validateSketch(code: string): CompileDiagnostic[] {
     diagnostics.push({ line: lineOf(code, open.index), column: 1, severity: "error", message: `Unclosed '${open.char}'.` });
   }
 
-  for (const match of code.matchAll(/\b(attachInterrupt|tone|noTone|shiftOut)\s*\(/g)) {
+  for (const match of code.matchAll(/\b(attachInterrupt|shiftOut)\s*\(/g)) {
     diagnostics.push({
       line: lineOf(code, match.index ?? 0),
       column: 1,

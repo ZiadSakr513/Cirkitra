@@ -80,6 +80,43 @@ export type SketchInstruction =
   | (InstructionSource & {
       kind: "jump";
       target: number;
+    })
+  | (InstructionSource & {
+      kind: "servoAttach";
+      instance: string;
+      expression: string;
+    })
+  | (InstructionSource & {
+      kind: "servoWrite";
+      instance: string;
+      expression: string;
+    })
+  | (InstructionSource & {
+      kind: "lcdBegin";
+      instance: string;
+      columns: string;
+      rows: string;
+    })
+  | (InstructionSource & {
+      kind: "lcdClear";
+      instance: string;
+    })
+  | (InstructionSource & {
+      kind: "lcdCursor";
+      instance: string;
+      column: string;
+      row: string;
+    })
+  | (InstructionSource & {
+      kind: "lcdPrint";
+      instance: string;
+      expression: string;
+      newline: boolean;
+    })
+  | (InstructionSource & {
+      kind: "tone";
+      pinExpression: string;
+      frequencyExpression?: string;
     });
 
 export interface CompiledArduinoSketch {
@@ -110,6 +147,23 @@ export interface SerialEntry {
   newline: boolean;
 }
 
+export interface ServoState { instance: string; pin: number; angle: number; attached: boolean; }
+export interface LcdState { instance: string; columns: number; rows: number; column: number; row: number; lines: ReadonlyArray<string>; }
+export interface ToneState { pin: number; active: boolean; frequency: number; }
+
+export type ElectricalLevel = "low" | "high" | "floating" | "conflict";
+export interface SimulatedComponentState {
+  type: string;
+  powered: boolean;
+  level?: ElectricalLevel;
+  analogValue?: number;
+  channels?: Readonly<Record<string, number>>;
+  segments?: ReadonlyArray<string>;
+  direction?: "forward" | "reverse" | "stopped" | "brake" | "coast";
+  speed?: number;
+  position?: boolean;
+}
+
 export interface SimulatorSnapshot {
   status: SimulatorStatus;
   phase: SimulatorPhase;
@@ -120,6 +174,10 @@ export interface SimulatorSnapshot {
   waitRemainingMs: number;
   pins: ReadonlyArray<UnoPinState>;
   serial: ReadonlyArray<SerialEntry>;
+  servos: ReadonlyArray<ServoState>;
+  lcds: ReadonlyArray<LcdState>;
+  tones: ReadonlyArray<ToneState>;
+  componentStates: Readonly<Record<string, SimulatedComponentState>>;
   diagnostics: ReadonlyArray<SimulatorDiagnostic>;
 }
 

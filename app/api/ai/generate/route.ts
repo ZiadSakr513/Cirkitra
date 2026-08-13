@@ -2,6 +2,7 @@ import {
   normalizeGroundReturns,
   type CircuitProject as SharedCircuitProject,
 } from "../../../../lib/circuit/index.ts";
+import { ArduinoSimulator, compileArduinoSketch, solveCircuit } from "../../../../lib/simulator/index.ts";
 
 const GEMINI_API_BASE_URL =
   "https://generativelanguage.googleapis.com/v1beta/models";
@@ -13,9 +14,12 @@ const DEFAULT_GEMINI_MODEL: GeminiModel = "gemini-3.5-flash";
 const MAX_PROMPT_LENGTH = 4_000;
 const MAX_CURRENT_PROJECT_LENGTH = 50_000;
 const MAX_REQUEST_BYTES = 100_000;
-const GEMINI_TIMEOUT_MS = 45_000;
-const GENERATION_BUDGET_MS = 90_000;
+const CHAT_TIMEOUT_MS = 45_000;
+const GENERATION_BUDGET_MS = 285_000;
 const MAX_REPAIR_CONTENT_LENGTH = 30_000;
+
+/** Allow complex structured generation to use Vercel's five-minute function window. */
+export const maxDuration = 300;
 const CHAT_OUTPUT_SCHEMA = {
   type: "object",
   properties: { reply: { type: "string", minLength: 1, maxLength: 2_000 } },
@@ -110,6 +114,7 @@ const COMPONENT_CATALOG = {
   "logic-nor": ["A", "B", "Y", "VCC", "GND"],
   "logic-not": ["A", "Y", "VCC", "GND"],
   "hc-sr04": ["VCC", "TRIG", "ECHO", "GND"],
+  "temperature-sensor": ["VCC", "OUT", "GND"],
   "pir-sensor": ["VCC", "OUT", "GND"],
 } as const;
 
@@ -237,7 +242,9 @@ Rules:
 - Use unique, identifier-safe IDs (letters first, then letters, digits, hyphens, or underscores).
 - Use only supported parts. If a request needs an unsupported or analog/SPICE-only part, build the closest useful supported alternative and explain the limitation in warnings.
 - Add current-limiting resistors for LEDs and a driver stage for DC motors. Use the Arduino GND, GND2, and GND3 pins once each before adding ground components. If more than three returns need ground, add one separate ground component beside each remaining load and connect its GND pin. Never send several return wires to the same Arduino ground pin. Do not create power-to-ground shorts or connect two actively driven outputs together.
+- Every catalog component is electrically simulated. Power logic gates from VCC/GND and use their exact truth-table pins. RGB LEDs and seven-segment displays are common-cathode. Toggle COM connects to NO when position=true and NC when false. Potentiometer SIG is its 0-1023 wiper voltage. Power L293D VSS and VS, ground all four GND pins, use EN pins for enable/PWM, and connect DC motors only across matching OUT pairs.
 - Produce ordinary Arduino Uno C++ containing void setup() and void loop(). Keep pin assignments exactly consistent with the connections.
+- The browser runtime supports millis(), delay(), pinMode(), digitalRead/write(), analogRead/write(), pulseIn(), map(), constrain(), tone()/noTone(), Servo.attach/write/read(), and LiquidCrystal.begin/clear/setCursor/print/println(). Use these exact APIs. Keep logic directly inside setup() and loop(); do not use custom helper functions, recursion, switch statements, or unbounded loops.
 - Use a compact, non-overlapping layout with its top-left near x=64, y=64. Keep the full circuit within roughly 1100 by 650 when practical.
 - Use bright, high-contrast hex colors for wires on the dark canvas (for example #42d7bd, #f59e0b, #ef4444, or #68a7ff). Never use black or near-black wire colors.
 - Fill every properties key required by the schema. Use null for a property that does not apply.
@@ -599,6 +606,13 @@ function validateGeneratedEnvelope(value: unknown): ValidationResult {
   if (code && !/\bvoid\s+loop\s*\(/.test(code)) {
     issues.push("project.code must define void loop()");
   }
+  if (code) {
+    const compilation = compileArduinoSketch(code);
+    compilation.diagnostics
+      .filter((diagnostic) => diagnostic.severity === "error")
+      .slice(0, 12)
+      .forEach((diagnostic) => issues.push(`project.code simulator ${diagnostic.code}${diagnostic.line ? ` at line ${diagnostic.line}` : ""}: ${diagnostic.message}`));
+  }
 
   const envelope: GeneratedEnvelope = {
     project: {
@@ -620,6 +634,17 @@ function validateGeneratedEnvelope(value: unknown): ValidationResult {
     assumptions: stringArray(value.assumptions, "assumptions", issues),
     warnings: stringArray(value.warnings, "warnings", issues),
   };
+
+  if (!issues.length && code) {
+    const normalizedProject = normalizeGroundReturns(envelope.project as unknown as SharedCircuitProject);
+    const simulator = new ArduinoSimulator(code);
+    simulator.run();
+    simulator.advance(0);
+    solveCircuit(normalizedProject, simulator.getSnapshot()).diagnostics
+      .filter((diagnostic) => diagnostic.severity === "error")
+      .slice(0, 8)
+      .forEach((diagnostic) => issues.push(`project.circuit ${diagnostic.code}: ${diagnostic.message}`));
+  }
 
   return issues.length
     ? { ok: false, issues: [...new Set(issues)].slice(0, 20) }
@@ -731,7 +756,7 @@ async function generateAttempt(options: {
   const controller = new AbortController();
   const timeout = setTimeout(
     () => controller.abort(),
-    Math.min(GEMINI_TIMEOUT_MS, remainingMs),
+    remainingMs,
   );
   let geminiResponse: Response;
   try {
@@ -747,7 +772,7 @@ async function generateAttempt(options: {
           systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
           contents: [{ role: "user", parts: [{ text: options.userContent }] }],
           generationConfig: {
-            maxOutputTokens: 8_192,
+            maxOutputTokens: 65_536,
             responseMimeType: "application/json",
             responseSchema: OUTPUT_SCHEMA,
           },
@@ -849,7 +874,7 @@ async function generateChatReply(options: {
   prompt: string;
 }): Promise<Response> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), CHAT_TIMEOUT_MS);
   let response: Response;
   try {
     response = await fetch(

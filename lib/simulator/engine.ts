@@ -5,6 +5,10 @@ import type {
   CompiledArduinoSketch,
   DigitalLevel,
   SerialEntry,
+  ServoState,
+  LcdState,
+  ToneState,
+  SimulatedComponentState,
   SimulatorListener,
   SimulatorPhase,
   SimulatorSnapshot,
@@ -41,6 +45,10 @@ function freezeSnapshot(
   pins: UnoPinState[],
   serial: SerialEntry[],
   compiled: CompiledArduinoSketch,
+  servos: ServoState[],
+  lcds: LcdState[],
+  tones: ToneState[],
+  componentStates: Readonly<Record<string, SimulatedComponentState>>,
 ): SimulatorSnapshot {
   const pinSnapshot = Object.freeze(
     pins.map((pin) => Object.freeze({ ...pin })),
@@ -62,6 +70,10 @@ function freezeSnapshot(
     waitRemainingMs,
     pins: pinSnapshot,
     serial: serialSnapshot,
+    servos: Object.freeze(servos.map((item) => Object.freeze({ ...item }))),
+    lcds: Object.freeze(lcds.map((item) => Object.freeze({ ...item, lines: Object.freeze([...item.lines]) }))),
+    tones: Object.freeze(tones.map((item) => Object.freeze({ ...item }))),
+    componentStates: Object.freeze({ ...componentStates }),
     diagnostics: diagnosticSnapshot,
   });
 }
@@ -85,6 +97,12 @@ export class ArduinoSimulator {
   private serial: SerialEntry[] = [];
   private variables = new Map<string, number>();
   private nextSerialId = 1;
+  private servos = new Map<string, ServoState>();
+  private lcds = new Map<string, LcdState>();
+  private tones = new Map<number, ToneState>();
+  private componentStates: Readonly<Record<string, SimulatedComponentState>> = {};
+  private analogInputs = new Map<number, number>();
+  private pulseInputs = new Map<number, number>();
   private readonly maxOperationsPerAdvance: number;
   private readonly maxSerialEntries: number;
   private readonly listeners = new Set<SimulatorListener>();
@@ -114,6 +132,7 @@ export class ArduinoSimulator {
       this.pins,
       this.serial,
       this.compiled,
+      [...this.servos.values()], [...this.lcds.values()], [...this.tones.values()], this.componentStates,
     );
   }
 
@@ -154,6 +173,10 @@ export class ArduinoSimulator {
     this.serial = [];
     this.variables = new Map(Object.entries(this.compiled.globals));
     this.nextSerialId = 1;
+    this.servos.clear();
+    this.lcds.clear();
+    this.tones.clear();
+    this.componentStates = {};
     this.commit();
     return this.snapshot;
   }
@@ -281,6 +304,51 @@ export class ArduinoSimulator {
     return this.snapshot;
   }
 
+  setAnalogInput(pin: number | string, value: number): SimulatorSnapshot {
+    const number = this.resolvePin(pin);
+    if (number === undefined) throw new RangeError(`Unknown Arduino Uno pin: ${pin}`);
+    this.analogInputs.set(number, Math.round(Math.min(1023, Math.max(0, value))));
+    return this.snapshot;
+  }
+
+  setPulseInput(pin: number | string, durationMicroseconds: number): SimulatorSnapshot {
+    const number = this.resolvePin(pin);
+    if (number === undefined) throw new RangeError(`Unknown Arduino Uno pin: ${pin}`);
+    this.pulseInputs.set(number, Math.max(0, durationMicroseconds));
+    return this.snapshot;
+  }
+
+  /** Atomically applies the inputs and derived component state from the circuit solver. */
+  applyCircuitState(input: {
+    digital?: Readonly<Record<number, DigitalLevel>>;
+    analog?: Readonly<Record<number, number>>;
+    components?: Readonly<Record<string, SimulatedComponentState>>;
+  }): SimulatorSnapshot {
+    let changed = false;
+    Object.entries(input.digital ?? {}).forEach(([pin, value]) => {
+      const number = Number(pin);
+      const state = this.pins[number];
+      if (!state || state.mode === "OUTPUT") return;
+      const next = value === 1 ? 1 : 0;
+      if (state.digitalValue !== next) {
+        state.digitalValue = next;
+        state.pwmValue = next ? 255 : 0;
+        state.lastChangedAtMs = this.timeMs;
+        changed = true;
+      }
+    });
+    Object.entries(input.analog ?? {}).forEach(([pin, value]) => {
+      this.analogInputs.set(Number(pin), Math.round(Math.min(1023, Math.max(0, value))));
+    });
+    const nextComponents = input.components ?? {};
+    if (JSON.stringify(this.componentStates) !== JSON.stringify(nextComponents)) {
+      this.componentStates = nextComponents;
+      changed = true;
+    }
+    if (changed) this.commit();
+    return this.snapshot;
+  }
+
   clearSerial(): SimulatorSnapshot {
     if (this.serial.length > 0) {
       this.serial = [];
@@ -334,6 +402,53 @@ export class ArduinoSimulator {
     if (instruction.kind === "declare" || instruction.kind === "assign") {
       const value = this.evaluate(instruction.expression);
       if (value !== undefined) this.variables.set(instruction.name, value);
+      return;
+    }
+
+    if (instruction.kind === "servoAttach" || instruction.kind === "servoWrite") {
+      const current = this.servos.get(instruction.instance) ?? { instance: instruction.instance, pin: -1, angle: 90, attached: false };
+      const value = this.evaluate(instruction.expression);
+      if (value !== undefined) {
+        if (instruction.kind === "servoAttach") { current.pin = Math.trunc(value); current.attached = true; }
+        else current.angle = Math.round(Math.min(180, Math.max(0, value)));
+        this.servos.set(instruction.instance, current);
+      }
+      return;
+    }
+
+    if (instruction.kind === "lcdBegin") {
+      const columns = Math.max(1, Math.trunc(this.evaluate(instruction.columns) ?? 16));
+      const rows = Math.max(1, Math.trunc(this.evaluate(instruction.rows) ?? 2));
+      this.lcds.set(instruction.instance, { instance: instruction.instance, columns, rows, column: 0, row: 0, lines: Array.from({ length: rows }, () => "") });
+      return;
+    }
+    if (instruction.kind === "lcdClear") {
+      const lcd = this.lcds.get(instruction.instance);
+      if (lcd) { lcd.lines = Array.from({ length: lcd.rows }, () => ""); lcd.column = 0; lcd.row = 0; }
+      return;
+    }
+    if (instruction.kind === "lcdCursor") {
+      const lcd = this.lcds.get(instruction.instance);
+      if (lcd) { lcd.column = Math.max(0, Math.trunc(this.evaluate(instruction.column) ?? 0)); lcd.row = Math.min(lcd.rows - 1, Math.max(0, Math.trunc(this.evaluate(instruction.row) ?? 0))); }
+      return;
+    }
+    if (instruction.kind === "lcdPrint") {
+      const lcd = this.lcds.get(instruction.instance);
+      if (lcd) {
+        const literal = /^(["'])([\s\S]*)\1$/.exec(instruction.expression.trim());
+        const text = literal ? literal[2] : String(this.evaluate(instruction.expression) ?? "");
+        const line = (lcd.lines[lcd.row] ?? "").padEnd(lcd.column, " ");
+        const lines = [...lcd.lines];
+        lines[lcd.row] = (line.slice(0, lcd.column) + text).slice(0, lcd.columns);
+        lcd.lines = lines;
+        lcd.column = Math.min(lcd.columns, lcd.column + text.length);
+        if (instruction.newline) { lcd.row = Math.min(lcd.rows - 1, lcd.row + 1); lcd.column = 0; }
+      }
+      return;
+    }
+    if (instruction.kind === "tone") {
+      const pin = Math.trunc(this.evaluate(instruction.pinExpression) ?? -1);
+      if (pin >= 0) this.tones.set(pin, { pin, active: Boolean(instruction.frequencyExpression), frequency: Math.max(0, this.evaluate(instruction.frequencyExpression ?? "0") ?? 0) });
       return;
     }
 
@@ -406,10 +521,19 @@ export class ArduinoSimulator {
     values.set("true", 1);
     values.set("LED_BUILTIN", 13);
     for (let analog = 0; analog < 6; analog += 1) values.set(`A${analog}`, 14 + analog);
-    return evaluateRuntimeExpression(expression, values, {
+    const normalized = expression.replace(/\b([A-Za-z_]\w*)\.read\s*\(\s*\)/g, "servoRead_$1()");
+    const functions: Record<string, (...args: number[]) => number> = {
       millis: () => this.timeMs,
       digitalRead: (pin) => this.pins[Math.trunc(pin)]?.digitalValue ?? 0,
-    });
+      analogRead: (pin) => this.analogInputs.get(Math.trunc(pin)) ?? 0,
+      pulseIn: (pin) => this.pulseInputs.get(Math.trunc(pin)) ?? 0,
+      map: (value, fromLow, fromHigh, toLow, toHigh) => fromHigh === fromLow ? toLow : (value - fromLow) * (toHigh - toLow) / (fromHigh - fromLow) + toLow,
+      constrain: (value, low, high) => Math.min(high, Math.max(low, value)),
+      min: (...args) => Math.min(...args),
+      max: (...args) => Math.max(...args),
+    };
+    this.servos.forEach((servo, name) => { functions[`servoRead_${name}`] = () => servo.angle; });
+    return evaluateRuntimeExpression(normalized, values, functions);
   }
 
   private resolvePin(pin: number | string): number | undefined {
@@ -431,6 +555,7 @@ export class ArduinoSimulator {
       this.pins,
       this.serial,
       this.compiled,
+      [...this.servos.values()], [...this.lcds.values()], [...this.tones.values()], this.componentStates,
     );
     for (const listener of this.listeners) listener(this.snapshot);
   }
