@@ -24,6 +24,33 @@ test("the Cirkitra workbench and metadata contain the production identity", asyn
   assert.doesNotMatch(source, /codex-preview|react-loading-skeleton|Your site is taking shape/);
 });
 
+test("public SEO routes expose canonical metadata and keep the workbench separate", async () => {
+  const [layout, page, studioPage, robots, sitemap, manifest, social] = await Promise.all([
+    readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/studio/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/robots.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/sitemap.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/manifest.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/opengraph-image.tsx", import.meta.url), "utf8"),
+  ]);
+  assert.match(layout, /metadataBase:\s*new URL\(siteUrl\)/);
+  assert.match(layout, /cirkitra-green\.vercel\.app/);
+  assert.match(layout, /openGraph:/);
+  assert.match(layout, /twitter:/);
+  assert.match(page, /SoftwareApplication/);
+  assert.match(page, /FAQPage/);
+  assert.match(page, /href="\/studio"/);
+  assert.match(page, /Describe the circuit/);
+  assert.match(studioPage, /index:\s*false/);
+  assert.match(studioPage, /<CircuitStudio\s*\/>/);
+  assert.match(robots, /disallow:\s*\["\/api\/", "\/studio"\]/);
+  assert.doesNotMatch(sitemap, /\/studio/);
+  assert.match(manifest, /start_url:\s*"\/studio"/);
+  assert.match(social, /width:\s*1200/);
+  assert.match(social, /height:\s*630/);
+});
+
 test("compile endpoint accepts a simulation-ready Uno sketch", async () => {
   const response = await compileSketch(
     new Request("http://localhost/api/compile", {
