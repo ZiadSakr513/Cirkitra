@@ -1,4 +1,5 @@
 import Link from "next/link";
+import Image from "next/image";
 
 const features = [
   ["Prompt to schematic", "Describe a circuit and Cirkitra generates compatible components, wiring, and Arduino code together."],
@@ -48,7 +49,7 @@ export default function Home() {
     <main className="landing-shell">
       <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(structuredData).replace(/</g, "\\u003c") }} />
       <nav className="landing-nav" aria-label="Main navigation">
-        <Link className="landing-brand" href="/" aria-label="Cirkitra home"><i aria-hidden="true"><b /><b /><b /></i><span>Cirkitra<small>Founded by Ziad Sakr</small></span></Link>
+        <Link className="landing-brand" href="/" aria-label="Cirkitra home"><Image className="cirkitra-logo" src="/cirkitra-logo.png" alt="" width={38} height={38} priority /><span>Cirkitra<small>Founded by Ziad Sakr</small></span></Link>
         <div><a href="#features">Features</a><a href="#how-it-works">How it works</a><a href="#faq">FAQ</a></div>
         <Link className="landing-button landing-button-small" href="/studio">Open Cirkitra <span aria-hidden="true">→</span></Link>
       </nav>
@@ -73,7 +74,7 @@ export default function Home() {
       <section className="landing-section landing-components"><div className="section-heading"><small>SIMULATION LIBRARY</small><h2>Components that actually respond</h2><p>Build with Arduino Uno, sensors, LEDs, LCDs, motors, switches, buzzers, servos, logic gates, and more.</p></div><div className="component-chips">{["Arduino Uno", "Sensors", "Displays", "Motors", "Logic gates", "Switches", "LEDs", "Buzzers", "Servos"].map((item) => <span key={item}>{item}</span>)}</div></section>
       <section className="landing-section landing-faq" id="faq"><div className="section-heading"><small>QUESTIONS</small><h2>Frequently asked</h2></div><div>{faqs.map(([question, answer]) => <details key={question}><summary>{question}<span>+</span></summary><p>{answer}</p></details>)}</div></section>
       <section className="landing-cta"><small>READY TO BUILD?</small><h2>Turn your next circuit idea into a simulation.</h2><Link className="landing-button" href="/studio">Open the workbench <span aria-hidden="true">→</span></Link></section>
-      <footer><Link className="landing-brand" href="/"><i aria-hidden="true"><b /><b /><b /></i><span>Cirkitra<small>Founded by Ziad Sakr</small></span></Link><p>AI-assisted Arduino circuit design and simulation in your browser.</p><Link href="/studio">Open Cirkitra →</Link></footer>
+      <footer><Link className="landing-brand" href="/"><Image className="cirkitra-logo" src="/cirkitra-logo.png" alt="" width={38} height={38} /><span>Cirkitra<small>Founded by Ziad Sakr</small></span></Link><p>AI-assisted Arduino circuit design and simulation in your browser.</p><Link href="/studio">Open Cirkitra →</Link></footer>
     </main>
   );
 }

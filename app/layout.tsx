@@ -29,7 +29,7 @@ export const metadata: Metadata = {
   publisher: "Cirkitra",
   alternates: { canonical: "/" },
   manifest: "/manifest.webmanifest",
-  icons: { icon: "/favicon.svg" },
+  icons: { icon: "/cirkitra-logo.png", apple: "/cirkitra-logo.png" },
   openGraph: {
     type: "website",
     url: siteUrl,

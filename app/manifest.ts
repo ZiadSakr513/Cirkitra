@@ -9,6 +9,6 @@ export default function manifest(): MetadataRoute.Manifest {
     display: "standalone",
     background_color: "#070b10",
     theme_color: "#070b10",
-    icons: [{ src: "/favicon.svg", sizes: "any", type: "image/svg+xml" }],
+    icons: [{ src: "/cirkitra-logo.png", sizes: "1024x1024", type: "image/png", purpose: "any" }],
   };
 }
