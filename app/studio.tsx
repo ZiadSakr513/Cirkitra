@@ -10,6 +10,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type WheelEvent as ReactWheelEvent,
 } from "react";
+import Image from "next/image";
 import {
   COMPONENT_CATALOG,
   SUPPORTED_COMPONENT_TYPES,
@@ -990,7 +991,7 @@ export function CircuitStudio() {
     >
       <header className="topbar">
         <div className="brand-block">
-          <div className="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+          <Image className="brand-logo" src="/cirkitra-logo.png" alt="" width={34} height={34} priority />
           <div>
             <div className="brand-name">Cirkitra</div>
             <div className="brand-owner">Founded by <strong>Ziad Sakr</strong></div>

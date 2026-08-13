@@ -67,6 +67,7 @@ select:focus-visible {
 .landing-shell a { color:inherit; text-decoration:none; }
 .landing-nav { position:relative; z-index:10; display:flex; align-items:center; justify-content:space-between; width:min(1180px,calc(100% - 40px)); height:78px; margin:auto; border-bottom:1px solid var(--line-soft); }
 .landing-brand { display:flex; align-items:center; gap:11px; font-size:18px; font-weight:750; }
+.cirkitra-logo { width:38px; height:38px; border-radius:10px; object-fit:cover; }
 .landing-brand>i { position:relative; width:38px; height:38px; border:1px solid #28776c; border-radius:10px; background:#10312e; }
 .landing-brand>i b { position:absolute; width:7px; height:7px; border:2px solid var(--teal); border-radius:50%; }.landing-brand>i b:nth-child(1){left:8px;top:8px}.landing-brand>i b:nth-child(2){right:7px;top:15px}.landing-brand>i b:nth-child(3){left:10px;bottom:6px}.landing-brand>i:after,.landing-brand>i:before{content:"";position:absolute;height:1px;background:var(--teal);transform-origin:left}.landing-brand>i:before{left:14px;top:12px;width:13px;transform:rotate(20deg)}.landing-brand>i:after{left:15px;bottom:11px;width:14px;transform:rotate(-28deg)}
 .landing-brand span { display:flex; flex-direction:column; }.landing-brand small { margin-top:2px; color:#7e8c99; font-size:9px; font-weight:500; }
@@ -115,6 +116,7 @@ select:focus-visible {
   padding: 0 18px;
   border-right: 1px solid var(--line);
 }
+.brand-logo { width:34px; height:34px; flex:none; border-radius:9px; object-fit:cover; }
 
 .brand-mark {
   position: relative;
@@ -981,7 +983,7 @@ body.resizing-row * {
 @media (max-width: 720px) {
   .studio-shell { min-height: 620px; }
   .topbar { grid-template-columns: 156px 1fr auto; }
-  .brand-name { font-size: 11px; }.brand-owner { font-size: 6px; letter-spacing: 0; }.brand-mark { width: 25px; height: 25px; }
+  .brand-name { font-size: 11px; }.brand-owner { font-size: 6px; letter-spacing: 0; }.brand-mark,.brand-logo { width: 25px; height: 25px; }
   .project-name { width: 100%; font-size: 11px; }
   .workspace { grid-template-columns: 1fr; }
   .parts-panel,
