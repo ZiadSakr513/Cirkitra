@@ -5,7 +5,9 @@ import { createDefaultBlinkProject } from "../circuit/index.ts";
 import {
   ArduinoSimulator,
   compileArduinoSketch,
+  isBuzzerCircuitPowered,
   isLedCircuitPowered,
+  resolveBuzzerCircuitBindings,
   resolveLedCircuitBindings,
 } from "./index.ts";
 
@@ -87,27 +89,65 @@ test("step consumes one instruction and treats delay as one complete step", () =
   assert.equal(simulator.getSnapshot().loopCount, 1);
 });
 
-test("reports unsupported control flow without executing nested calls", () => {
-  const program = compileArduinoSketch(`
-    void setup() { pinMode(2, INPUT_PULLUP); }
+test("executes if statements with digitalRead conditions", () => {
+  const simulator = new ArduinoSimulator(`
+    void setup() { pinMode(2, INPUT_PULLUP); pinMode(13, OUTPUT); }
     void loop() {
       if (digitalRead(2) == LOW) {
         digitalWrite(13, HIGH);
+      } else {
+        digitalWrite(13, LOW);
       }
       delay(10);
     }
   `);
+  simulator.run();
+  simulator.advance(0);
+  simulator.setDigitalInput(2, false);
+  simulator.advance(10);
+  assert.equal(simulator.getSnapshot().pins[13].digitalValue, 1);
+});
 
-  assert.equal(program.valid, true);
-  assert.ok(
-    program.diagnostics.some(
-      (diagnostic) => diagnostic.code === "UNSUPPORTED_CONTROL_FLOW",
-    ),
-  );
-  assert.deepEqual(
-    program.loop.map((instruction) => instruction.kind),
-    ["delay"],
-  );
+test("executes millis-based variables, assignments, arithmetic, and conditions", () => {
+  const simulator = new ArduinoSimulator(`
+    const int RED_PIN = 13;
+    unsigned long previous = 0;
+    int state = 0;
+    void setup() { pinMode(RED_PIN, OUTPUT); }
+    void loop() {
+      if (millis() - previous >= 500) {
+        previous = millis();
+        state = (state + 1) % 2;
+        if (state == 1) { digitalWrite(RED_PIN, HIGH); }
+        else { digitalWrite(RED_PIN, LOW); }
+      }
+    }
+  `);
+  assert.equal(simulator.getCompiledSketch().valid, true);
+  simulator.run();
+  simulator.advance(499);
+  assert.equal(simulator.getSnapshot().pins[13].digitalValue, 0);
+  simulator.advance(1);
+  assert.equal(simulator.getSnapshot().pins[13].digitalValue, 1);
+  simulator.advance(500);
+  assert.equal(simulator.getSnapshot().pins[13].digitalValue, 0);
+});
+
+test("evaluates state and ternary expressions passed to digitalWrite", () => {
+  const simulator = new ArduinoSimulator(`
+    bool buzzerOn = false;
+    void setup() { pinMode(8, OUTPUT); }
+    void loop() {
+      buzzerOn = !buzzerOn;
+      digitalWrite(8, buzzerOn ? HIGH : LOW);
+      delay(100);
+    }
+  `);
+  simulator.run();
+  simulator.advance(0);
+  assert.equal(simulator.getSnapshot().pins[8].digitalValue, 1);
+  simulator.advance(100);
+  assert.equal(simulator.getSnapshot().pins[8].digitalValue, 0);
 });
 
 test("supports named external inputs and stable subscription snapshots", () => {
@@ -201,4 +241,30 @@ test("treats a Ground component as the zero-volt reference", () => {
 
   assert.deepEqual(binding?.cathodeBoardPins, ["GND"]);
   assert.equal(isLedCircuitPowered(binding, simulator.getSnapshot()), true);
+});
+
+test("powers a buzzer only while voltage is applied across its terminals", () => {
+  const project = createDefaultBlinkProject();
+  project.components = [
+    project.components.find((component) => component.type === "arduino-uno")!,
+    { id: "buzzer1", type: "buzzer", label: "Buzzer", x: 500, y: 250 },
+  ];
+  project.connections = [
+    { id: "wire-buzzer-positive", from: { componentId: "uno", pin: "D8" }, to: { componentId: "buzzer1", pin: "+" } },
+    { id: "wire-buzzer-ground", from: { componentId: "buzzer1", pin: "-" }, to: { componentId: "uno", pin: "GND" } },
+  ];
+  project.code = `
+    void setup() { pinMode(8, OUTPUT); }
+    void loop() {
+      digitalWrite(8, HIGH); delay(1000);
+      digitalWrite(8, LOW); delay(1000);
+    }
+  `;
+  const binding = resolveBuzzerCircuitBindings(project).get("buzzer1");
+  const simulator = new ArduinoSimulator(project.code);
+  simulator.run();
+  simulator.advance(0);
+  assert.equal(isBuzzerCircuitPowered(binding, simulator.getSnapshot()), true);
+  simulator.advance(1000);
+  assert.equal(isBuzzerCircuitPowered(binding, simulator.getSnapshot()), false);
 });

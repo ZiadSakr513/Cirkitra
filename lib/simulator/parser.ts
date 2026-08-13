@@ -263,9 +263,10 @@ function tokenizeExpression(expression: string): ExpressionToken[] | undefined {
       continue;
     }
 
-    if ("+-*/%()".includes(expression[index])) {
-      tokens.push({ type: "operator", value: expression[index] });
-      index += 1;
+    const operator = /^(?:&&|\|\||==|!=|<=|>=|[+\-*/%()!,:?<>])/.exec(remainder);
+    if (operator) {
+      tokens.push({ type: "operator", value: operator[0] });
+      index += operator[0].length;
       continue;
     }
 
@@ -281,13 +282,70 @@ class ExpressionParser {
   constructor(
     private readonly tokens: ExpressionToken[],
     private readonly constants: ReadonlyMap<string, number>,
+    private readonly functions: Readonly<Record<string, (...args: number[]) => number>> = {},
   ) {}
 
   parse(): number | undefined {
-    const value = this.parseAdditive();
+    const value = this.parseConditional();
     return value !== undefined && this.cursor === this.tokens.length
       ? value
       : undefined;
+  }
+
+  private parseConditional(): number | undefined {
+    const condition = this.parseLogicalOr();
+    if (condition === undefined || !this.peek("?")) return condition;
+    this.cursor += 1;
+    const whenTrue = this.parseConditional();
+    if (whenTrue === undefined || !this.peek(":")) return undefined;
+    this.cursor += 1;
+    const whenFalse = this.parseConditional();
+    if (whenFalse === undefined) return undefined;
+    return condition !== 0 ? whenTrue : whenFalse;
+  }
+
+  private parseLogicalOr(): number | undefined {
+    let value = this.parseLogicalAnd();
+    while (value !== undefined && this.peek("||")) {
+      this.cursor += 1;
+      const right = this.parseLogicalAnd();
+      if (right === undefined) return undefined;
+      value = value !== 0 || right !== 0 ? 1 : 0;
+    }
+    return value;
+  }
+
+  private parseLogicalAnd(): number | undefined {
+    let value = this.parseEquality();
+    while (value !== undefined && this.peek("&&")) {
+      this.cursor += 1;
+      const right = this.parseEquality();
+      if (right === undefined) return undefined;
+      value = value !== 0 && right !== 0 ? 1 : 0;
+    }
+    return value;
+  }
+
+  private parseEquality(): number | undefined {
+    let value = this.parseComparison();
+    while (value !== undefined && (this.peek("==") || this.peek("!="))) {
+      const operator = this.tokens[this.cursor++].value;
+      const right = this.parseComparison();
+      if (right === undefined) return undefined;
+      value = operator === "==" ? Number(value === right) : Number(value !== right);
+    }
+    return value;
+  }
+
+  private parseComparison(): number | undefined {
+    let value = this.parseAdditive();
+    while (value !== undefined && ["<", "<=", ">", ">="].some((item) => this.peek(item))) {
+      const operator = this.tokens[this.cursor++].value;
+      const right = this.parseAdditive();
+      if (right === undefined) return undefined;
+      value = Number(operator === "<" ? value < right : operator === "<=" ? value <= right : operator === ">" ? value > right : value >= right);
+    }
+    return value;
   }
 
   private parseAdditive(): number | undefined {
@@ -325,12 +383,12 @@ class ExpressionParser {
   }
 
   private parseUnary(): number | undefined {
-    if (this.peek("+") || this.peek("-")) {
+    if (this.peek("+") || this.peek("-") || this.peek("!")) {
       const operator = this.tokens[this.cursor].value;
       this.cursor += 1;
       const value = this.parseUnary();
       if (value === undefined) return undefined;
-      return operator === "-" ? -value : value;
+      return operator === "-" ? -value : operator === "!" ? Number(value === 0) : value;
     }
     return this.parsePrimary();
   }
@@ -346,12 +404,24 @@ class ExpressionParser {
 
     if (token.type === "identifier") {
       this.cursor += 1;
+      if (this.peek("(")) {
+        this.cursor += 1;
+        const args: number[] = [];
+        if (!this.peek(")")) {
+          const argument = this.parseConditional();
+          if (argument === undefined) return undefined;
+          args.push(argument);
+        }
+        if (!this.peek(")")) return undefined;
+        this.cursor += 1;
+        return this.functions[token.value]?.(...args);
+      }
       return this.constants.get(token.value);
     }
 
     if (token.value === "(") {
       this.cursor += 1;
-      const value = this.parseAdditive();
+      const value = this.parseConditional();
       if (value === undefined || !this.peek(")")) return undefined;
       this.cursor += 1;
       return value;
@@ -363,6 +433,17 @@ class ExpressionParser {
   private peek(operator: string): boolean {
     return this.tokens[this.cursor]?.value === operator;
   }
+}
+
+export function evaluateRuntimeExpression(
+  expression: string,
+  variables: ReadonlyMap<string, number>,
+  functions: Readonly<Record<string, (...args: number[]) => number>> = {},
+): number | undefined {
+  const tokens = tokenizeExpression(expression.trim());
+  if (!tokens) return undefined;
+  const result = new ExpressionParser(tokens, variables, functions).parse();
+  return result !== undefined && Number.isFinite(result) ? result : undefined;
 }
 
 function evaluateStatic(
@@ -509,7 +590,7 @@ function compileBody(
     );
     if (!call) {
       diagnostics.push({
-        severity: "warning",
+        severity: "error",
         code: "UNSUPPORTED_STATEMENT",
         message: `This statement is outside the simulator subset and was skipped: ${statement.text}`,
         line,
@@ -558,11 +639,24 @@ function compileBody(
       }
       const pin = evaluateStatic(args[0], constants);
       const value = evaluateStatic(args[1], constants);
-      if (pin === undefined || !isUnoPin(pin) || (value !== 0 && value !== 1)) {
+      if (pin === undefined || !isUnoPin(pin)) {
         diagnostics.push({
           severity: "error",
           code: "INVALID_DIGITAL_WRITE",
           message: `${callee} requires a valid Uno pin and HIGH/LOW (or 1/0).`,
+          line,
+        });
+        continue;
+      }
+      if (value === undefined) {
+        instructions.push({ kind: "digitalWriteExpression", pin, expression: args[1].trim(), ...sourceInfo });
+        continue;
+      }
+      if (value !== 0 && value !== 1) {
+        diagnostics.push({
+          severity: "error",
+          code: "INVALID_DIGITAL_WRITE",
+          message: `${callee} requires HIGH/LOW, 1/0, or a numeric state expression.`,
           line,
         });
         continue;
@@ -643,7 +737,7 @@ function compileBody(
     }
 
     diagnostics.push({
-      severity: "warning",
+      severity: "error",
       code: "UNSUPPORTED_CALL",
       message: `${callee}() is outside the simulator subset and was skipped.`,
       line,
@@ -651,6 +745,111 @@ function compileBody(
   }
 
   return instructions;
+}
+
+function compileExecutableBody(
+  source: string,
+  body: FunctionBody | undefined,
+  constants: ReadonlyMap<string, number>,
+  diagnostics: SimulatorDiagnostic[],
+): SketchInstruction[] {
+  if (!body) return [];
+  const instructions: SketchInstruction[] = [];
+  const text = body.body;
+
+  const skipWhitespace = (start: number) => {
+    let cursor = start;
+    while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+    return cursor;
+  };
+  const matching = (start: number, open: string, close: string): number | undefined => {
+    let depth = 0;
+    for (let cursor = start; cursor < text.length; cursor += 1) {
+      if (text[cursor] === open) depth += 1;
+      if (text[cursor] === close && --depth === 0) return cursor;
+    }
+    return undefined;
+  };
+  const compileSimple = (statement: string, localStart: number) => {
+    const trimmed = statement.trim();
+    const sourceInfo = { line: lineAt(source, body.startIndex + localStart), source: trimmed };
+    const declaration = /^(?:(?:const\s+)?(?:unsigned\s+)?(?:int|long|short|byte|uint8_t|uint16_t|size_t|bool))\s+([A-Za-z_]\w*)(?:\s*=\s*([^;]+))?\s*;$/.exec(trimmed);
+    if (declaration) {
+      instructions.push({ kind: "declare", name: declaration[1], expression: declaration[2]?.trim() ?? "0", ...sourceInfo });
+      return;
+    }
+    const assignment = /^([A-Za-z_]\w*)\s*(=|\+=|-=|\*=|\/=|%=)\s*([^;]+)\s*;$/.exec(trimmed);
+    if (assignment) {
+      const expression = assignment[2] === "=" ? assignment[3] : `${assignment[1]} ${assignment[2][0]} (${assignment[3]})`;
+      instructions.push({ kind: "assign", name: assignment[1], expression, ...sourceInfo });
+      return;
+    }
+    const increment = /^(?:([A-Za-z_]\w*)\+\+|\+\+([A-Za-z_]\w*)|([A-Za-z_]\w*)--|--([A-Za-z_]\w*))\s*;$/.exec(trimmed);
+    if (increment) {
+      const name = increment[1] ?? increment[2] ?? increment[3] ?? increment[4];
+      const delta = increment[1] || increment[2] ? 1 : -1;
+      instructions.push({ kind: "assign", name, expression: `${name} ${delta > 0 ? "+" : "-"} 1`, ...sourceInfo });
+      return;
+    }
+    const compiled = compileBody(source, { body: trimmed, startIndex: body.startIndex + localStart }, constants, diagnostics);
+    instructions.push(...compiled);
+  };
+
+  const compileRange = (rangeStart: number, rangeEnd: number) => {
+    let cursor = rangeStart;
+    while ((cursor = skipWhitespace(cursor)) < rangeEnd) {
+      if (/^if\b/.test(text.slice(cursor))) {
+        const openParen = skipWhitespace(cursor + 2);
+        if (text[openParen] !== "(") break;
+        const closeParen = matching(openParen, "(", ")");
+        if (closeParen === undefined) break;
+        const openBrace = skipWhitespace(closeParen + 1);
+        if (text[openBrace] !== "{") break;
+        const closeBrace = matching(openBrace, "{", "}");
+        if (closeBrace === undefined) break;
+        const condition = text.slice(openParen + 1, closeParen).trim();
+        const jumpIfIndex = instructions.length;
+        instructions.push({ kind: "jumpIfFalse", expression: condition, target: 0, line: lineAt(source, body.startIndex + cursor), source: `if (${condition})` });
+        compileRange(openBrace + 1, closeBrace);
+        let next = skipWhitespace(closeBrace + 1);
+        if (/^else\b/.test(text.slice(next))) {
+          const jumpIndex = instructions.length;
+          instructions.push({ kind: "jump", target: 0, line: lineAt(source, body.startIndex + next), source: "else" });
+          (instructions[jumpIfIndex] as Extract<SketchInstruction, { kind: "jumpIfFalse" }>).target = instructions.length;
+          const elseBrace = skipWhitespace(next + 4);
+          if (text[elseBrace] === "{") {
+            const elseClose = matching(elseBrace, "{", "}");
+            if (elseClose === undefined) break;
+            compileRange(elseBrace + 1, elseClose);
+            next = elseClose + 1;
+          }
+          (instructions[jumpIndex] as Extract<SketchInstruction, { kind: "jump" }>).target = instructions.length;
+        } else {
+          (instructions[jumpIfIndex] as Extract<SketchInstruction, { kind: "jumpIfFalse" }>).target = instructions.length;
+        }
+        cursor = next;
+        continue;
+      }
+      const semicolon = text.indexOf(";", cursor);
+      if (semicolon < 0 || semicolon >= rangeEnd) break;
+      compileSimple(text.slice(cursor, semicolon + 1), cursor);
+      cursor = semicolon + 1;
+    }
+  };
+  compileRange(0, text.length);
+  return instructions;
+}
+
+function collectGlobalVariables(source: string): Record<string, number> {
+  const globals: Record<string, number> = {};
+  const setupIndex = source.search(/\bvoid\s+setup\s*\(/);
+  const prefix = setupIndex >= 0 ? source.slice(0, setupIndex) : source;
+  const constants = defaultConstants();
+  for (const match of prefix.matchAll(/\b(?:unsigned\s+)?(?:int|long|short|byte|uint8_t|uint16_t|size_t|bool)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g)) {
+    const value = evaluateStatic(match[2], new Map([...constants, ...Object.entries(globals)]));
+    if (value !== undefined) globals[match[1]] = value;
+  }
+  return globals;
 }
 
 /**
@@ -673,13 +872,14 @@ export function compileArduinoSketch(source: string): CompiledArduinoSketch {
     });
   }
 
-  const setup = compileBody(masked, setupBody, constants, diagnostics);
-  const loop = compileBody(masked, loopBody, constants, diagnostics);
+  const setup = compileExecutableBody(masked, setupBody, constants, diagnostics);
+  const loop = compileExecutableBody(masked, loopBody, constants, diagnostics);
 
   return {
     source,
     setup,
     loop,
+    globals: collectGlobalVariables(masked),
     diagnostics,
     valid: !diagnostics.some((diagnostic) => diagnostic.severity === "error"),
   };

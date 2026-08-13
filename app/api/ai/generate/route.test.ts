@@ -25,6 +25,100 @@ function generationRequest(model?: string) {
   });
 }
 
+function requestWithCurrentProject(prompt: string) {
+  return new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompt, currentProject: createDefaultBlinkProject() }),
+  });
+}
+
+test("ordinary greetings receive a model-generated chat reply without circuit generation", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  let requestBody: {
+    generationConfig: { maxOutputTokens: number; responseSchema: { required: string[] } };
+    contents: Array<{ parts: Array<{ text: string }> }>;
+  } | undefined;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body));
+    return modelResponse(JSON.stringify({ reply: "Hello! How can I help with your circuit?" }));
+  };
+
+  const response = await POST(requestWithCurrentProject("hello"));
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.deepEqual(body, {
+    kind: "chat",
+    reply: "Hello! How can I help with your circuit?",
+    model: "gemini-3.5-flash",
+  });
+  assert.equal(requestBody?.generationConfig.maxOutputTokens, 512);
+  assert.deepEqual(requestBody?.generationConfig.responseSchema.required, ["reply"]);
+  assert.equal(requestBody?.contents[0].parts[0].text, "hello");
+});
+
+test("standalone and ambiguous prompts create fresh circuits without current project context", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const requests: RequestInit[] = [];
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    requests.push(init ?? {});
+    return modelResponse(JSON.stringify(generatedEnvelope));
+  };
+
+  for (const prompt of ["Buzzer alert every second", "Traffic light with 3 LEDs", "Make something useful"]) {
+    const response = await POST(requestWithCurrentProject(prompt));
+    assert.equal(response.status, 200);
+  }
+  for (const request of requests) {
+    const body = JSON.parse(String(request.body));
+    const data = JSON.parse(body.contents[0].parts[0].text);
+    assert.equal(data.mode, "create");
+    assert.equal("currentProject" in data, false);
+    assert.match(data.task, /fresh circuit/i);
+  }
+});
+
+test("explicit edit prompts include the current project", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const requests: RequestInit[] = [];
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    requests.push(init ?? {});
+    return modelResponse(JSON.stringify(generatedEnvelope));
+  };
+
+  for (const prompt of ["Add a buzzer to this traffic light", "Remove the LED", "Modify the current circuit"]) {
+    const response = await POST(requestWithCurrentProject(prompt));
+    assert.equal(response.status, 200);
+  }
+  for (const request of requests) {
+    const body = JSON.parse(String(request.body));
+    const data = JSON.parse(body.contents[0].parts[0].text);
+    assert.equal(data.mode, "edit");
+    assert.deepEqual(data.currentProject, createDefaultBlinkProject());
+  }
+});
+
 test("forwards only the default and selected Gemini models", async (context) => {
   const originalFetch = globalThis.fetch;
   const originalKey = process.env.GEMINI_API_KEY;
@@ -102,6 +196,7 @@ test("repairs malformed JSON before returning a circuit", async (context) => {
   assert.equal(requests.length, 2);
   const repairBody = JSON.parse(String(requests[1].body));
   const repairData = JSON.parse(repairBody.contents[0].parts[0].text);
+  assert.equal(repairData.mode, "create");
   assert.match(repairData.task, /Repair the rejected circuit proposal/);
   assert.deepEqual(repairData.validationIssues, ["response invalid_json"]);
   assert.equal(repairData.rejectedResponse, '{"project":');
@@ -164,6 +259,7 @@ test("regenerates cleanly when repair is also malformed", async (context) => {
     regeneratedBody.contents[0].parts[0].text,
     firstBody.contents[0].parts[0].text,
   );
+  assert.equal(JSON.parse(regeneratedBody.contents[0].parts[0].text).mode, "create");
   assert.notEqual(
     repairBody.contents[0].parts[0].text,
     firstBody.contents[0].parts[0].text,

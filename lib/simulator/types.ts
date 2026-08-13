@@ -44,6 +44,11 @@ export type SketchInstruction =
       value: DigitalLevel;
     })
   | (InstructionSource & {
+      kind: "digitalWriteExpression";
+      pin: number;
+      expression: string;
+    })
+  | (InstructionSource & {
       kind: "analogWrite";
       pin: number;
       value: number;
@@ -56,12 +61,32 @@ export type SketchInstruction =
       kind: "serialPrint";
       value: string;
       newline: boolean;
+    })
+  | (InstructionSource & {
+      kind: "declare";
+      name: string;
+      expression: string;
+    })
+  | (InstructionSource & {
+      kind: "assign";
+      name: string;
+      expression: string;
+    })
+  | (InstructionSource & {
+      kind: "jumpIfFalse";
+      expression: string;
+      target: number;
+    })
+  | (InstructionSource & {
+      kind: "jump";
+      target: number;
     });
 
 export interface CompiledArduinoSketch {
   source: string;
   setup: ReadonlyArray<SketchInstruction>;
   loop: ReadonlyArray<SketchInstruction>;
+  globals: Readonly<Record<string, number>>;
   diagnostics: ReadonlyArray<SimulatorDiagnostic>;
   valid: boolean;
 }

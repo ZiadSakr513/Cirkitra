@@ -26,7 +26,9 @@ import {
 } from "../lib/circuit";
 import {
   ArduinoSimulator,
+  isBuzzerCircuitPowered,
   isLedCircuitPowered,
+  resolveBuzzerCircuitBindings,
   resolveLedCircuitBindings,
   type SimulatorSnapshot,
 } from "../lib/simulator";
@@ -577,6 +579,10 @@ export function CircuitStudio() {
     () => resolveLedCircuitBindings(project),
     [project],
   );
+  const buzzerCircuitBindings = useMemo(
+    () => resolveBuzzerCircuitBindings(project),
+    [project],
+  );
   const wireRoutes = useMemo(() => {
     const inputs = project.connections.flatMap((connection) => {
       const fromComponent = project.components.find((component) => component.id === connection.from.componentId);
@@ -848,6 +854,8 @@ export function CircuitStudio() {
         body: JSON.stringify({ prompt: clean, currentProject: project, model: aiModel }),
       });
       const result = await response.json() as {
+        kind?: "chat";
+        reply?: string;
         project?: unknown;
         explanation?: string;
         warnings?: string[];
@@ -859,6 +867,20 @@ export function CircuitStudio() {
           result.error?.message ||
           `AI generation failed${result.error?.code ? ` (${result.error.code})` : ""}.`,
         );
+      }
+
+      const responseModel = isGeminiModel(result.model) ? result.model : aiModel;
+      if (result.kind === "chat") {
+        const reply = typeof result.reply === "string" ? result.reply.trim() : "";
+        if (!reply) throw new Error("AI returned an empty response.");
+        setChat((items) => [...items, {
+          id: uid("assistant"),
+          role: "assistant",
+          text: reply,
+          meta: GEMINI_MODEL_LABELS[responseModel],
+        }]);
+        announce(`${GEMINI_MODEL_LABELS[responseModel]} replied`);
+        return;
       }
 
       const parsed = safeParseCircuitProject(result.project);
@@ -876,7 +898,6 @@ export function CircuitStudio() {
         ...parsed.data,
         components: centerComponentsAtOrigin(parsed.data.components),
       };
-      const responseModel = isGeminiModel(result.model) ? result.model : aiModel;
       const metaParts = [GEMINI_MODEL_LABELS[responseModel], "schema validated"];
       if (result.warnings?.length) metaParts.push(...result.warnings);
       const meta = metaParts.join(" · ");
@@ -1118,16 +1139,21 @@ export function CircuitStudio() {
                   ledCircuitBindings.get(component.id),
                   snapshot,
                 );
+                const isBuzzerOn = component.type === "buzzer" && isBuzzerCircuitPowered(
+                  buzzerCircuitBindings.get(component.id),
+                  snapshot,
+                );
+                const isPowered = isLedOn || isBuzzerOn;
                 return (
                   <article
                     key={component.id}
-                    className={`circuit-node schematic-component component-${component.type} ${isSelected ? "selected" : ""} ${isLedOn ? "powered" : ""}`}
+                    className={`circuit-node schematic-component component-${component.type} ${isSelected ? "selected" : ""} ${isPowered ? "powered" : ""}`}
                     style={{ left: component.x, top: component.y, width: size.width, height: size.height, "--node-accent": definition?.accent ?? "#64748b" } as React.CSSProperties}
                     onPointerDown={(event) => beginDrag(event, component)}
                     onDoubleClick={() => { setSelectedIds([component.id]); setSideTab("inspector"); }}
                   >
                     <div className="symbol-caption"><strong>{component.label}</strong><small>{component.type === "arduino-uno" ? "ARDUINO UNO R3" : definition?.displayName}</small></div>
-                    <SchematicSymbol type={component.type} properties={component.properties} powered={isLedOn || component.type === "arduino-uno"} />
+                    <SchematicSymbol type={component.type} properties={component.properties} powered={isPowered || component.type === "arduino-uno"} />
                     {definition?.pins.map((pin) => {
                         const localPoint = pinPosition({ ...component, x: 0, y: 0, rotation: 0 }, pin.id, definition);
                         if (!localPoint) return null;
@@ -1205,7 +1231,7 @@ export function CircuitStudio() {
                     <div><p>{message.text}</p>{message.meta && <small>{message.meta}</small>}</div>
                   </div>
                 ))}
-                {generating && <div className="chat-message assistant"><div className="avatar">✦</div><div className="thinking"><i></i><i></i><i></i><span>Checking and finalizing the circuit…</span></div></div>}
+                {generating && <div className="chat-message assistant"><div className="avatar">✦</div><div className="thinking"><i></i><i></i><i></i><span>Thinking…</span></div></div>}
               </div>
               <div className="prompt-zone">
                 {generationError && (

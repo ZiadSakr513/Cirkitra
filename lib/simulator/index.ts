@@ -1,10 +1,12 @@
 export { ArduinoSimulator } from "./engine.ts";
 export { compileArduinoSketch } from "./parser.ts";
 export {
+  isBuzzerCircuitPowered,
   isLedCircuitPowered,
+  resolveBuzzerCircuitBindings,
   resolveLedCircuitBindings,
 } from "./circuit-state.ts";
-export type { LedCircuitBinding } from "./circuit-state.ts";
+export type { BuzzerCircuitBinding, LedCircuitBinding } from "./circuit-state.ts";
 export {
   createInitialPinStates,
   isUnoPin,

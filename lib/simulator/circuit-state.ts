@@ -10,6 +10,11 @@ export interface LedCircuitBinding {
   cathodeBoardPins: ReadonlyArray<string>;
 }
 
+export interface BuzzerCircuitBinding {
+  positiveBoardPins: ReadonlyArray<string>;
+  negativeBoardPins: ReadonlyArray<string>;
+}
+
 type ElectricalGraph = {
   adjacency: Map<string, Set<string>>;
   endpoints: Map<string, ConnectionEndpoint>;
@@ -127,6 +132,22 @@ export function resolveLedCircuitBindings(
   return bindings;
 }
 
+/** Resolve each buzzer's positive and negative terminals to their Uno rails. */
+export function resolveBuzzerCircuitBindings(
+  project: CircuitProject,
+): ReadonlyMap<string, BuzzerCircuitBinding> {
+  const graph = buildElectricalGraph(project);
+  const bindings = new Map<string, BuzzerCircuitBinding>();
+  project.components.forEach((component) => {
+    if (component.type !== "buzzer") return;
+    bindings.set(component.id, {
+      positiveBoardPins: reachableBoardPins(graph, { componentId: component.id, pin: "+" }),
+      negativeBoardPins: reachableBoardPins(graph, { componentId: component.id, pin: "-" }),
+    });
+  });
+  return bindings;
+}
+
 function boardPinLevel(
   pin: string,
   snapshot: SimulatorSnapshot,
@@ -152,4 +173,14 @@ export function isLedCircuitPowered(
     (pin) => boardPinLevel(pin, snapshot) === 0,
   );
   return anodeHigh && cathodeLow;
+}
+
+/** True while voltage is actively applied across a buzzer's terminals. */
+export function isBuzzerCircuitPowered(
+  binding: BuzzerCircuitBinding | undefined,
+  snapshot: SimulatorSnapshot,
+): boolean {
+  if (!binding) return false;
+  return binding.positiveBoardPins.some((pin) => boardPinLevel(pin, snapshot) === 1)
+    && binding.negativeBoardPins.some((pin) => boardPinLevel(pin, snapshot) === 0);
 }

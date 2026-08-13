@@ -1,3 +1,5 @@
+import { compileArduinoSketch } from "../../../lib/simulator/index.ts";
+
 type CompileDiagnostic = {
   line: number;
   column: number;
@@ -89,6 +91,16 @@ export async function POST(request: Request) {
   }
 
   const diagnostics = validateSketch(body.code);
+  const simulation = compileArduinoSketch(body.code);
+  for (const diagnostic of simulation.diagnostics) {
+    const duplicate = diagnostics.some((item) => item.line === (diagnostic.line ?? 1) && item.message === diagnostic.message);
+    if (!duplicate) diagnostics.push({
+      line: diagnostic.line ?? 1,
+      column: diagnostic.column ?? 1,
+      severity: diagnostic.severity,
+      message: diagnostic.message,
+    });
+  }
   const success = diagnostics.every((item) => item.severity !== "error");
   return Response.json({
     success,

@@ -1,5 +1,5 @@
 import { createInitialPinStates, parseUnoPinLabel, UNO_PWM_PINS } from "./pins.ts";
-import { compileArduinoSketch } from "./parser.ts";
+import { compileArduinoSketch, evaluateRuntimeExpression } from "./parser.ts";
 import type {
   ArduinoSimulatorOptions,
   CompiledArduinoSketch,
@@ -83,6 +83,7 @@ export class ArduinoSimulator {
   private waitRemainingMs = 0;
   private pins: UnoPinState[] = createInitialPinStates();
   private serial: SerialEntry[] = [];
+  private variables = new Map<string, number>();
   private nextSerialId = 1;
   private readonly maxOperationsPerAdvance: number;
   private readonly maxSerialEntries: number;
@@ -100,6 +101,7 @@ export class ArduinoSimulator {
       DEFAULT_MAX_SERIAL_ENTRIES,
     );
     this.compiled = compileArduinoSketch(source);
+    this.variables = new Map(Object.entries(this.compiled.globals));
     this.status = this.compiled.valid ? "idle" : "error";
     this.snapshot = freezeSnapshot(
       this.status,
@@ -150,6 +152,7 @@ export class ArduinoSimulator {
     this.waitRemainingMs = 0;
     this.pins = createInitialPinStates();
     this.serial = [];
+    this.variables = new Map(Object.entries(this.compiled.globals));
     this.nextSerialId = 1;
     this.commit();
     return this.snapshot;
@@ -230,6 +233,7 @@ export class ArduinoSimulator {
     if (this.status !== "running") return this.snapshot;
 
     let budget = realDeltaMs * this.speed;
+    this.timeMs += budget;
     let operations = 0;
 
     while (this.status === "running" && operations < this.maxOperationsPerAdvance) {
@@ -239,7 +243,6 @@ export class ArduinoSimulator {
       if (this.waitRemainingMs > 0) {
         if (budget <= 0) break;
         const elapsed = Math.min(budget, this.waitRemainingMs);
-        this.timeMs += elapsed;
         this.waitRemainingMs -= elapsed;
         budget -= elapsed;
         if (this.waitRemainingMs > 0) break;
@@ -317,6 +320,23 @@ export class ArduinoSimulator {
   }
 
   private execute(instruction: SketchInstruction): void {
+    if (instruction.kind === "jump") {
+      this.programCounter = instruction.target - 1;
+      return;
+    }
+
+    if (instruction.kind === "jumpIfFalse") {
+      const value = this.evaluate(instruction.expression);
+      if (!value) this.programCounter = instruction.target - 1;
+      return;
+    }
+
+    if (instruction.kind === "declare" || instruction.kind === "assign") {
+      const value = this.evaluate(instruction.expression);
+      if (value !== undefined) this.variables.set(instruction.name, value);
+      return;
+    }
+
     if (instruction.kind === "delay") {
       this.waitRemainingMs = instruction.durationMs;
       return;
@@ -352,12 +372,14 @@ export class ArduinoSimulator {
       return;
     }
 
-    if (instruction.kind === "digitalWrite") {
+    if (instruction.kind === "digitalWrite" || instruction.kind === "digitalWriteExpression") {
+      const rawValue = instruction.kind === "digitalWrite" ? instruction.value : this.evaluate(instruction.expression);
+      const value: DigitalLevel = rawValue && rawValue !== 0 ? 1 : 0;
       const changed =
-        pin.digitalValue !== instruction.value ||
-        pin.pwmValue !== (instruction.value === 1 ? 255 : 0);
-      pin.digitalValue = instruction.value;
-      pin.pwmValue = instruction.value === 1 ? 255 : 0;
+        pin.digitalValue !== value ||
+        pin.pwmValue !== (value === 1 ? 255 : 0);
+      pin.digitalValue = value;
+      pin.pwmValue = value === 1 ? 255 : 0;
       if (changed) pin.lastChangedAtMs = this.timeMs;
       return;
     }
@@ -374,6 +396,20 @@ export class ArduinoSimulator {
     pin.digitalValue = digitalValue;
     pin.pwmValue = instruction.value;
     if (changed) pin.lastChangedAtMs = this.timeMs;
+  }
+
+  private evaluate(expression: string): number | undefined {
+    const values = new Map(this.variables);
+    values.set("LOW", 0);
+    values.set("HIGH", 1);
+    values.set("false", 0);
+    values.set("true", 1);
+    values.set("LED_BUILTIN", 13);
+    for (let analog = 0; analog < 6; analog += 1) values.set(`A${analog}`, 14 + analog);
+    return evaluateRuntimeExpression(expression, values, {
+      millis: () => this.timeMs,
+      digitalRead: (pin) => this.pins[Math.trunc(pin)]?.digitalValue ?? 0,
+    });
   }
 
   private resolvePin(pin: number | string): number | undefined {
