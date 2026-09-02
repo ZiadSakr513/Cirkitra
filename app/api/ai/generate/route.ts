@@ -755,7 +755,7 @@ function validationIssueCode(issue: string): string {
   return `${path}:invalid`;
 }
 
-function logRecoveryFailure(stage: "initial" | "repair" | "regenerate" | "repair2" | "regenerate2", issues: string[]) {
+function logRecoveryFailure(stage: "initial" | "repair" | "regenerate" | "repair2" | "regenerate2" | "repair3" | "regenerate3", issues: string[]) {
   console.warn("[ai-generation-recovery]", {
     stage,
     issueCodes: [...new Set(issues.map(validationIssueCode))].slice(0, 20),
@@ -767,38 +767,75 @@ function autoCorrectPinNames(content: string): { corrected: string; changes: num
   let corrected = content;
   let changes = 0;
   
-  // Common pin name corrections
-  const corrections: Array<[RegExp, string]> = [
-    // Ground pins
+  // Common pin name corrections - expanded list
+  const corrections: Array<[RegExp, string | ((match: string, ...args: any[]) => string)]> = [
+    // Ground pins - all variations
     [/"pin":\s*"GND1"/g, '"pin": "GND"'],
     [/"pin":\s*"GND4"/g, '"pin": "GND2"'],
     [/"pin":\s*"GND5"/g, '"pin": "GND3"'],
-    // Power pins
+    [/"pin":\s*"GROUND"/gi, '"pin": "GND"'],
+    [/"pin":\s*"ground"/g, '"pin": "GND"'],
+    // Power pins - all variations
     [/"pin":\s*"5v"/gi, '"pin": "5V"'],
     [/"pin":\s*"Vcc"/g, '"pin": "VCC"'],
+    [/"pin":\s*"VDD"/g, '"pin": "VCC"'],
     [/"pin":\s*"3v3"/gi, '"pin": "3V3"'],
-    // LED pins
+    [/"pin":\s*"3\.3V"/gi, '"pin": "3V3"'],
+    [/"pin":\s*"POWER"/gi, '"pin": "5V"'],
+    [/"pin":\s*"V\+"/g, '"pin": "5V"'],
+    // LED pins - all variations
     [/"pin":\s*"anode"/gi, '"pin": "A"'],
     [/"pin":\s*"cathode"/gi, '"pin": "K"'],
     [/"pin":\s*"ANODE"/g, '"pin": "A"'],
     [/"pin":\s*"CATHODE"/g, '"pin": "K"'],
-    // Sensor pins with numbers
+    [/"pin":\s*"\+"/g, '"pin": "A"'],
+    [/"pin":\s*"-"/g, '"pin": "K"'],
+    [/"pin":\s*"POSITIVE"/gi, '"pin": "A"'],
+    [/"pin":\s*"NEGATIVE"/gi, '"pin": "K"'],
+    [/"pin":\s*"POS"/gi, '"pin": "A"'],
+    [/"pin":\s*"NEG"/gi, '"pin": "K"'],
+    // Sensor/component pins with numbers
     [/"pin":\s*"OUT1"/g, '"pin": "OUT"'],
     [/"pin":\s*"SIG1"/g, '"pin": "SIG"'],
     [/"pin":\s*"TRIG1"/g, '"pin": "TRIG"'],
     [/"pin":\s*"ECHO1"/g, '"pin": "ECHO"'],
+    [/"pin":\s*"VCC1"/g, '"pin": "VCC"'],
+    [/"pin":\s*"OUTPUT"/gi, '"pin": "OUT"'],
+    [/"pin":\s*"SIGNAL"/gi, '"pin": "SIG"'],
+    [/"pin":\s*"TRIGGER"/gi, '"pin": "TRIG"'],
     // Resistor/button pins
     [/"pin":\s*"PIN1"/gi, '"pin": "1"'],
     [/"pin":\s*"PIN2"/gi, '"pin": "2"'],
+    [/"pin":\s*"TERMINAL1"/gi, '"pin": "1"'],
+    [/"pin":\s*"TERMINAL2"/gi, '"pin": "2"'],
+    [/"pin":\s*"T1"/gi, '"pin": "1"'],
+    [/"pin":\s*"T2"/gi, '"pin": "2"'],
     // Arduino digital pins - lowercase d
     [/"pin":\s*"d(\d+)"/gi, (match, num) => `"pin": "D${num}"`],
-    // Arduino analog pins - lowercase a
+    [/"pin":\s*"digital(\d+)"/gi, (match, num) => `"pin": "D${num}"`],
+    [/"pin":\s*"DIG(\d+)"/gi, (match, num) => `"pin": "D${num}"`],
+    // Arduino analog pins - lowercase a  
     [/"pin":\s*"a(\d+)"/gi, (match, num) => `"pin": "A${num}"`],
+    [/"pin":\s*"analog(\d+)"/gi, (match, num) => `"pin": "A${num}"`],
+    [/"pin":\s*"AIN(\d+)"/gi, (match, num) => `"pin": "A${num}"`],
+    // RGB LED pins
+    [/"pin":\s*"RED"/gi, '"pin": "R"'],
+    [/"pin":\s*"GREEN"/gi, '"pin": "G"'],
+    [/"pin":\s*"BLUE"/gi, '"pin": "B"'],
+    [/"pin":\s*"COMMON"/gi, '"pin": "COM"'],
+    // Switch pins
+    [/"pin":\s*"NORMALLY_OPEN"/gi, '"pin": "NO"'],
+    [/"pin":\s*"NORMALLY_CLOSED"/gi, '"pin": "NC"'],
+    [/"pin":\s*"COMMON"/gi, '"pin": "COM"'],
   ];
   
   for (const [pattern, replacement] of corrections) {
     const before = corrected;
-    corrected = corrected.replace(pattern, replacement);
+    if (typeof replacement === 'function') {
+      corrected = corrected.replace(pattern, replacement as any);
+    } else {
+      corrected = corrected.replace(pattern, replacement);
+    }
     if (corrected !== before) {
       changes++;
     }
@@ -1223,6 +1260,59 @@ export async function POST(request: Request) {
     }
   }
   logRecoveryFailure("regenerate2", regenerated2.issues);
+
+  // Attempt 6: Third repair - ultra aggressive
+  const repairContent3 = JSON.stringify({
+    mode,
+    task: "CRITICAL FIX NEEDED. Only fix pin names, nothing else. Arduino pins: D0-D13, A0-A5, GND, GND2, GND3, 5V, 3V3. LED pins: A, K. Resistor pins: 1, 2. Buzzer pins: +, -. Sensor pins: VCC, GND, OUT or SIG or TRIG/ECHO. Return complete JSON.",
+    originalRequest: prompt,
+    ...(currentProject ? { currentProject } : {}),
+    validationIssues: ["PIN NAMES ONLY!", ...regenerated2.issues.slice(0, 3)],
+    rejectedResponse: regenerated2.content.slice(0, MAX_REPAIR_CONTENT_LENGTH),
+  });
+  const repaired3 = await generateAttempt({
+    apiKey,
+    model,
+    userContent: repairContent3,
+    deadline,
+  });
+  if (repaired3.kind === "terminal") return repaired3.response;
+  if (repaired3.kind === "success") return jsonResponse({ ...repaired3.value, model });
+  
+  const autoCorrected6 = autoCorrectPinNames(repaired3.content);
+  if (autoCorrected6.changes > 0) {
+    try {
+      const parsed = parseModelJson(autoCorrected6.corrected);
+      const validated = validateGeneratedEnvelope(parsed);
+      if (validated.ok) {
+        console.log(`[ai-generation-recovery] Auto-corrected ${autoCorrected6.changes} pin names after third repair`);
+        return jsonResponse({ ...validated.value, model });
+      }
+    } catch {
+      // Continue
+    }
+  }
+  logRecoveryFailure("repair3", repaired3.issues);
+
+  // Attempt 7: Absolute final attempt
+  const regenerated3 = await generateAttempt({ apiKey, model, userContent, deadline });
+  if (regenerated3.kind === "terminal") return regenerated3.response;
+  if (regenerated3.kind === "success") return jsonResponse({ ...regenerated3.value, model });
+  
+  const autoCorrected7 = autoCorrectPinNames(regenerated3.content);
+  if (autoCorrected7.changes > 0) {
+    try {
+      const parsed = parseModelJson(autoCorrected7.corrected);
+      const validated = validateGeneratedEnvelope(parsed);
+      if (validated.ok) {
+        console.log(`[ai-generation-recovery] Auto-corrected ${autoCorrected7.changes} pin names on final attempt`);
+        return jsonResponse({ ...validated.value, model });
+      }
+    } catch {
+      // Absolute final failure
+    }
+  }
+  logRecoveryFailure("regenerate3", regenerated3.issues);
 
   return errorResponse(
     502,
