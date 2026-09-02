@@ -217,11 +217,13 @@ const PART_GLYPHS: Record<string, string> = {
 };
 
 let uidCounter = 0;
+let isFirstRender = true;
+
 function uid(prefix: string) {
-  // Use a counter-based approach to ensure deterministic IDs during SSR/hydration
-  // Only use random values after component has mounted on client
-  if (typeof window === 'undefined') {
-    return `${prefix}-ssr-${uidCounter++}`;
+  // Use deterministic counter-based IDs for SSR and initial client render
+  // After hydration, use timestamp-based IDs for uniqueness
+  if (typeof window === 'undefined' || isFirstRender) {
+    return `${prefix}-${uidCounter++}`;
   }
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 }
@@ -239,13 +241,13 @@ function statusLabel(snapshot: SimulatorSnapshot) {
 }
 
 export function CircuitStudio() {
+  const [hydrated, setHydrated] = useState(false);
   const initialProject = useMemo(() => createDefaultBlinkProject(), []);
   const [project, setProject] = useState<CircuitProject>(initialProject);
   const projectRef = useRef(project);
   const historyRef = useRef<CircuitProject[]>([deepClone(initialProject)]);
   const [historyIndex, setHistoryIndex] = useState(0);
   const [historyLength, setHistoryLength] = useState(1);
-  const [hydrated, setHydrated] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>(["led1"]);
   const [pendingPin, setPendingPin] = useState<ConnectionEndpoint | null>(null);
   const [highlightedWireId, setHighlightedWireId] = useState<string | null>(null);
@@ -385,7 +387,10 @@ export function CircuitStudio() {
     } catch {
       // A broken local draft should never prevent the studio from opening.
     }
-    queueMicrotask(() => setHydrated(true));
+    queueMicrotask(() => {
+      setHydrated(true);
+      isFirstRender = false; // Allow timestamp-based IDs after hydration
+    });
   }, []);
 
   useEffect(() => {
