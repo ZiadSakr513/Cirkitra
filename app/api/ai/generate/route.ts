@@ -246,7 +246,7 @@ VALIDATION RULES - THESE MUST BE FOLLOWED EXACTLY:
 - Component IDs must be unique, identifier-safe (letters first, then letters, digits, hyphens, or underscores only).
 - Use only supported parts from the catalog above. If a request needs an unsupported part, build the closest useful alternative and explain in warnings.
 - Add current-limiting resistors (220-330 ohms) for ALL LEDs. Use L293D motor driver for DC motors, never connect motors directly to Arduino pins.
-- GROUND RULES: Use Arduino GND, GND2, and GND3 pins once each. If more ground connections needed, add separate ground components and connect to their GND pin. Never create power-to-ground shorts.
+- GROUND RULES: ALWAYS use Arduino's GND, GND2, and GND3 pins first. ONLY add separate ground components if you need MORE than 3 ground connections. Never create power-to-ground shorts. Prefer Arduino ground pins over ground components!
 - Power all logic gates from VCC and GND pins. RGB LEDs and seven-segment displays are common-cathode (connect COM to ground).
 - Arduino CODE RULES - Your code will be compiled and executed:
   * Must include EXACTLY "void setup()" and "void loop()" - these exact function signatures
