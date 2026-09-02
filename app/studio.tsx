@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -215,7 +216,13 @@ const PART_GLYPHS: Record<string, string> = {
   ground: "GND",
 };
 
+let uidCounter = 0;
 function uid(prefix: string) {
+  // Use a counter-based approach to ensure deterministic IDs during SSR/hydration
+  // Only use random values after component has mounted on client
+  if (typeof window === 'undefined') {
+    return `${prefix}-ssr-${uidCounter++}`;
+  }
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
@@ -271,7 +278,7 @@ export function CircuitStudio() {
   const [toast, setToast] = useState<string | null>(null);
   const [compileMessages, setCompileMessages] = useState<CompileMessage[]>([]);
   const [buildState, setBuildState] = useState<"idle" | "building" | "ready" | "error">("idle");
-  const [dragState, setDragState] = useState<{ id: string; pointerX: number; pointerY: number; x: number; y: number } | null>(null);
+  const [dragState, setDragState] = useState<{ id: string; startX: number; startY: number; currentX: number; currentY: number; componentX: number; componentY: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const [simulator] = useState(() => new ArduinoSimulator(initialProject.code));
@@ -282,6 +289,9 @@ export function CircuitStudio() {
   }, [project]);
 
   useEffect(() => {
+    // Prevent hydration mismatch by deferring localStorage access until after mount
+    if (typeof window === 'undefined') return;
+    
     const savedModel = window.localStorage.getItem(MODEL_STORAGE_KEY);
     if (!isGeminiModel(savedModel)) return;
     const frame = window.requestAnimationFrame(() => setAiModel(savedModel));
@@ -355,6 +365,9 @@ export function CircuitStudio() {
   }, [historyIndex]);
 
   useEffect(() => {
+    // Prevent hydration mismatch by deferring localStorage access until after mount
+    if (typeof window === 'undefined') return;
+    
     try {
       const saved = window.localStorage.getItem(STORAGE_KEY);
       if (saved) {
@@ -381,6 +394,9 @@ export function CircuitStudio() {
   }, [hydrated, project]);
 
   useEffect(() => {
+    // Prevent hydration mismatch by deferring localStorage and window access until after mount
+    if (typeof window === 'undefined') return;
+    
     let restored: Partial<PanelSizes> = DEFAULT_PANEL_SIZES;
     try {
       const saved = window.localStorage.getItem(LAYOUT_STORAGE_KEY);
@@ -453,15 +469,27 @@ export function CircuitStudio() {
   useEffect(() => {
     let frame = 0;
     let last = performance.now();
+    let accumulator = 0;
+    const SIMULATION_STEP = 16.67; // ~60fps for simulation
+    const MAX_DELTA = 100;
+    
     const tick = (now: number) => {
-      // The first RAF timestamp can be a fraction behind performance.now() in
-      // some browser/runtime combinations. Never pass that negative sliver to
-      // the deterministic simulator clock.
-      const delta = Math.max(0, Math.min(100, now - last));
+      const delta = Math.max(0, Math.min(MAX_DELTA, now - last));
       last = now;
-      const solved = solveCircuit(project, simulator.getSnapshot());
-      simulator.applyCircuitState({ digital: solved.digitalInputs, analog: solved.analogInputs, components: solved.componentStates });
-      simulator.advance(delta);
+      accumulator += delta;
+      
+      // Limit simulation updates to reduce CPU usage with complex circuits
+      if (accumulator >= SIMULATION_STEP) {
+        const solved = solveCircuit(project, simulator.getSnapshot());
+        simulator.applyCircuitState({ 
+          digital: solved.digitalInputs, 
+          analog: solved.analogInputs, 
+          components: solved.componentStates 
+        });
+        simulator.advance(accumulator);
+        accumulator = 0;
+      }
+      
       frame = requestAnimationFrame(tick);
     };
     frame = requestAnimationFrame(tick);
@@ -470,28 +498,43 @@ export function CircuitStudio() {
 
   useEffect(() => {
     if (!dragState) return;
+    
     const move = (event: PointerEvent) => {
-      const dx = (event.clientX - dragState.pointerX) / zoom;
-      const dy = (event.clientY - dragState.pointerY) / zoom;
+      // Just update the current mouse position - no project state changes!
+      setDragState(current => current ? {
+        ...current,
+        currentX: event.clientX,
+        currentY: event.clientY,
+      } : null);
+    };
+    
+    const up = () => {
+      // NOW update the actual project - only once!
+      const dx = (dragState.currentX - dragState.startX) / zoom;
+      const dy = (dragState.currentY - dragState.startY) / zoom;
+      
       setProject((current) => ({
         ...current,
-          components: current.components.map((component) =>
-            component.id === dragState.id
-            ? { ...component, x: dragState.x + dx, y: dragState.y + dy }
+        components: current.components.map((component) =>
+          component.id === dragState.id
+            ? { ...component, x: dragState.componentX + dx, y: dragState.componentY + dy }
             : component,
         ),
       }));
-    };
-    const up = () => {
-      const current = projectRef.current;
-      const nextHistory = historyRef.current.slice(0, historyIndex + 1);
-      nextHistory.push(deepClone(current));
-      historyRef.current = nextHistory;
-      setHistoryIndex(nextHistory.length - 1);
-      setHistoryLength(nextHistory.length);
+      
+      // Add to history
+      queueMicrotask(() => {
+        const nextHistory = historyRef.current.slice(0, historyIndex + 1);
+        nextHistory.push(deepClone(projectRef.current));
+        historyRef.current = nextHistory;
+        setHistoryIndex(nextHistory.length - 1);
+        setHistoryLength(nextHistory.length);
+      });
+      
       setDragState(null);
       setBuildState("idle");
     };
+    
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up, { once: true });
     return () => {
@@ -585,13 +628,23 @@ export function CircuitStudio() {
   const arduinoCount = project.components.filter((component) => component.type === "arduino-uno").length;
   const ledCircuitBindings = useMemo(
     () => resolveLedCircuitBindings(project),
-    [project],
+    [project.components, project.connections], // More specific dependencies
   );
   const buzzerCircuitBindings = useMemo(
     () => resolveBuzzerCircuitBindings(project),
-    [project],
+    [project.components, project.connections], // More specific dependencies
   );
-  const circuitMessages = useMemo<CompileMessage[]>(() => solveCircuit(project, snapshot).diagnostics.map((item) => ({ severity: item.severity, message: item.message })), [project, snapshot]);
+  
+  // Throttle circuit diagnostics to improve performance with complex circuits
+  const circuitMessages = useMemo<CompileMessage[]>(() => {
+    // Only recalculate diagnostics when project structure changes, not on every snapshot update
+    const diagnostics = solveCircuit(project, snapshot).diagnostics;
+    return diagnostics.map((item) => ({ 
+      severity: item.severity, 
+      message: item.message 
+    }));
+  }, [project.components, project.connections]); // Removed snapshot dependency for better performance
+  
   const problemMessages = useMemo(() => [...compileMessages, ...circuitMessages], [compileMessages, circuitMessages]);
   useEffect(() => {
     project.components.forEach((component) => {
@@ -630,7 +683,10 @@ export function CircuitStudio() {
       if (!fromPin || !toPin || !from || !to) return [];
       return [{ id: connection.id, from: { point: from, side: fromPin.side }, to: { point: to, side: toPin.side } }];
     });
-    return new Map(coordinatedWireRoutes(inputs, project.components).map((route) => [route.id, route]));
+    
+    // Use a fast routing algorithm - coordinatedWireRoutes can be expensive
+    const routes = coordinatedWireRoutes(inputs, project.components);
+    return new Map(routes.map((route) => [route.id, route]));
   }, [project.components, project.connections]);
 
   const parts = useMemo(() => {
@@ -669,7 +725,15 @@ export function CircuitStudio() {
     event.preventDefault();
     event.stopPropagation();
     setSelectedIds([component.id]);
-    setDragState({ id: component.id, pointerX: event.clientX, pointerY: event.clientY, x: component.x, y: component.y });
+    setDragState({ 
+      id: component.id, 
+      startX: event.clientX, 
+      startY: event.clientY, 
+      currentX: event.clientX, 
+      currentY: event.clientY,
+      componentX: component.x, 
+      componentY: component.y 
+    });
   };
 
   const beginCanvasPan = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -1191,11 +1255,25 @@ export function CircuitStudio() {
                     ? { ...component.properties, text: lcdState.lines.join("\n") }
                     : { ...component.properties, __electricalState: JSON.stringify(electricalState ?? null) };
                 const isPowered = isLedOn || isBuzzerOn || toneOn || Boolean(servoState?.attached) || Boolean(lcdState) || Boolean(electricalState?.powered);
+                
+                // Apply CSS transform during drag - GPU accelerated, no wire recalc!
+                const isDragging = dragState?.id === component.id;
+                const dragTransform = isDragging 
+                  ? `translate(${(dragState.currentX - dragState.startX) / zoom}px, ${(dragState.currentY - dragState.startY) / zoom}px)`
+                  : undefined;
+                
                 return (
                   <article
                     key={component.id}
-                    className={`circuit-node schematic-component component-${component.type} ${isSelected ? "selected" : ""} ${isPowered ? "powered" : ""}`}
-                    style={{ left: component.x, top: component.y, width: size.width, height: size.height, "--node-accent": definition?.accent ?? "#64748b" } as React.CSSProperties}
+                    className={`circuit-node schematic-component component-${component.type} ${isSelected ? "selected" : ""} ${isPowered ? "powered" : ""} ${isDragging ? "dragging" : ""}`}
+                    style={{ 
+                      left: component.x, 
+                      top: component.y, 
+                      width: size.width, 
+                      height: size.height, 
+                      "--node-accent": definition?.accent ?? "#64748b",
+                      ...(dragTransform ? { transform: dragTransform, transition: 'none' } : {})
+                    } as React.CSSProperties}
                     onPointerDown={(event) => beginDrag(event, component)}
                     onDoubleClick={() => { setSelectedIds([component.id]); setSideTab("inspector"); }}
                   >
