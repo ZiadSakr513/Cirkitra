@@ -6,11 +6,11 @@ import { ArduinoSimulator, compileArduinoSketch, solveCircuit } from "../../../.
 
 const GEMINI_API_BASE_URL =
   "https://generativelanguage.googleapis.com/v1beta/models";
-const GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite"] as const;
+const GEMINI_MODELS = ["gemini-3.5-flash-lite"] as const;
 type GeminiModel = (typeof GEMINI_MODELS)[number];
 type GenerationMode = "create" | "edit";
 type RequestIntent = "circuit" | "chat";
-const DEFAULT_GEMINI_MODEL: GeminiModel = "gemini-3.5-flash";
+const DEFAULT_GEMINI_MODEL: GeminiModel = "gemini-3.5-flash-lite";
 const MAX_PROMPT_LENGTH = 4_000;
 const MAX_CURRENT_PROJECT_LENGTH = 50_000;
 const MAX_REQUEST_BYTES = 100_000;

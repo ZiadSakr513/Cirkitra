@@ -50,11 +50,10 @@ import { SchematicSymbol } from "./schematic-symbols";
 const STORAGE_KEY = "ai-circuit-studio.project.v1";
 const LAYOUT_STORAGE_KEY = "ai-circuit-studio.layout.v1";
 const MODEL_STORAGE_KEY = "ai-circuit-studio.ai-model.v1";
-const GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite"] as const;
+const GEMINI_MODELS = ["gemini-3.5-flash-lite"] as const;
 type GeminiModel = (typeof GEMINI_MODELS)[number];
-const DEFAULT_GEMINI_MODEL: GeminiModel = "gemini-3.5-flash";
+const DEFAULT_GEMINI_MODEL: GeminiModel = "gemini-3.5-flash-lite";
 const GEMINI_MODEL_LABELS: Record<GeminiModel, string> = {
-  "gemini-3.5-flash": "Gemini 3.5 Flash",
   "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite",
 };
 const WIRE_COLORS = ["#ffb547", "#ff6b6b", "#56d7c3", "#68a7ff", "#b38cff"];
