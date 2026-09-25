@@ -1,4 +1,6 @@
 import type { CSSProperties } from "react";
+import type { SimulatorStatus } from "../lib/simulator/types.ts";
+import { motorDisplay } from "../lib/schematic/motor-display.ts";
 
 import type { ComponentProperties } from "../lib/circuit/types.ts";
 
@@ -6,6 +8,9 @@ export interface SchematicSymbolProps {
   type: string;
   properties?: Readonly<ComponentProperties>;
   powered?: boolean;
+  simulationStatus?: SimulatorStatus;
+  playbackSpeed?: number;
+  zoom?: number;
 }
 
 type SymbolStyle = CSSProperties & Record<`--${string}`, string | number>;
@@ -254,18 +259,29 @@ function ServoSymbol({ powered, angle }: { powered: boolean; angle: number }) {
   );
 }
 
-function DcMotorSymbol({ powered, direction, speed }: { powered: boolean; direction?: string; speed?: number }) {
+function DcMotorSymbol({ powered, direction, speed, simulationStatus = "idle", playbackSpeed = 1, zoom = 1 }: {
+  powered: boolean; direction?: string; speed?: number;
+  simulationStatus?: SimulatorStatus; playbackSpeed?: number; zoom?: number;
+}) {
+  const display = motorDisplay({ powered, direction, speed, status: simulationStatus, playbackSpeed });
   return (
-    <div className={symbolClass("dc-motor", powered)} data-direction={direction} style={{ "--symbol-motor-speed": `${Math.max(0.15, 1 - (speed ?? 0) * 0.85)}s` } as SymbolStyle} aria-hidden="true">
-      <span className="symbol-motor__terminal symbol-motor__terminal--positive" />
-      <span className="symbol-motor__terminal symbol-motor__terminal--negative" />
-      <span className="symbol-motor__can">
-        <i className="symbol-motor__vent symbol-motor__vent--one" />
-        <i className="symbol-motor__vent symbol-motor__vent--two" />
-        <b className="symbol-motor__polarity">+</b>
+    <div className={symbolClass("dc-motor", display.active)} data-direction={display.direction} data-motion={display.moving ? "running" : "paused"}
+      style={{ "--symbol-motor-speed": `${display.duration}s`, "--motor-badge-scale": Math.min(2, 1 / Math.max(0.1, zoom)) } as SymbolStyle}>
+      <div aria-hidden="true">
+        <span className="symbol-motor__terminal symbol-motor__terminal--positive" />
+        <span className="symbol-motor__terminal symbol-motor__terminal--negative" />
+        <span className="symbol-motor__can">
+          <i className="symbol-motor__vent symbol-motor__vent--one" />
+          <i className="symbol-motor__vent symbol-motor__vent--two" />
+          <b className="symbol-motor__polarity">+</b>
+        </span>
+        <span className="symbol-motor__endbell" />
+        <span className="symbol-motor__shaft" />
+        <span className="symbol-motor__rotor"><i /><b /></span>
+      </div>
+      <span className="symbol-motor__status" title="Simulated drive level, not physical RPM">
+        <span aria-hidden="true">{display.active ? display.direction === "reverse" ? "↶" : "↷" : "■"}</span> {display.label}
       </span>
-      <span className="symbol-motor__endbell" />
-      <span className="symbol-motor__shaft" />
     </div>
   );
 }
@@ -381,6 +397,9 @@ export function SchematicSymbol({
   type,
   properties = {},
   powered = false,
+  simulationStatus,
+  playbackSpeed,
+  zoom,
 }: SchematicSymbolProps) {
   let electrical: { channels?: Record<string, number>; segments?: string[]; direction?: string; speed?: number; position?: boolean; level?: string } = {};
   try {
@@ -414,7 +433,7 @@ export function SchematicSymbol({
     case "servo":
       return <ServoSymbol powered={powered} angle={numericProperty(properties, "angle", 90, 0, 180)} />;
     case "dc-motor":
-      return <DcMotorSymbol powered={powered} direction={electrical.direction} speed={electrical.speed} />;
+      return <DcMotorSymbol powered={powered} direction={electrical.direction} speed={electrical.speed} simulationStatus={simulationStatus} playbackSpeed={playbackSpeed} zoom={zoom} />;
     case "l293d":
       return <L293dSymbol powered={powered} />;
     case "logic-and":

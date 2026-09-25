@@ -252,6 +252,12 @@ export function solveCircuit(
       if (closed) join("1", "2");
     }
     if (component.type === "toggle-switch") join("COM", component.properties?.position === true ? "NO" : "NC");
+    // The L293D's four ground legs share an internal ground node. One grounded
+    // leg is enough for the logical simulator; all four should still be wired
+    // on a physical circuit to carry motor current and dissipate heat.
+    if (component.type === "l293d") {
+      ["GND2", "GND3", "GND4"].forEach((pin) => join("GND1", pin));
+    }
   });
 
   const base = new Map<string, number[]>();
@@ -313,7 +319,7 @@ export function solveCircuit(
                   : !a;
         output(id, "Y", value ? 1 : 0);
       }
-      if (type === "l293d" && high(id, "VSS") && high(id, "VS") && low(id, "GND1") && low(id, "GND2") && low(id, "GND3") && low(id, "GND4")) {
+      if (type === "l293d" && high(id, "VSS") && high(id, "VS") && low(id, "GND1")) {
         [["EN1", "IN1", "OUT1"], ["EN1", "IN2", "OUT2"], ["EN2", "IN3", "OUT3"], ["EN2", "IN4", "OUT4"]].forEach(([enable, input, out]) => {
           const duty = reading(id, enable).value ?? 0;
           if (duty > 0) output(id, out, high(id, input) ? duty : 0);
@@ -363,12 +369,24 @@ export function solveCircuit(
     } else if (type === "toggle-switch") {
       componentStates[id] = { type, powered: reading(id, "COM").value !== undefined, position: component.properties?.position === true };
     } else if (type === "l293d") {
-      const isPowered = high(id, "VSS") && high(id, "VS") && ["GND1", "GND2", "GND3", "GND4"].every((pin) => low(id, pin));
+      const groundPins = ["GND1", "GND2", "GND3", "GND4"];
+      const connected = (pin: string) => project.connections.some(({ from, to }) =>
+        (from.componentId === id && from.pin === pin) || (to.componentId === id && to.pin === pin));
+      const isPowered = high(id, "VSS") && high(id, "VS") && low(id, "GND1");
       componentStates[id] = { type, powered: isPowered, channels: { OUT1: reading(id, "OUT1").value ?? 0, OUT2: reading(id, "OUT2").value ?? 0, OUT3: reading(id, "OUT3").value ?? 0, OUT4: reading(id, "OUT4").value ?? 0 } };
-      if (!isPowered) diagnostics.push({ severity: "warning", code: "component-unpowered", message: `${component.label} needs VSS, VS, and all four ground pins connected.` });
+      if (!isPowered) diagnostics.push({ severity: "warning", code: "component-unpowered", message: `${component.label} needs VSS, VS, and a ground connection.` });
+      else if (groundPins.some((pin) => !connected(pin))) {
+        diagnostics.push({ severity: "warning", code: "motor-driver-ground-wiring", message: `${component.label}: connect all four ground pins for real hardware.` });
+      }
+      for (const [enable, outputs] of [["EN1", ["OUT1", "OUT2"]], ["EN2", ["OUT3", "OUT4"]]] as const) {
+        if (!connected(enable) && outputs.some(connected)) {
+          diagnostics.push({ severity: "warning", code: "motor-driver-enable-floating", message: `${component.label} ${enable} is disconnected; connect it to 5V or a PWM output to drive this motor.` });
+        }
+      }
     } else if (type === "dc-motor") {
       const positive = reading(id, "+").value; const negative = reading(id, "-").value;
-      const delta = (positive ?? 0) - (negative ?? 0); const speed = Math.min(1, Math.abs(delta));
+      const delta = positive !== undefined && negative !== undefined ? positive - negative : 0;
+      const speed = Math.min(1, Math.abs(delta));
       componentStates[id] = { type, powered: speed > 0.01, direction: speed <= 0.01 ? (positive !== undefined && negative !== undefined ? "brake" : "coast") : delta > 0 ? "forward" : "reverse", speed };
     }
   });

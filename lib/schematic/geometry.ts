@@ -62,6 +62,7 @@ export interface CoordinatedWireRoute {
   id: string;
   segments: WireSegment[];
   bridges: WireBridge[];
+  blocked?: boolean;
 }
 
 /**
@@ -320,13 +321,126 @@ function routeScore(candidate: readonly WireSegment[], occupied: readonly WireSe
   const length = candidate.reduce((sum, segment) => sum + segmentLength(segment), 0);
   let overlaps = 0;
   let crossings = 0;
+  let crowding = 0;
   for (const segment of candidate) {
     for (const other of occupied) {
       if (collinearOverlap(segment, other)) overlaps += 1;
       else if (perpendicularIntersection(segment, other)) crossings += 1;
+      const horizontal = segment.from.y === segment.to.y;
+      if (horizontal === (other.from.y === other.to.y)) {
+        const distance = Math.abs(horizontal ? segment.from.y - other.from.y : segment.from.x - other.from.x);
+        const overlap = horizontal
+          ? rangesOverlap(segment.from.x, segment.to.x, other.from.x, other.to.x)
+          : rangesOverlap(segment.from.y, segment.to.y, other.from.y, other.to.y);
+        if (overlap && distance < 12) crowding += (12 - distance) * segmentLength(segment);
+      }
     }
   }
-  return overlaps * 1_000_000 + crossings * 4_000 + candidate.length * 32 + length;
+  return overlaps * 1_000_000 + crowding * 20 + crossings * 40 + candidate.length * 24 + length;
+}
+
+/** Visibility-grid A*: turns can be made around every obstacle, not just twice.
+ * Occupied channels carry a cost so independent signals fan out into separate lanes.
+ */
+function channelRoute(start: Point, end: Point, obstacles: readonly Bounds[], occupied: readonly WireSegment[]): WireSegment[] | undefined {
+  const xs = new Set([start.x, end.x]);
+  const ys = new Set([start.y, end.y]);
+  for (const bounds of obstacles) {
+    xs.add(bounds.left); xs.add(bounds.right);
+    ys.add(bounds.top); ys.add(bounds.bottom);
+  }
+  for (const segment of occupied) {
+    if (segment.from.y === segment.to.y) {
+      ys.add(segment.from.y - 12); ys.add(segment.from.y + 12);
+    } else {
+      xs.add(segment.from.x - 12); xs.add(segment.from.x + 12);
+    }
+  }
+  xs.add(Math.min(...xs) - 24); xs.add(Math.max(...xs) + 24);
+  ys.add(Math.min(...ys) - 24); ys.add(Math.max(...ys) + 24);
+  const x = [...xs].sort((a, b) => a - b);
+  const y = [...ys].sort((a, b) => a - b);
+  const width = x.length;
+  const startNode = y.indexOf(start.y) * width + x.indexOf(start.x);
+  const endNode = y.indexOf(end.y) * width + x.indexOf(end.x);
+  const point = (node: number): Point => ({ x: x[node % width], y: y[Math.floor(node / width)] });
+  const distance = new Map<number, number>();
+  const previous = new Map<number, number>();
+  const heap: { state: number; score: number; cost: number }[] = [];
+  const push = (entry: typeof heap[number]) => {
+    heap.push(entry);
+    let i = heap.length - 1;
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (heap[parent].score <= entry.score) break;
+      heap[i] = heap[parent]; i = parent;
+    }
+    heap[i] = entry;
+  };
+  const pop = () => {
+    const first = heap[0];
+    const last = heap.pop()!;
+    if (heap.length) {
+      let i = 0;
+      while (i * 2 + 1 < heap.length) {
+        let child = i * 2 + 1;
+        if (child + 1 < heap.length && heap[child + 1].score < heap[child].score) child++;
+        if (heap[child].score >= last.score) break;
+        heap[i] = heap[child]; i = child;
+      }
+      heap[i] = last;
+    }
+    return first;
+  };
+  for (const direction of [0, 1]) {
+    const state = startNode * 2 + direction;
+    distance.set(state, 0); push({ state, cost: 0, score: 0 });
+  }
+  const edgeCosts = new Map<string, number>();
+  while (heap.length) {
+    const current = pop();
+    if (current.cost !== distance.get(current.state)) continue;
+    const node = Math.floor(current.state / 2);
+    if (node === endNode) {
+      const points: Point[] = [];
+      let state: number | undefined = current.state;
+      while (state !== undefined) {
+        points.push(point(Math.floor(state / 2)));
+        state = previous.get(state);
+      }
+      const segments = segmentsFromPoints(points.reverse());
+      const merged: WireSegment[] = [];
+      for (const segment of segments) {
+        const last = merged.at(-1);
+        if (last && (last.from.x === last.to.x) === (segment.from.x === segment.to.x)) last.to = segment.to;
+        else merged.push(segment);
+      }
+      return merged;
+    }
+    const column = node % width;
+    const row = Math.floor(node / width);
+    const neighbors = [column > 0 ? node - 1 : -1, column + 1 < width ? node + 1 : -1,
+      row > 0 ? node - width : -1, row + 1 < y.length ? node + width : -1];
+    for (let direction = 0; direction < neighbors.length; direction++) {
+      const next = neighbors[direction];
+      if (next < 0) continue;
+      const axis = direction < 2 ? 0 : 1;
+      const key = `${Math.min(node, next)}:${Math.max(node, next)}`;
+      let cost = edgeCosts.get(key);
+      const segment = { from: point(node), to: point(next) };
+      if (cost === undefined) {
+        cost = obstacles.some((bounds) => segmentCrossesBounds(segment, bounds))
+          ? Infinity : routeScore([segment], occupied) - 24;
+        edgeCosts.set(key, cost);
+      }
+      const total = current.cost + cost + (current.state % 2 === axis ? 0 : 24);
+      const nextState = next * 2 + axis;
+      if (total >= (distance.get(nextState) ?? Infinity)) continue;
+      distance.set(nextState, total); previous.set(nextState, current.state);
+      push({ state: nextState, cost: total, score: total + Math.abs(segment.to.x - end.x) + Math.abs(segment.to.y - end.y) });
+    }
+  }
+  return undefined;
 }
 
 /** Route all wires together so later wires avoid lanes already in use. */
@@ -341,7 +455,12 @@ export function coordinatedWireRoutes(
     return { left: bounds.left - safeClearance, top: bounds.top - safeClearance, right: bounds.right + safeClearance, bottom: bounds.bottom + safeClearance };
   });
   const routes: CoordinatedWireRoute[] = [];
-  const occupied: WireSegment[] = [];
+  // Reserve every pin lead before routing, including wires processed later.
+  // Otherwise an early route can sit on top of a later wire's endpoint.
+  const occupied: WireSegment[] = wires.flatMap((wire) => [
+    { from: wire.from.point, to: escapePoint(wire.from, safeClearance) },
+    { from: wire.to.point, to: escapePoint(wire.to, safeClearance) },
+  ]);
 
   for (const wire of wires) {
     const start = escapePoint(wire.from, safeClearance);
@@ -349,11 +468,20 @@ export function coordinatedWireRoutes(
     const startLead = { from: { ...wire.from.point }, to: start };
     const endLead = { from: end, to: { ...wire.to.point } };
     const candidates = candidateMiddleRoutes(start, end, obstacles, safeClearance)
-      .sort((a, b) => routeScore(a, occupied) - routeScore(b, occupied));
-    const middle = candidates[0] ?? segmentsFromPoints([start, { x: start.x, y: end.y }, end]);
+      .map((segments) => ({ segments, score: routeScore(segments, occupied) }))
+      .sort((a, b) => a.score - b.score);
+    const best = candidates[0];
+    const searched = !best || best.score > 10_000
+      ? channelRoute(start, end, obstacles, occupied) : undefined;
+    const middle = searched ?? best?.segments ?? [];
+    // Never draw a misleading shortcut through a component if the layout is blocked.
+    if (!middle.length && (start.x !== end.x || start.y !== end.y)) {
+      routes.push({ id: wire.id, segments: [startLead, endLead], bridges: [], blocked: true });
+      continue;
+    }
     const segments = [startLead, ...middle, endLead].filter((segment) => segmentLength(segment) > 0);
     routes.push({ id: wire.id, segments, bridges: [] });
-    occupied.push(...segments);
+    occupied.push(...middle);
   }
 
   for (let routeIndex = 0; routeIndex < routes.length; routeIndex += 1) {

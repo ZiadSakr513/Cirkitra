@@ -246,6 +246,7 @@ VALIDATION RULES - THESE MUST BE FOLLOWED EXACTLY:
 - Component IDs must be unique, identifier-safe (letters first, then letters, digits, hyphens, or underscores only).
 - Use only supported parts from the catalog above. If a request needs an unsupported part, build the closest useful alternative and explain in warnings.
 - Add current-limiting resistors (220-330 ohms) for ALL LEDs. Use L293D motor driver for DC motors, never connect motors directly to Arduino pins.
+- For every used L293D motor channel, connect its EN1/EN2 pin to an Arduino PWM output or 5V. Connect VSS, VS, and ground. A disconnected enable pin leaves that motor stopped even while the sketch is running.
 - GROUND RULES: ALWAYS use Arduino's GND, GND2, and GND3 pins first. ONLY add separate ground components if you need MORE than 3 ground connections. Never create power-to-ground shorts. Prefer Arduino ground pins over ground components!
 - Power all logic gates from VCC and GND pins. RGB LEDs and seven-segment displays are common-cathode (connect COM to ground).
 - Arduino CODE RULES - Your code will be compiled and executed:
@@ -268,7 +269,7 @@ EXAMPLE CONNECTION (COPY THIS EXACT PATTERN):
 }
 
 COMMON PIN NAME ERRORS TO AVOID:
-- ❌ WRONG: "GND1", "GND4" → ✅ CORRECT: "GND", "GND2", "GND3"
+- Arduino Uno ground pins are "GND", "GND2", and "GND3". L293D ground pins are "GND1", "GND2", "GND3", and "GND4"; preserve those exact names and wire all four for real hardware.
 - ❌ WRONG: "5v", "Vcc" → ✅ CORRECT: "5V", "VCC"
 - ❌ WRONG: "anode", "cathode" → ✅ CORRECT: "A", "K"
 - ❌ WRONG: "SIG1", "OUT1" → ✅ CORRECT: "SIG", "OUT"
@@ -667,10 +668,16 @@ function validateGeneratedEnvelope(value: unknown): ValidationResult {
     const simulator = new ArduinoSimulator(code);
     simulator.run();
     simulator.advance(0);
-    solveCircuit(normalizedProject, simulator.getSnapshot()).diagnostics
-      .filter((diagnostic) => diagnostic.severity === "error")
+    const solution = solveCircuit(normalizedProject, simulator.getSnapshot());
+    solution.diagnostics
+      .filter((diagnostic) => diagnostic.severity === "error" || diagnostic.code === "motor-driver-enable-floating")
       .slice(0, 8)
       .forEach((diagnostic) => issues.push(`project.circuit ${diagnostic.code}: ${diagnostic.message}`));
+    normalizedProject.components.filter((component) => component.type === "l293d").forEach((driver) => {
+      if (!solution.componentStates[driver.id]?.powered) {
+        issues.push(`project.circuit: ${driver.label} needs VSS, VS, and a ground connection before its motors can run.`);
+      }
+    });
   }
 
   return issues.length
@@ -768,10 +775,8 @@ function autoCorrectPinNames(content: string): { corrected: string; changes: num
   let changes = 0;
   
   // Common pin name corrections - expanded list
-  const corrections: Array<[RegExp, string | ((match: string, ...args: any[]) => string)]> = [
+  const corrections: Array<[RegExp, string | ((match: string, group: string) => string)]> = [
     // Ground pins - all variations
-    [/"pin":\s*"GND1"/g, '"pin": "GND"'],
-    [/"pin":\s*"GND4"/g, '"pin": "GND2"'],
     [/"pin":\s*"GND5"/g, '"pin": "GND3"'],
     [/"pin":\s*"GROUND"/gi, '"pin": "GND"'],
     [/"pin":\s*"ground"/g, '"pin": "GND"'],
@@ -788,14 +793,11 @@ function autoCorrectPinNames(content: string): { corrected: string; changes: num
     [/"pin":\s*"cathode"/gi, '"pin": "K"'],
     [/"pin":\s*"ANODE"/g, '"pin": "A"'],
     [/"pin":\s*"CATHODE"/g, '"pin": "K"'],
-    [/"pin":\s*"\+"/g, '"pin": "A"'],
-    [/"pin":\s*"-"/g, '"pin": "K"'],
     [/"pin":\s*"POSITIVE"/gi, '"pin": "A"'],
     [/"pin":\s*"NEGATIVE"/gi, '"pin": "K"'],
     [/"pin":\s*"POS"/gi, '"pin": "A"'],
     [/"pin":\s*"NEG"/gi, '"pin": "K"'],
     // Sensor/component pins with numbers
-    [/"pin":\s*"OUT1"/g, '"pin": "OUT"'],
     [/"pin":\s*"SIG1"/g, '"pin": "SIG"'],
     [/"pin":\s*"TRIG1"/g, '"pin": "TRIG"'],
     [/"pin":\s*"ECHO1"/g, '"pin": "ECHO"'],
@@ -833,7 +835,7 @@ function autoCorrectPinNames(content: string): { corrected: string; changes: num
   for (const [pattern, replacement] of corrections) {
     const before = corrected;
     if (typeof replacement === 'function') {
-      corrected = corrected.replace(pattern, replacement as any);
+      corrected = corrected.replace(pattern, replacement);
     } else {
       corrected = corrected.replace(pattern, replacement);
     }

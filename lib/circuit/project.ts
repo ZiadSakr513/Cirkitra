@@ -73,6 +73,27 @@ export function normalizeGroundReturns(project: CircuitProject): CircuitProject 
   return { ...project, components: [...project.components, ...additions], connections };
 }
 
+/** Tie disconnected, used L293D channels high so an existing motor circuit can run. */
+export function connectFloatingMotorDriverEnables(project: CircuitProject): CircuitProject {
+  const uno = project.components.find((component) => component.type === "arduino-uno");
+  if (!uno) return project;
+  const connections = [...project.connections];
+  const usedIds = new Set(connections.map((connection) => connection.id));
+  for (const driver of project.components.filter((component) => component.type === "l293d")) {
+    for (const [enable, outputs] of [["EN1", ["OUT1", "OUT2"]], ["EN2", ["OUT3", "OUT4"]]] as const) {
+      const connected = (pin: string) => connections.some(({ from, to }) =>
+        (from.componentId === driver.id && from.pin === pin) || (to.componentId === driver.id && to.pin === pin));
+      if (connected(enable) || !outputs.some(connected)) continue;
+      let id = `enable-${driver.id}-${enable}`;
+      let suffix = 2;
+      while (usedIds.has(id)) id = `enable-${driver.id}-${enable}-${suffix++}`;
+      usedIds.add(id);
+      connections.push({ id, from: { componentId: uno.id, pin: "5V" }, to: { componentId: driver.id, pin: enable }, color: "#f59e0b" });
+    }
+  }
+  return connections.length === project.connections.length ? project : { ...project, connections };
+}
+
 /**
  * Remove a placed component and every wire attached to it.
  *

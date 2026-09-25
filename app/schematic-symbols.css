@@ -318,7 +318,19 @@
 
 /* DC motor */
 .symbol-motor__terminal{position:absolute;top:47px;width:18px;height:3px;background:#aeb8bd}.symbol-motor__terminal--positive{left:0}.symbol-motor__terminal--negative{right:0}.symbol-motor__can{position:absolute;top:16px;left:18px;width:62px;height:64px;border:3px solid #808d92;border-radius:12px 8px 8px 12px;background:linear-gradient(90deg,#737f82,#c0c9c8 50%,#5a676c);box-shadow:0 6px 10px #0007}.symbol-motor__vent{position:absolute;top:13px;width:6px;height:38px;border-radius:3px;background:#39464b}.symbol-motor__vent--one{left:18px}.symbol-motor__vent--two{left:33px}.symbol-motor__polarity{position:absolute;top:4px;left:5px;color:#ef5757}.symbol-motor__endbell{position:absolute;top:22px;right:9px;width:14px;height:52px;border-radius:0 7px 7px 0;background:#343f44}.symbol-motor__shaft{position:absolute;top:44px;right:-3px;width:20px;height:7px;background:#c2cbcc}
-.schematic-symbol--dc-motor.schematic-symbol--powered .symbol-motor__shaft{animation:motor-spin var(--symbol-motor-speed,.5s) linear infinite;transform-origin:left center}.schematic-symbol--dc-motor[data-direction="reverse"] .symbol-motor__shaft{animation-direction:reverse}@keyframes motor-spin{to{transform:rotate(360deg)}}
+/* The asymmetric rotor makes rotation visible even when zoomed out. */
+.symbol-motor__rotor { position:absolute; left:31px; top:30px; width:34px; height:34px; border:2px solid #526c76; border-radius:50%; background:#142630; box-shadow:0 0 0 3px #09141dcc; animation:motor-spin var(--symbol-motor-speed,1.2s) linear infinite; animation-play-state:paused; }
+.symbol-motor__rotor i { position:absolute; width:5px; height:13px; left:13px; top:2px; border-radius:3px; background:#8ea3ad; }
+.symbol-motor__rotor b { position:absolute; width:7px; height:7px; left:12px; top:12px; border-radius:50%; background:#dbe9ee; }
+.schematic-symbol--dc-motor.schematic-symbol--powered .symbol-motor__rotor { border-color:#43e0be; box-shadow:0 0 0 3px #09141d,0 0 12px #43e0be66; }
+.schematic-symbol--dc-motor.schematic-symbol--powered .symbol-motor__rotor i { background:#43e0be; }
+.schematic-symbol--dc-motor[data-motion="running"] .symbol-motor__rotor { animation-play-state:running; }
+.schematic-symbol--dc-motor[data-direction="reverse"] .symbol-motor__rotor { animation-direction:reverse; }
+.symbol-motor__status { position:absolute; top:84px; left:50%; transform:translateX(-50%) scale(var(--motor-badge-scale,1)); transform-origin:top center; white-space:nowrap; padding:3px 6px; border:1px solid #526876; border-radius:5px; background:#0b1925; color:#c5d3df; font:600 11px/1.3 var(--font-mono); pointer-events:none; }
+.schematic-symbol--dc-motor.schematic-symbol--powered .symbol-motor__status { color:#85f5d8; border-color:#36b79e; background:#0b2524; }
+@keyframes motor-spin { to { transform:rotate(360deg); } }
+@media (prefers-reduced-motion:reduce) { .symbol-motor__rotor { animation:none !important; } }
+
 
 /* DIP motor driver */
 .symbol-dip__body{position:absolute;top:12px;bottom:12px;left:24px;right:24px;border-radius:8px;background:#171c20;box-shadow:inset 0 0 18px #000,0 7px 12px #0008}.symbol-dip__notch{position:absolute;top:-1px;left:50%;width:30px;height:13px;border-radius:0 0 16px 16px;background:#091017;transform:translateX(-50%)}.symbol-dip__pin-one{position:absolute;top:17px;left:10px;width:7px;height:7px;border-radius:50%;background:#626d72}.symbol-dip__label{position:absolute;top:46%;left:50%;color:#a7b0b3;font:700 12px var(--font-mono);transform:translate(-50%,-50%)}.symbol-dip__sub-label{position:absolute;top:57%;left:50%;color:#57636a;font:6px var(--font-mono);transform:translateX(-50%)}.symbol-dip__legs{position:absolute;top:19px;bottom:19px;display:flex;flex-direction:column;justify-content:space-between}.symbol-dip__legs--left{left:7px}.symbol-dip__legs--right{right:7px}.symbol-dip__leg{width:26px;height:6px;background:#aeb7b9}.symbol-dip__legs--left .symbol-dip__leg{border-radius:3px 0 0 3px}.symbol-dip__legs--right .symbol-dip__leg{border-radius:0 3px 3px 0}
@@ -341,3 +353,37 @@
 @media (prefers-reduced-motion: reduce) {
   .schematic-grid { transition: none !important; }
 }
+
+/* Quiet, crisp wires; a traced connection is the only bright path. */
+.wire-segment::before { box-shadow: 0 0 0 1px #091017; border-radius: 0; }
+.wire-route.highlighted { z-index: 5; }
+.tracing-wire .wire-route:not(.highlighted) { opacity: .12; }
+.tracing-wire .schematic-component { opacity: .65; }
+.tracing-wire .schematic-component:has(.wire-highlighted) { opacity: 1; }
+.wire-route.highlighted .wire-segment::before { background: var(--wire-color); box-shadow: 0 0 0 2px #091017; }
+.wire-route.highlighted .wire-segment.horizontal::before { inset: auto 0; top: 3px; height: 3px; }
+.wire-route.highlighted .wire-segment.vertical::before { inset: 0 auto; left: 3px; width: 3px; }
+.wire-bridge { width: 10px; height: 7px; border-width: 2px; background: #091017; box-shadow: none; }
+.wire-route.highlighted .wire-bridge { border-color: var(--wire-color); box-shadow: none; }
+.wire-junction { box-shadow: none; }
+.wire-endpoint-label { position: absolute; z-index: 8; padding: 5px 8px; border: 1px solid var(--wire-color); border-radius: 5px; background: #0c1822; color: #eef7ff; font: 11px/1.4 var(--font-mono, monospace); white-space: nowrap; pointer-events: none; box-shadow: 0 3px 12px #0008; transform: translate(12px, -100%); }
+.wire-endpoint-label.side-left { transform: translate(calc(-100% - 12px), -100%); }
+.wire-endpoint-label.side-bottom { transform: translate(12px, 12px); }
+.connection-panel { position: absolute; z-index: 20; top: 12px; left: 12px; width: min(320px, calc(100% - 24px)); max-height: calc(100% - 130px); display: flex; flex-direction: column; padding: 12px; border: 1px solid #304854; border-radius: 10px; background: #0b141ef5; box-shadow: 0 12px 36px #0006; }
+.connection-panel-heading { display: flex; justify-content: space-between; align-items: center; color: #e8f5fc; }
+.connection-panel-heading small { margin-left: 6px; color: #92b4c7; }
+.connection-panel-heading button, .wire-trace-card button { border: 1px solid #304854; border-radius: 5px; padding: 5px 8px; color: #d4e8f3; background: #132430; cursor: pointer; }
+.connection-panel p { font-size: 11px; color: #9ab3c5; margin: 8px 0 12px; }
+.connection-list { overflow-y: auto; min-height: 0; }
+.connection-list > button { display: flex; align-items: center; gap: 12px; width: 100%; padding: 10px 8px; text-align: left; color: #deebf4; border: 1px solid transparent; border-bottom-color: #20303c; background: transparent; border-radius: 5px; cursor: pointer; }
+.connection-list > button:hover, .connection-list > button.active { background: #16342f; border-color: #42d7bd; }
+.connection-number { min-width: 28px; font: 11px monospace; }
+.connection-list strong, .connection-list small { display: block; font-size: 11px; line-height: 1.6; }
+.connection-list small { color: #9bb1c5; }
+.wire-trace-card { position: absolute; z-index: 21; bottom: 40px; left: 12px; right: 12px; display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid #476571; border-radius: 8px; color: #edf7ff; background: #0b1926f5; box-shadow: 0 8px 24px #0006; }
+.trace-swatch { width: 4px; height: 34px; border-radius: 3px; flex-shrink: 0; }
+.wire-trace-card > div { flex: 1; min-width: 0; }
+.wire-trace-card strong, .wire-trace-card span, .wire-trace-card small { display: block; font-size: 11px; overflow-wrap: anywhere; }
+.wire-trace-card span { color: #afc7d9; margin-top: 4px; }
+.wire-trace-card small { color: #ffd18b; margin-top: 5px; }
+.wire-trace-card button { flex-shrink: 0; font-size: 11px; }

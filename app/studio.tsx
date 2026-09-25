@@ -15,6 +15,7 @@ import Image from "next/image";
 import {
   COMPONENT_CATALOG,
   SUPPORTED_COMPONENT_TYPES,
+  connectFloatingMotorDriverEnables,
   createDefaultBlinkProject,
   createDefaultProperties,
   getComponentDefinition,
@@ -249,7 +250,16 @@ export function CircuitStudio() {
   const [historyLength, setHistoryLength] = useState(1);
   const [selectedIds, setSelectedIds] = useState<string[]>(["led1"]);
   const [pendingPin, setPendingPin] = useState<ConnectionEndpoint | null>(null);
-  const [highlightedWireId, setHighlightedWireId] = useState<string | null>(null);
+  const [hoveredWireId, setHighlightedWireId] = useState<string | null>(null);
+  const [pinnedWireId, setPinnedWireId] = useState<string | null>(null);
+  const [showConnections, setShowConnections] = useState(false);
+  const highlightedWireId = project.connections.some((wire) => wire.id === pinnedWireId)
+    ? pinnedWireId : hoveredWireId;
+  const tracedWire = project.connections.find((wire) => wire.id === highlightedWireId);
+  const endpointLabel = (endpoint: ConnectionEndpoint) => {
+    const component = project.components.find((part) => part.id === endpoint.componentId);
+    return `${component?.label ?? endpoint.componentId} · ${endpoint.pin}`;
+  };
   const [paletteCategory, setPaletteCategory] = useState<(typeof PALETTE_CATEGORIES)[number]>("all");
   const [paletteSearch, setPaletteSearch] = useState("");
   const [sideTab, setSideTab] = useState<SideTab>("assistant");
@@ -363,7 +373,7 @@ export function CircuitStudio() {
     setHistoryLength(nextHistory.length);
     setProject(normalized);
     setBuildState("idle");
-  }, [historyIndex]);
+  }, [historyIndex, setBuildState]);
 
   useEffect(() => {
     // Prevent hydration mismatch by deferring localStorage access until after mount
@@ -607,6 +617,7 @@ export function CircuitStudio() {
         event.preventDefault();
         selectAllComponents();
       }
+      if (!editing && event.key === "Escape") { setPinnedWireId(null); setHighlightedWireId(null); setShowConnections(false); }
       if (!editing && (event.key === "Delete" || event.key === "Backspace") && selectedIds.length) {
         event.preventDefault();
         removeSelectedComponents();
@@ -650,6 +661,8 @@ export function CircuitStudio() {
   }, [project.components, project.connections]); // Removed snapshot dependency for better performance
   
   const problemMessages = useMemo(() => [...compileMessages, ...circuitMessages], [compileMessages, circuitMessages]);
+  const enableRepair = useMemo(() => connectFloatingMotorDriverEnables(project), [project]);
+  const missingEnableCount = enableRepair.connections.length - project.connections.length;
   useEffect(() => {
     project.components.forEach((component) => {
       if (component.type === "pir-sensor") {
@@ -743,6 +756,9 @@ export function CircuitStudio() {
   const beginCanvasPan = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0 && event.button !== 1) return;
     const target = event.target as HTMLElement;
+    if (target.closest(".connection-panel, .wire-trace-card, .wire-segment")) return;
+    setPinnedWireId(null);
+    setHighlightedWireId(null);
     const forcedPan = spaceHeld || canvasTool === "pan" || event.button === 1;
     if (!forcedPan && target.closest(".circuit-node, .wire-segment, .minimap")) return;
     event.preventDefault();
@@ -1140,9 +1156,13 @@ export function CircuitStudio() {
         <section className="canvas-column">
           <div className="canvas-toolbar">
             <div className="tool-group">
-              <button className={`tool ${canvasTool === "select" && !spaceHeld ? "active" : ""}`} onClick={() => setCanvasTool("select")} title="Select, move, or drag a box around parts">↖ <span>Select</span></button>
-              <button className={`tool ${canvasTool === "pan" || spaceHeld || panDrag ? "active" : ""}`} onClick={() => setCanvasTool("pan")} title="Drag empty canvas to pan, or drag a component to move it. Middle-drag or hold Space to pan anywhere.">✋ <span>Pan</span></button>
-              <button className={`tool ${pendingPin ? "active amber" : ""}`} onClick={() => setPendingPin(null)} title="Wire">⌁ <span>{pendingPin ? "Cancel wire" : "Wire"}</span></button>
+              <button className={`tool ${canvasTool === "select" && !spaceHeld ? "active" : ""}`} onClick={() => setCanvasTool("select")} aria-label="Select" title="Select, move, or drag a box around parts">↖ <span>Select</span></button>
+              <button className={`tool ${canvasTool === "pan" || spaceHeld || panDrag ? "active" : ""}`} onClick={() => setCanvasTool("pan")} aria-label="Pan" title="Drag empty canvas to pan, or drag a component to move it. Middle-drag or hold Space to pan anywhere.">✋ <span>Pan</span></button>
+              <button className={`tool ${pendingPin ? "active amber" : ""}`} onClick={() => setPendingPin(null)} aria-label={pendingPin ? "Cancel wire" : "Wire"} title="Wire">⌁ <span>{pendingPin ? "Cancel wire" : "Wire"}</span></button>
+              <button className={`tool connections-tool ${showConnections ? "active" : ""}`} onClick={() => setShowConnections((value) => !value)} aria-label="Connections" title="Show connections" aria-expanded={showConnections} aria-controls="connection-list">
+                <svg width="15" height="15" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M5 5h5v10h5"/><circle cx="3" cy="5" r="2"/><circle cx="17" cy="15" r="2"/></svg>
+                <span>Connections</span>
+              </button>
             </div>
             <div className="mobile-panel-buttons" aria-label="Workspace panels">
               <button onClick={() => setMobilePanel("library")} aria-controls="components-panel" aria-expanded={mobilePanel === "library"}>Components</button>
@@ -1174,8 +1194,8 @@ export function CircuitStudio() {
             onPointerCancel={endCanvasPan}
             onWheel={handleCanvasWheel}
           >
-            <div className="schematic-grid" style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}>
-              {project.connections.map((connection) => {
+            <div className={`schematic-grid ${tracedWire ? "tracing-wire" : ""}`} style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}>
+              {project.connections.map((connection, wireIndex) => {
                 const fromComponent = project.components.find((component) => component.id === connection.from.componentId);
                 const toComponent = project.components.find((component) => component.id === connection.to.componentId);
                 const fromDefinition = fromComponent ? getComponentDefinition(fromComponent.type) : undefined;
@@ -1190,12 +1210,7 @@ export function CircuitStudio() {
                 const route = wireRoutes.get(connection.id);
                 if (!route) return null;
                 const segments = route.segments;
-                const wireTitle = `${fromComponent.label}: ${fromPin.label} → ${toComponent.label}: ${toPin.label}. Click to remove.`;
-                const removeWire = (event: React.MouseEvent) => {
-                  event.stopPropagation();
-                  commitProject({ ...project, connections: project.connections.filter((item) => item.id !== connection.id) });
-                  announce("Wire removed");
-                };
+                const wireTitle = `W${wireIndex + 1}: ${fromComponent.label} · ${fromPin.label} → ${toComponent.label} · ${toPin.label}. Click to trace.`;
                 return (
                   <div className={`wire-route ${highlightedWireId === connection.id ? "highlighted" : ""}`} key={connection.id} style={{ "--wire-color": connection.color ?? "#47b86b" } as React.CSSProperties}>
                     {segments.map((segment, index) => {
@@ -1215,7 +1230,11 @@ export function CircuitStudio() {
                           onPointerLeave={() => setHighlightedWireId((current) => current === connection.id ? null : current)}
                           onFocus={() => setHighlightedWireId(connection.id)}
                           onBlur={() => setHighlightedWireId((current) => current === connection.id ? null : current)}
-                          onClick={removeWire}
+                          aria-label={wireTitle}
+                          tabIndex={index === 0 ? 0 : -1}
+                          aria-pressed={pinnedWireId === connection.id}
+                          onPointerDown={(event) => event.stopPropagation()}
+                          onClick={(event) => { event.stopPropagation(); setPinnedWireId((current) => current === connection.id ? null : connection.id); }}
                         />
                       );
                     })}
@@ -1226,6 +1245,10 @@ export function CircuitStudio() {
                         style={{ left: bridge.point.x, top: bridge.point.y }}
                       />
                     ))}
+                    {(highlightedWireId === connection.id || route.blocked) && <>
+                      <span className={`wire-endpoint-label side-${fromPin.side}`} style={{ left: from.x, top: from.y }}>W{wireIndex + 1} · {fromComponent.label} · {fromPin.label}</span>
+                      <span className={`wire-endpoint-label side-${toPin.side}`} style={{ left: to.x, top: to.y }}>W{wireIndex + 1} · {toComponent.label} · {toPin.label}</span>
+                    </>}
                     <i className="wire-junction from" style={{ left: from.x, top: from.y }} />
                     <i className="wire-junction to" style={{ left: to.x, top: to.y }} />
                   </div>
@@ -1282,7 +1305,7 @@ export function CircuitStudio() {
                     onDoubleClick={() => { setSelectedIds([component.id]); setSideTab("inspector"); }}
                   >
                     <div className="symbol-caption"><strong>{component.label}</strong><small>{component.type === "arduino-uno" ? "ARDUINO UNO R3" : definition?.displayName}</small></div>
-                    <SchematicSymbol type={component.type} properties={symbolProperties} powered={isPowered || component.type === "arduino-uno"} />
+                    <SchematicSymbol type={component.type} properties={symbolProperties} powered={isPowered || component.type === "arduino-uno"} simulationStatus={snapshot.status} playbackSpeed={snapshot.speed} zoom={zoom} />
                     {definition?.pins.map((pin) => {
                         const localPoint = pinPosition({ ...component, x: 0, y: 0, rotation: 0 }, pin.id, definition);
                         if (!localPoint) return null;
@@ -1314,8 +1337,27 @@ export function CircuitStudio() {
               />
             )}
 
+            {showConnections && <div className="connection-panel" id="connection-list" onPointerDown={(event) => event.stopPropagation()} onWheel={(event) => event.stopPropagation()}>
+              <div className="connection-panel-heading"><strong>Connections <small>{project.connections.length}</small></strong><button onClick={() => setShowConnections(false)} aria-label="Close connections">×</button></div>
+              <p>Select a wire to isolate its path and endpoints.</p>
+              <div className="connection-list">
+                {project.connections.map((wire, index) => <button key={wire.id} className={highlightedWireId === wire.id ? "active" : ""} aria-pressed={pinnedWireId === wire.id} onClick={() => { setPinnedWireId((current) => current === wire.id ? null : wire.id); setSelectedIds([]); }}>
+                  <span className="connection-number" style={{ color: wire.color ?? "#42d7bd" }}>W{index + 1}</span>
+                  <span><strong>{endpointLabel(wire.from)}</strong><small>→ {endpointLabel(wire.to)}</small></span>
+                </button>)}
+                {!project.connections.length && <p>No wires yet. Connect two pins to add one.</p>}
+              </div>
+            </div>}
+            {tracedWire && <div className="wire-trace-card" onPointerDown={(event) => event.stopPropagation()}>
+              <span className="trace-swatch" style={{ background: tracedWire.color ?? "#42d7bd" }} />
+              <div><strong>W{project.connections.indexOf(tracedWire) + 1} · {endpointLabel(tracedWire.from)}</strong><span>→ {endpointLabel(tracedWire.to)}</span>
+                {wireRoutes.get(tracedWire.id)?.blocked && <small>Linked by matching labels. Move parts apart to make room for a full path.</small>}
+              </div>
+              <button onClick={() => { commitProject({ ...project, connections: project.connections.filter((wire) => wire.id !== tracedWire.id) }); setPinnedWireId(null); setHighlightedWireId(null); announce("Wire removed"); }}>Remove wire</button>
+              <button onClick={() => { setPinnedWireId(null); setHighlightedWireId(null); }} aria-label="Clear wire trace">×</button>
+            </div>}
             <div className="canvas-help">
-              <span className={pendingPin ? "active" : ""}>{pendingPin ? `Wiring from ${pendingPin.pin} — choose a destination pin` : "Click any pin to start a wire"}</span>
+              <span className={pendingPin ? "active" : ""}>{pendingPin ? `Wiring from ${pendingPin.pin} — choose a destination pin` : "Click a wire to trace · Connections lists every endpoint"}</span>
               <span>{selectedIds.length > 1 ? `${selectedIds.length} parts selected · Delete removes all` : "Drag empty space to select · Space or middle-drag to pan"}</span>
             </div>
             <div className="pan-readout" aria-hidden="true">X {Math.round(-pan.x / zoom)} &nbsp; Y {Math.round(-pan.y / zoom)}</div>
@@ -1465,7 +1507,7 @@ export function CircuitStudio() {
           <div className="drawer-content">
             {bottomTab === "code" && <div className="code-editor"><pre aria-hidden="true">{project.code.split("\n").map((_, index) => <span key={index}>{index + 1}</span>)}</pre><textarea spellCheck={false} aria-label="Arduino code" value={project.code} onChange={(event) => { setProject((current) => ({ ...current, code: event.target.value })); setBuildState("idle"); }} onBlur={() => commitProject(projectRef.current)} /></div>}
             {bottomTab === "serial" && <div className="serial-console"><header><span>9600 baud</span><button onClick={() => simulator.clearSerial()}>Clear output</button></header><div>{snapshot.serial.length ? snapshot.serial.map((entry) => <p key={entry.id}><time>{(entry.timestampMs / 1000).toFixed(2)}s</time><span>{entry.text}{entry.newline ? "" : "_"}</span></p>) : <div className="console-empty">Run the simulation to see Serial output here.<small>Serial.begin(9600) detected automatically</small></div>}</div></div>}
-            {bottomTab === "problems" && <div className="problems-list">{problemMessages.length ? problemMessages.map((message, index) => <button key={index} onClick={() => setBottomTab("code")}><span className={message.severity}>{message.severity === "error" ? "×" : "!"}</span><strong>{message.message}</strong><small>{message.line ? `Sketch.ino:${message.line}` : "Circuit"}</small></button>) : <div className="console-empty"><span className="success-check">✓</span>No build problems detected.<small>The supported simulation subset is ready.</small></div>}</div>}
+            {bottomTab === "problems" && <div className="problems-list">{missingEnableCount > 0 && <button className="motor-enable-repair" onClick={() => { commitProject(enableRepair); announce(`Connected ${missingEnableCount} motor driver enable ${missingEnableCount === 1 ? "pin" : "pins"} to 5V`); }}><span>↗</span><strong>Connect {missingEnableCount} disconnected motor driver {missingEnableCount === 1 ? "enable" : "enables"} to Arduino 5V</strong><small>Fix wiring</small></button>}{problemMessages.length ? problemMessages.map((message, index) => <button key={index} onClick={() => setBottomTab("code")}><span className={message.severity}>{message.severity === "error" ? "×" : "!"}</span><strong>{message.message}</strong><small>{message.line ? `Sketch.ino:${message.line}` : "Circuit"}</small></button>) : <div className="console-empty"><span className="success-check">✓</span>No build problems detected.<small>The supported simulation subset is ready.</small></div>}</div>}
           </div>
         )}
       </section>

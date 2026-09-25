@@ -415,6 +415,8 @@ select:focus-visible {
 .empty-note { padding: 24px 16px; color: var(--muted-2); font-size: 11px; line-height: 1.5; text-align: center; }
 
 .canvas-column {
+  container-type: inline-size;
+  container-name: schematic;
   display: grid;
   grid-template-rows: 43px minmax(0, 1fr);
   min-width: 0;
@@ -425,13 +427,18 @@ select:focus-visible {
 .canvas-toolbar {
   z-index: 4;
   display: grid;
-  grid-template-columns: 1fr auto 1fr;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "tools title zoom";
+  column-gap: 12px;
   align-items: center;
   padding: 0 9px;
   border-bottom: 1px solid var(--line);
   background: #0b1118;
 }
 
+.tool-group { grid-area: tools; min-width: 0; }
+.connections-tool { display: inline-flex; align-items: center; margin-left: 6px; }
+.connections-tool svg { flex-shrink: 0; }
 .tool-group,
 .zoom-controls { display: flex; align-items: center; gap: 3px; }
 .tool { height: 29px; padding: 0 8px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: #738191; font-size: 12px; }
@@ -440,11 +447,11 @@ select:focus-visible {
 .tool.active { border-color: #2d4544; background: #152b29; color: var(--teal); }
 .tool.active.amber { border-color: #654d28; background: #332713; color: var(--amber); }
 
-.canvas-title { text-align: center; }
+.canvas-title { grid-area: title; min-width: 0; text-align: center; white-space: nowrap; }
 .canvas-title strong { display: block; font-size: 11px; font-weight: 650; }
 .canvas-title span { display: block; color: #5e6b79; font: 8px var(--font-mono); }
 
-.zoom-controls { justify-self: end; }
+.zoom-controls { grid-area: zoom; justify-self: end; flex-shrink: 0; padding-left: 8px; border-left: 1px solid var(--line); }
 .zoom-controls button { width: 28px; height: 27px; border-radius: 4px; background: transparent; color: #81909e; }
 .zoom-controls button:hover { background: var(--ink-3); color: white; }
 .zoom-controls span { width: 38px; color: #72808e; font: 9px var(--font-mono); text-align: center; }
@@ -923,6 +930,9 @@ body.resizing-row * {
 .success-check { display: grid; width: 25px; height: 25px; margin: 0 auto 7px; place-items: center; border: 1px solid #38685f; border-radius: 50%; color: var(--teal); }
 .problems-list button { display: grid; grid-template-columns: 24px 1fr auto; align-items: center; gap: 8px; width: 100%; padding: 7px 14px; border-bottom: 1px solid #18222d; background: transparent; text-align: left; }
 .problems-list button:hover { background: #111922; }
+.problems-list .motor-enable-repair { background: #123b35; border-bottom-color: #2d8270; }
+.problems-list .motor-enable-repair:hover { background: #195146; }
+.problems-list .motor-enable-repair strong, .problems-list .motor-enable-repair small { color: #8ff5d4; }
 .problems-list button > span { display: grid; width: 17px; height: 17px; place-items: center; border-radius: 50%; }
 .problems-list button > span.error { background: #482129; color: #ff7c87; }.problems-list button > span.warning { background: #463516; color: #ffc45c; }
 .problems-list strong { color: #9caab5; font-size: 9px; font-weight: 450; }.problems-list small { color: #4f5d69; font-size: 8px; }
@@ -1039,8 +1049,7 @@ body.resizing-row * {
   .side-tabs .mobile-panel-close { align-self: center; justify-self: center; }
   .side-tabs .mobile-panel-close::after { display: none; }
   .mobile-panel-buttons {
-    grid-column: 1 / -1;
-    grid-row: 2;
+    grid-area: panels;
     display: flex;
     justify-content: center;
     gap: 5px;
@@ -1060,14 +1069,15 @@ body.resizing-row * {
   .canvas-title { display: none; }
   .canvas-column { grid-template-rows: 72px minmax(0, 1fr); }
   .canvas-toolbar {
-    grid-template-columns: 1fr auto;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "tools zoom" "panels panels";
     grid-template-rows: 34px 34px;
     gap: 2px 4px;
     padding: 1px 5px 3px;
   }
   .tool { padding-inline: 6px; }
   .tool span { display: none; }
-  .zoom-controls { grid-column: 2; grid-row: 1; }
+  .zoom-controls { grid-area: zoom; }
   .zoom-controls button { width: 25px; }
   .zoom-controls span { width: 32px; }
   .bottom-drawer.open { height: var(--bottom-drawer-height); }
@@ -1084,4 +1094,21 @@ body.resizing-row * {
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
+
+/* Respond to the canvas width, including when the side panels are resized. */
+@container schematic (max-width: 740px) {
+  .canvas-title { display: none; }
+  .canvas-toolbar { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "tools zoom"; column-gap: 6px; }
+}
+@container schematic (max-width: 540px) {
+  .tool-group .tool { display: inline-flex; align-items: center; justify-content: center; width: 30px; padding: 0; flex-shrink: 0; }
+  .tool-group .tool span { display: none; }
+  .connections-tool { margin-left: 4px; }
+  .zoom-controls { gap: 1px; padding-left: 5px; }
+  .zoom-controls button { width: 25px; }
+  .zoom-controls span { width: 34px; }
+}
+@media (max-width: 720px) {
+  .canvas-toolbar { grid-template-areas: "tools zoom" "panels panels"; }
 }

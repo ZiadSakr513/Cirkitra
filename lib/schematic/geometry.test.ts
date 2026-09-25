@@ -270,3 +270,53 @@ test("keeps pan centered when fitted zoom is raised to its minimum", () => {
   assert.ok(Math.abs(center.x - 500) < 1e-9);
   assert.ok(Math.abs(center.y - 300) < 1e-9);
 });
+
+
+test("27 crossed signals keep independent lanes and reserve future pin leads", () => {
+  const wires = Array.from({ length: 27 }, (_, index) => ({
+    id: `signal-${index}`,
+    from: { point: { x: 320, y: index * 12 + 12 }, side: "right" as const },
+    to: { point: { x: 920, y: ((index * 7) % 27) * 12 + 12 }, side: "left" as const },
+  }));
+  const components = [{ type: "arduino-uno", x: 0, y: 0 }, { type: "arduino-uno", x: 920, y: 0 }];
+  const routes = coordinatedWireRoutes(wires, components);
+  assert.deepEqual(routes, coordinatedWireRoutes(wires, components));
+  for (const [index, route] of routes.entries()) {
+    assert.equal(route.blocked, undefined);
+    assert.deepEqual(route.segments[0].from, wires[index].from.point);
+    assert.deepEqual(route.segments.at(-1)!.to, wires[index].to.point);
+    for (let segmentIndex = 1; segmentIndex < route.segments.length; segmentIndex++) {
+      assert.deepEqual(route.segments[segmentIndex - 1].to, route.segments[segmentIndex].from);
+    }
+    for (const segment of route.segments) {
+      assert.ok(segment.from.x === segment.to.x || segment.from.y === segment.to.y);
+      for (const other of routes.slice(0, index).flatMap((item) => item.segments)) {
+        const horizontal = segment.from.y === segment.to.y;
+        if (horizontal !== (other.from.y === other.to.y)) continue;
+        const sameLane = horizontal ? segment.from.y === other.from.y : segment.from.x === other.from.x;
+        if (!sameLane) continue;
+        const [a, b, c, d] = horizontal
+          ? [segment.from.x, segment.to.x, other.from.x, other.to.x]
+          : [segment.from.y, segment.to.y, other.from.y, other.to.y];
+        assert.ok(Math.max(Math.min(a, b), Math.min(c, d)) >= Math.min(Math.max(a, b), Math.max(c, d)), "independent signals must not overlap");
+      }
+      for (const component of components) {
+        const horizontal = segment.from.y === segment.to.y;
+        const crosses = horizontal
+          ? segment.from.y > 0 && segment.from.y < 350 && Math.max(segment.from.x, segment.to.x) > component.x && Math.min(segment.from.x, segment.to.x) < component.x + 320
+          : segment.from.x > component.x && segment.from.x < component.x + 320 && Math.max(segment.from.y, segment.to.y) > 0 && Math.min(segment.from.y, segment.to.y) < 350;
+        assert.equal(crosses, false, "no route may cross a component body");
+      }
+    }
+  }
+});
+
+test("blocked layouts report a labelled connection instead of a false path through a body", () => {
+  const [route] = coordinatedWireRoutes([{
+    id: "blocked",
+    from: { point: { x: 30, y: 40 }, side: "right" },
+    to: { point: { x: 400, y: 40 }, side: "left" },
+  }], [{ type: "arduino-uno", x: 0, y: 0 }]);
+  assert.equal(route.blocked, true);
+  assert.equal(route.segments.length, 2);
+});
