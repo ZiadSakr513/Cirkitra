@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+test("void returns exit setup and the current loop iteration, including nested blocks", () => {
+  const sim = new ArduinoSimulator(`int count = 0;
+void setup(){ Serial.begin(9600); for(int i=0;i<3;i++){ Serial.println("setup"); return; } Serial.println("unreachable"); }
+void loop(){ delay(10); count += 1; if(count == 1){ Serial.println("first"); return; } Serial.println("next"); delay(10); }`);
+  assert.equal(sim.getSnapshot().diagnostics.some(d => d.severity === "error" || d.code === "UNSUPPORTED_STATEMENT"), false);
+  sim.run(); sim.advance(25);
+  assert.deepEqual(sim.getSnapshot().serial.map(entry => entry.text), ["setup", "first", "next"]);
+});
+
 import { createDefaultBlinkProject, type CircuitProject } from "../circuit/index.ts";
 import {
   ArduinoSimulator,

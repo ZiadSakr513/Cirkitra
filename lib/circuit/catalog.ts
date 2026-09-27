@@ -1,7 +1,10 @@
+import { publicationIssues } from "./publication.ts";
 import type {
   ComponentProperties,
   ComponentPropertyValue,
 } from "./types.ts";
+import { POWER_COMPONENTS } from "./power-parts.ts";
+import { EXPANDED_COMPONENTS } from "./parts.ts";
 
 export type ComponentCategory =
   | "boards"
@@ -12,7 +15,7 @@ export type ComponentCategory =
   | "motors"
   | "logic"
   | "sensors"
-  | "drivers";
+  | "drivers" | "wireless" | "multiplexers" | "power";
 
 export type PinDirection =
   | "input"
@@ -40,6 +43,25 @@ export interface ComponentPinDefinition {
   signals: readonly PinSignal[];
   side: PinSide;
   order: number;
+  number?: string;
+  noConnect?: boolean;
+}
+
+export type SimulationCapability = "unavailable" | "partial" | "simulated";
+export interface ComponentMetadata {
+  manufacturer: string;
+  variant: string;
+  kind: "chip" | "module" | "sensor";
+  aliases: readonly string[];
+  interfaces: readonly string[];
+  supplies: readonly { pins: readonly string[]; minVolts: number; maxVolts: number }[];
+  currentRatings?: readonly { label: string; maxAmps: number; conditions: string }[];
+  groundPins: readonly string[];
+  documentation: readonly { title: string; url: string; section: string }[];
+  libraries: readonly { name: string; url: string; headers: readonly string[]; note: string }[];
+  libraryNote?: string;
+  notes: readonly string[];
+  verifiedOn: string;
 }
 
 export interface ComponentPropertyDefinition {
@@ -64,6 +86,9 @@ export interface ComponentDefinition {
   pins: readonly ComponentPinDefinition[];
   properties: Readonly<Record<string, ComponentPropertyDefinition>>;
   defaultProperties: Readonly<ComponentProperties>;
+  metadata?: ComponentMetadata;
+  symbol?: "ic" | "module";
+  simulation?: { capability: SimulationCapability; model?: string; behavior: string; limitations: string };
 }
 
 const digitalPins: ComponentPinDefinition[] = Array.from(
@@ -173,7 +198,7 @@ function binaryGate(
  * The complete v1 component contract. Pin IDs are stable API values; UI labels
  * may change, but saved projects and AI output must use the IDs exactly.
  */
-export const COMPONENT_CATALOG = {
+const LEGACY_COMPONENTS = {
   ground: {
     id: "ground",
     displayName: "Ground",
@@ -989,6 +1014,56 @@ export const COMPONENT_CATALOG = {
   },
 } satisfies Record<string, ComponentDefinition>;
 
+const LEGACY_SYMBOL_SIZES: Readonly<Record<string, { width: number; height: number }>> = {
+  ground: { width: 56, height: 58 },
+  "arduino-uno": { width: 320, height: 350 },
+  led: { width: 72, height: 104 },
+  "rgb-led": { width: 88, height: 112 },
+  resistor: { width: 140, height: 48 },
+  "push-button": { width: 96, height: 72 },
+  "toggle-switch": { width: 112, height: 80 },
+  potentiometer: { width: 104, height: 112 },
+  "seven-segment": { width: 116, height: 164 },
+  "lcd-16x2": { width: 240, height: 132 },
+  buzzer: { width: 92, height: 92 },
+  servo: { width: 140, height: 112 },
+  "dc-motor": { width: 96, height: 96 },
+  l293d: { width: 160, height: 232 },
+  "logic-and": { width: 112, height: 80 },
+  "logic-or": { width: 112, height: 80 },
+  "logic-xor": { width: 112, height: 80 },
+  "logic-nand": { width: 120, height: 80 },
+  "logic-nor": { width: 120, height: 80 },
+  "logic-not": { width: 104, height: 72 },
+  "hc-sr04": { width: 176, height: 96 },
+  "temperature-sensor": { width: 112, height: 104 },
+  "pir-sensor": { width: 112, height: 112 },
+};
+
+export const INTERNAL_COMPONENT_CATALOG: Readonly<Record<string, ComponentDefinition>> = Object.freeze({
+  ...Object.fromEntries(Object.entries(LEGACY_COMPONENTS).map(([id, definition]) => [id, { ...definition, ...LEGACY_SYMBOL_SIZES[id] }])),
+  ...EXPANDED_COMPONENTS,
+  ...POWER_COMPONENTS,
+});
+
+/** Only accepted implementations are offered in the palette and AI catalog. */
+export const COMPONENT_CATALOG: Readonly<Record<string, ComponentDefinition>> = Object.freeze(Object.fromEntries(
+  Object.entries(INTERNAL_COMPONENT_CATALOG).filter(([id, definition]) => definition.simulated && (Object.hasOwn(LEGACY_COMPONENTS, id) || publicationIssues(definition).length === 0)),
+));
+
+export function simulationCapability(definition: ComponentDefinition): SimulationCapability {
+  return definition.simulation?.capability ?? (definition.simulated ? "simulated" : "unavailable");
+}
+export const CAPABILITY_LABELS: Record<SimulationCapability, string> = { "unavailable": "Unavailable model", partial: "Partial simulation", simulated: "Simulated" };
+
+export function componentMatchesSearch(definition: ComponentDefinition, search: string): boolean {
+  const metadata = definition.metadata;
+  const text = [definition.id, definition.displayName, definition.description, definition.category,
+    metadata?.manufacturer, metadata?.variant, ...(metadata?.aliases ?? []), ...(metadata?.interfaces ?? []),
+    ...(metadata?.libraries.map(library => `${library.name} ${library.headers.join(" ")}`) ?? [])].join(" ").toLowerCase();
+  return search.toLowerCase().trim().split(/\s+/).every(token => text.includes(token));
+}
+
 export type SupportedComponentType = keyof typeof COMPONENT_CATALOG;
 
 export const SUPPORTED_COMPONENT_TYPES = Object.freeze(
@@ -1005,6 +1080,7 @@ export const COMPONENT_CATEGORIES = Object.freeze([
   "logic",
   "sensors",
   "drivers",
+  "wireless", "multiplexers", "power",
 ] satisfies ComponentCategory[]);
 
 export function isSupportedComponentType(
@@ -1016,7 +1092,7 @@ export function isSupportedComponentType(
 export function getComponentDefinition(
   type: string,
 ): ComponentDefinition | undefined {
-  return isSupportedComponentType(type) ? COMPONENT_CATALOG[type] : undefined;
+  return INTERNAL_COMPONENT_CATALOG[type];
 }
 
 export function getPinDefinition(

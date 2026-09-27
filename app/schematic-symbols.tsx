@@ -1,8 +1,10 @@
 import type { CSSProperties } from "react";
-import type { SimulatorStatus } from "../lib/simulator/types.ts";
+import type { SimulatedComponentState, SimulatorStatus } from "../lib/simulator/types.ts";
 import { motorDisplay } from "../lib/schematic/motor-display.ts";
 
 import type { ComponentProperties } from "../lib/circuit/types.ts";
+import { getComponentDefinition, simulationCapability } from "../lib/circuit/catalog.ts";
+import { pinPosition } from "../lib/schematic/geometry.ts";
 
 export interface SchematicSymbolProps {
   type: string;
@@ -368,7 +370,21 @@ function TemperatureSymbol({ powered, temperature }: { powered: boolean; tempera
   );
 }
 
-function GenericSymbol({ type, powered }: { type: string; powered: boolean }) {
+function GenericSymbol({ type, powered, state, zoom = 1, status }: { type: string; powered: boolean; state?: SimulatedComponentState; zoom?: number; status?: SimulatorStatus }) {
+  const definition = getComponentDefinition(type);
+  if (definition?.symbol) return (
+    <div className={`symbol-registry symbol-registry--${definition.symbol} ${powered && simulationCapability(definition) !== "unavailable" ? "is-powered" : ""}`} aria-hidden="true">
+      <div className="symbol-registry__body"><b>{definition.displayName}</b><small>{definition.metadata?.manufacturer}</small></div>
+      {definition.pins.map(pin => {
+        const point = pinPosition({ type, x: 0, y: 0 }, pin.id, definition);
+        return point && <span key={pin.id} className={`symbol-registry__pin side-${pin.side} ${pin.noConnect ? "is-nc" : ""}`} style={{ top: point.y }}><em>{pin.number}</em> {pin.label}</span>;
+      })}
+      {state?.status && simulationCapability(definition) !== "unavailable" && status !== "idle" && !state.fault && state.status !== "Wiring fault" && <span className="symbol-registry__state" style={{ transform: `translateX(-50%) scale(${1 / Math.max(0.4, Math.min(1, zoom))})` }}>
+        <strong>{state.status}{status === "paused" ? " · Paused" : ""}</strong>
+        {state.powered && <small>{Object.entries(state.readings ?? {}).filter(([, value]) => Number.isFinite(value)).slice(0, 2).map(([key, value]) => `${key}: ${Number(value.toFixed(2))}`).join(" · ")}</small>}
+      </span>}
+    </div>
+  );
   const label = type.replace(/[-_]+/g, " ").trim().toUpperCase().slice(0, 14) || "PART";
   return (
     <div className={symbolClass("generic", powered)} data-component-type={type} aria-hidden="true">
@@ -401,12 +417,13 @@ export function SchematicSymbol({
   playbackSpeed,
   zoom,
 }: SchematicSymbolProps) {
-  let electrical: { channels?: Record<string, number>; segments?: string[]; direction?: string; speed?: number; position?: boolean; level?: string } = {};
+  let electrical: Partial<SimulatedComponentState> = {};
   try {
     electrical = JSON.parse(typeof properties.__electricalState === "string" ? properties.__electricalState : "null") ?? {};
   } catch {
     electrical = {};
   }
+  if (getComponentDefinition(type)?.symbol) return <GenericSymbol type={type} powered={powered} state={electrical as SimulatedComponentState} zoom={zoom} status={simulationStatus} />;
   switch (type) {
     case "ground":
       return <GroundSymbol />;

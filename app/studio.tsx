@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -14,6 +13,8 @@ import {
 import Image from "next/image";
 import {
   COMPONENT_CATALOG,
+  COMPONENT_CATEGORIES,
+  componentMatchesSearch,
   SUPPORTED_COMPONENT_TYPES,
   connectFloatingMotorDriverEnables,
   createDefaultBlinkProject,
@@ -46,6 +47,7 @@ import {
   fitViewport,
   pinPosition,
 } from "../lib/schematic";
+import { DeviceFeedback } from "./device-feedback";
 import { SchematicSymbol } from "./schematic-symbols";
 
 const STORAGE_KEY = "ai-circuit-studio.project.v1";
@@ -58,7 +60,7 @@ const GEMINI_MODEL_LABELS: Record<GeminiModel, string> = {
   "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite",
 };
 const WIRE_COLORS = ["#ffb547", "#ff6b6b", "#56d7c3", "#68a7ff", "#b38cff"];
-const PALETTE_CATEGORIES = ["all", "boards", "passives", "inputs", "outputs", "displays", "sensors", "logic"] as const;
+const PALETTE_CATEGORIES = ["all", ...COMPONENT_CATEGORIES] as const;
 
 type SideTab = "assistant" | "inspector";
 type BottomTab = "code" | "serial" | "problems";
@@ -181,6 +183,7 @@ function resizePanel(
 
 const CATEGORY_LABELS: Record<string, string> = {
   all: "All",
+  motors: "Motors", drivers: "Drivers", wireless: "Wireless", multiplexers: "Mux / Expansion", power: "Power",
   boards: "Boards",
   passives: "Passives",
   inputs: "Input",
@@ -237,7 +240,7 @@ function statusLabel(snapshot: SimulatorSnapshot) {
   if (snapshot.status === "paused") return "Simulation paused";
   if (snapshot.status === "error") return "Code needs attention";
   if (snapshot.status === "completed") return "Simulation complete";
-  return "Ready to simulate";
+  return "Stopped";
 }
 
 export function CircuitStudio() {
@@ -487,6 +490,7 @@ export function CircuitStudio() {
     const SIMULATION_STEP = 16.67; // ~60fps for simulation
     const MAX_DELTA = 100;
     
+    simulator.attachProject(project);
     const tick = (now: number) => {
       const delta = Math.max(0, Math.min(MAX_DELTA, now - last));
       last = now;
@@ -643,22 +647,20 @@ export function CircuitStudio() {
   const arduinoCount = project.components.filter((component) => component.type === "arduino-uno").length;
   const ledCircuitBindings = useMemo(
     () => resolveLedCircuitBindings(project),
-    [project.components, project.connections], // More specific dependencies
+    [project],
   );
   const buzzerCircuitBindings = useMemo(
     () => resolveBuzzerCircuitBindings(project),
-    [project.components, project.connections], // More specific dependencies
+    [project],
   );
   
-  // Throttle circuit diagnostics to improve performance with complex circuits
   const circuitMessages = useMemo<CompileMessage[]>(() => {
-    // Only recalculate diagnostics when project structure changes, not on every snapshot update
     const diagnostics = solveCircuit(project, snapshot).diagnostics;
     return diagnostics.map((item) => ({ 
       severity: item.severity, 
       message: item.message 
     }));
-  }, [project.components, project.connections]); // Removed snapshot dependency for better performance
+  }, [project, snapshot]);
   
   const problemMessages = useMemo(() => [...compileMessages, ...circuitMessages], [compileMessages, circuitMessages]);
   const enableRepair = useMemo(() => connectFloatingMotorDriverEnables(project), [project]);
@@ -711,7 +713,7 @@ export function CircuitStudio() {
     return SUPPORTED_COMPONENT_TYPES
       .map((type) => COMPONENT_CATALOG[type])
       .filter((definition) => paletteCategory === "all" || definition.category === paletteCategory)
-      .filter((definition) => !search || `${definition.displayName} ${definition.description}`.toLowerCase().includes(search));
+      .filter((definition) => !search || componentMatchesSearch(definition, search));
   }, [paletteCategory, paletteSearch]);
 
   const addPart = (type: string) => {
@@ -972,6 +974,7 @@ export function CircuitStudio() {
       });
       const result = await response.json() as {
         kind?: "chat";
+
         reply?: string;
         project?: unknown;
         explanation?: string;
@@ -1015,7 +1018,7 @@ export function CircuitStudio() {
         ...parsed.data,
         components: centerComponentsAtOrigin(parsed.data.components),
       };
-      const metaParts = [GEMINI_MODEL_LABELS[responseModel], "schema validated"];
+      const metaParts = [GEMINI_MODEL_LABELS[responseModel], "simulation validated"];
       if (result.warnings?.length) metaParts.push(...result.warnings);
       const meta = metaParts.join(" · ");
       commitProject(nextProject);
@@ -1120,7 +1123,7 @@ export function CircuitStudio() {
             <input value={paletteSearch} onChange={(event) => setPaletteSearch(event.target.value)} placeholder="Search parts" aria-label="Search components" />
             <kbd>/</kbd>
           </label>
-          <div className="category-list" aria-label="Component categories">
+            <div className="category-list" role="group" aria-label="Component categories; scroll horizontally for more" tabIndex={0}>
             {PALETTE_CATEGORIES.map((category) => (
               <button key={category} className={paletteCategory === category ? "active" : ""} onClick={() => setPaletteCategory(category)}>{CATEGORY_LABELS[category]}</button>
             ))}
@@ -1129,7 +1132,7 @@ export function CircuitStudio() {
             {parts.map((part) => (
               <button className="part-card" key={part.id} onClick={() => { addPart(part.id); setMobilePanel(null); }} title={`Add ${part.displayName}`}>
                 <span className="part-glyph" style={{ "--part-accent": part.accent } as React.CSSProperties}>{PART_GLYPHS[part.id] ?? "IC"}</span>
-                <span><strong>{part.displayName}</strong><small>{part.category}</small></span>
+                <span><strong>{part.displayName}</strong><small>{CATEGORY_LABELS[part.category]}</small></span>
                 <i>+</i>
               </button>
             ))}
@@ -1219,7 +1222,6 @@ export function CircuitStudio() {
                         <button
                           key={index}
                           className={`wire-segment ${horizontal ? "horizontal" : "vertical"}`}
-                          title={wireTitle}
                           style={{
                             left: Math.min(segment.from.x, segment.to.x),
                             top: Math.min(segment.from.y, segment.to.y),
@@ -1245,10 +1247,6 @@ export function CircuitStudio() {
                         style={{ left: bridge.point.x, top: bridge.point.y }}
                       />
                     ))}
-                    {(highlightedWireId === connection.id || route.blocked) && <>
-                      <span className={`wire-endpoint-label side-${fromPin.side}`} style={{ left: from.x, top: from.y }}>W{wireIndex + 1} · {fromComponent.label} · {fromPin.label}</span>
-                      <span className={`wire-endpoint-label side-${toPin.side}`} style={{ left: to.x, top: to.y }}>W{wireIndex + 1} · {toComponent.label} · {toPin.label}</span>
-                    </>}
                     <i className="wire-junction from" style={{ left: from.x, top: from.y }} />
                     <i className="wire-junction to" style={{ left: to.x, top: to.y }} />
                   </div>
@@ -1281,7 +1279,7 @@ export function CircuitStudio() {
                   : component.type === "lcd-16x2" && lcdState
                     ? { ...component.properties, text: lcdState.lines.join("\n") }
                     : { ...component.properties, __electricalState: JSON.stringify(electricalState ?? null) };
-                const isPowered = isLedOn || isBuzzerOn || toneOn || Boolean(servoState?.attached) || Boolean(lcdState) || Boolean(electricalState?.powered);
+                const isPowered = (electricalState?.powered ?? (isLedOn || isBuzzerOn)) || toneOn || Boolean(servoState?.attached) || Boolean(lcdState) || Boolean(electricalState?.powered);
                 
                 // Apply CSS transform during drag - GPU accelerated, no wire recalc!
                 const isDragging = dragState?.id === component.id;
@@ -1316,7 +1314,7 @@ export function CircuitStudio() {
                         );
                         const highlightedWire = connectedWires.find((connection) => connection.id === highlightedWireId);
                         const displayWire = highlightedWire ?? connectedWires[0];
-                        return <button key={pin.id} className={`schematic-pin side-${pin.side} ${active ? "active" : ""} ${displayWire ? "connected" : ""} ${highlightedWire ? "wire-highlighted" : ""}`} style={{ left: localPoint.x, top: localPoint.y, "--pin-wire-color": displayWire?.color ?? "#47b86b" } as React.CSSProperties} title={`${pin.label}${displayWire ? " · connected" : ""} · click to wire`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); connectPin({ componentId: component.id, pin: pin.id }); }}><i /><span>{pin.label}</span></button>;
+                        return <button key={pin.id} className={`schematic-pin side-${pin.side} ${active ? "active" : ""} ${displayWire ? "connected" : ""} ${highlightedWire ? "wire-highlighted" : ""}`} style={{ left: localPoint.x, top: localPoint.y, "--pin-wire-color": displayWire?.color ?? "#47b86b" } as React.CSSProperties} aria-label={pin.number ? `${pin.label}, pin ${pin.number}` : pin.label} title={`${pin.number ? `Pin ${pin.number} · ` : ""}${pin.label}${displayWire ? " · connected" : ""} · click to wire`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); connectPin({ componentId: component.id, pin: pin.id }); }}><i />{!definition.symbol && <span>{pin.label}</span>}</button>;
                       })}
                   </article>
                 );
@@ -1453,11 +1451,26 @@ export function CircuitStudio() {
                   <label className="field-label">Reference label<input value={selected.label} onChange={(event) => setProject((current) => ({ ...current, components: current.components.map((component) => component.id === selected.id ? { ...component, label: event.target.value } : component) }))} onBlur={() => commitProject(projectRef.current)} /></label>
                   <div className="coordinate-row"><label>X<input type="number" value={Math.round(selected.x)} onChange={(event) => updateSelected({ x: Number(event.target.value) })} /></label><label>Y<input type="number" value={Math.round(selected.y)} onChange={(event) => updateSelected({ y: Number(event.target.value) })} /></label></div>
                   {Object.entries(selectedDefinition.properties).map(([key, property]) => (
-                    <label className="field-label" key={key}>{property.label}
-                      {property.kind === "boolean" ? <input type="checkbox" checked={Boolean(selected.properties?.[key] ?? property.defaultValue)} onChange={(event) => updateSelected({ properties: { ...selected.properties, [key]: event.target.checked } })} /> : <input type={property.kind === "number" ? "number" : property.kind === "color" ? "color" : "text"} value={String(selected.properties?.[key] ?? property.defaultValue)} onChange={(event) => updateSelected({ properties: { ...selected.properties, [key]: property.kind === "number" ? Number(event.target.value) : event.target.value } })} />}
+                    <label className="field-label" key={key}>{property.label}{property.unit ? ` (${property.unit})` : ""}
+                      {property.kind === "boolean" ? <input type="checkbox" checked={Boolean(selected.properties?.[key] ?? property.defaultValue)} onChange={(event) => updateSelected({ properties: { ...selected.properties, [key]: event.target.checked } })} /> : <input type={property.kind === "number" ? "number" : property.kind === "color" ? "color" : "text"} min={property.min} max={property.max} step={property.kind === "number" ? "any" : undefined} value={String(selected.properties?.[key] ?? property.defaultValue)} onChange={(event) => updateSelected({ properties: { ...selected.properties, [key]: property.kind === "number" ? Number(event.target.value) : event.target.value } })} />}
                     </label>
                   ))}
-                  <div className="pin-table"><header><span>Pin</span><span>Signals</span></header>{selectedDefinition.pins.slice(0, 14).map((pin) => <button key={pin.id} onClick={() => connectPin({ componentId: selected.id, pin: pin.id })}><strong>{pin.id}</strong><span>{pin.signals.join(" · ")}</span></button>)}</div>
+                  {COMPONENT_CATALOG[selected.type] && <DeviceFeedback key={selected.id} component={selected} state={snapshot.componentStates[selected.id]} status={snapshot.status} inject={(id, payload) => simulator.injectPacket(id, payload)} />}
+                  <section className="component-capabilities">
+                    <p>{selectedDefinition.simulation?.behavior ?? "Supported by the normalized browser simulator."}</p>
+                    <p>{selectedDefinition.simulation?.limitations ?? "Electrical levels are normalized; this is not an analog circuit analysis."}</p>
+                    {selectedDefinition.metadata && <>
+                      <h4>{selectedDefinition.metadata.manufacturer}</h4><p>{selectedDefinition.metadata.variant}</p>
+                      <p>{selectedDefinition.metadata.interfaces.join(" · ")}</p>
+                      {selectedDefinition.metadata.supplies.map((supply, index) => <p key={index}>{supply.pins.join(", ")}: {supply.minVolts}–{supply.maxVolts} V</p>)}
+                      {selectedDefinition.metadata.currentRatings?.map(rating => <p key={rating.label}>{rating.label}: {rating.maxAmps} A. {rating.conditions}</p>)}
+                      {selectedDefinition.metadata.notes.map(note => <p key={note}>{note}</p>)}
+                      {selectedDefinition.metadata.documentation.map(doc => <a key={doc.url} href={doc.url} target="_blank" rel="noreferrer">Datasheet · {doc.section}</a>)}
+                      <h4>Hardware library references</h4>
+                      {selectedDefinition.metadata.libraries.length ? selectedDefinition.metadata.libraries.map(library => <p key={library.url}><a href={library.url} target="_blank" rel="noreferrer">{library.name}</a><small>{library.note}</small></p>) : <p>{selectedDefinition.metadata.libraryNote}</p>}
+                    </>}
+                  </section>
+                  <div className="pin-table"><header><span>Pin</span><span>Signals</span></header>{selectedDefinition.pins.map((pin) => <button key={pin.id} onClick={() => connectPin({ componentId: selected.id, pin: pin.id })}><strong>{pin.number ? `${pin.number} · ` : ""}{pin.id}</strong><span>{pin.noConnect ? "Do not connect" : pin.signals.join(" · ")}</span></button>)}</div>
                   <button className="danger-button" onClick={() => removeComponent(selected.id)}>Remove component</button>
                 </>
               ) : <div className="inspector-empty"><span>↖</span><h3>Select a component</h3><p>Click a part on the schematic to edit its label, values, pins, and placement.</p></div>}

@@ -33,6 +33,10 @@ interface InstructionSource {
 }
 
 export type SketchInstruction =
+  | (InstructionSource & { kind: "bufferDeclare"; name: string; size: string; values: string[] })
+  | (InstructionSource & { kind: "bufferWrite"; name: string; index: string; expression: string })
+  | (InstructionSource & { kind: "deviceCall"; instance: string; method: string; args: string[] })
+  | (InstructionSource & { kind: "serialExpression"; expression: string; newline: boolean })
   | (InstructionSource & {
       kind: "pinMode";
       pin: number;
@@ -162,6 +166,10 @@ export interface SimulatedComponentState {
   direction?: "forward" | "reverse" | "stopped" | "brake" | "coast";
   speed?: number;
   position?: boolean;
+  readings?: Readonly<Record<string, number>>;
+  status?: string;
+  fault?: string;
+  packets?: readonly { timeMs: number; direction: "tx" | "rx"; payload: string; status: string }[];
 }
 
 export interface SimulatorSnapshot {
@@ -179,6 +187,8 @@ export interface SimulatorSnapshot {
   tones: ReadonlyArray<ToneState>;
   componentStates: Readonly<Record<string, SimulatedComponentState>>;
   diagnostics: ReadonlyArray<SimulatorDiagnostic>;
+  deviceDrives?: readonly { componentId: string; pin: string; value: number; weak?: boolean }[];
+  deviceBridges?: readonly { componentId: string; from: string; to: string }[];
 }
 
 export interface ArduinoSimulatorOptions {

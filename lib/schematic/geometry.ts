@@ -1,3 +1,5 @@
+import { getComponentDefinition } from "../circuit/catalog.ts";
+
 /** A point in schematic world or viewport coordinates. */
 export interface Point {
   x: number;
@@ -88,35 +90,11 @@ const DEFAULT_COMPONENT_SIZE: Readonly<ComponentSize> = {
  * These are deliberately roomier than the previous card UI so dense pin
  * groups (especially the Uno headers and DIP packages) remain selectable.
  */
-const COMPONENT_SIZES: Readonly<Record<string, Readonly<ComponentSize>>> = {
-  ground: { width: 56, height: 58 },
-  "arduino-uno": { width: 320, height: 350 },
-  led: { width: 72, height: 104 },
-  "rgb-led": { width: 88, height: 112 },
-  resistor: { width: 140, height: 48 },
-  "push-button": { width: 96, height: 72 },
-  "toggle-switch": { width: 112, height: 80 },
-  potentiometer: { width: 104, height: 112 },
-  "seven-segment": { width: 116, height: 164 },
-  "lcd-16x2": { width: 240, height: 132 },
-  buzzer: { width: 92, height: 92 },
-  servo: { width: 140, height: 112 },
-  "dc-motor": { width: 96, height: 96 },
-  l293d: { width: 160, height: 232 },
-  "logic-and": { width: 112, height: 80 },
-  "logic-or": { width: 112, height: 80 },
-  "logic-xor": { width: 112, height: 80 },
-  "logic-nand": { width: 120, height: 80 },
-  "logic-nor": { width: 120, height: 80 },
-  "logic-not": { width: 104, height: 72 },
-  "hc-sr04": { width: 176, height: 96 },
-  "temperature-sensor": { width: 112, height: 104 },
-  "pir-sensor": { width: 112, height: 112 },
-};
+
 
 /** Return the canonical visual footprint for a catalog component type. */
 export function componentSize(type: string): ComponentSize {
-  const size = COMPONENT_SIZES[type] ?? DEFAULT_COMPONENT_SIZE;
+  const size = getComponentDefinition(type) ?? DEFAULT_COMPONENT_SIZE;
   return { width: size.width, height: size.height };
 }
 

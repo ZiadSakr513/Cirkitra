@@ -1,5 +1,17 @@
 /* Proteus-style canvas and physical component symbols. All artwork is CSS/HTML. */
 
+.symbol-registry { position: absolute; inset: 0; pointer-events: none; }
+.symbol-registry__body { position: absolute; inset: 3px 10px; border: 2px solid #53646d; border-radius: 8px; background: linear-gradient(110deg, #26333b, #131d25); display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 4px 42px; text-align: center; }
+.symbol-registry--module .symbol-registry__body { background: #11423e; border-color: #39887e; }
+.symbol-registry.is-powered .symbol-registry__body { border-color: #42d7bd; }
+.symbol-registry__body b { max-width: 100%; font: 700 10px/1.2 var(--font-mono); color: #eef8ff; overflow-wrap: break-word; word-break: normal; }
+.symbol-registry__body small { max-width: 100%; margin-top: 5px; font: 7px/1.2 var(--font-mono); color: #a9bcc6; overflow-wrap: break-word; word-break: normal; }
+.symbol-registry__pin { position: absolute; transform: translateY(-50%); color: #edf4fa; font: 11px var(--font-mono); white-space: nowrap; }
+.symbol-registry__pin.side-left { left: 16px; }
+.symbol-registry__pin.side-right { right: 16px; text-align: right; }
+.symbol-registry__pin em { color: #8cabbc; font-size: 8px; font-style: normal; }
+.symbol-registry__pin.is-nc { color: #7b8a94; }
+
 .canvas-viewport {
   touch-action: none;
   cursor: grab;
@@ -215,9 +227,12 @@
 .schematic-pin.side-bottom { flex-direction: column-reverse; transform: translate(-50%, -100%); }
 .schematic-pin.side-top span,
 .schematic-pin.side-bottom span { font-size: 6px; writing-mode: vertical-rl; }
-.component-arduino-uno .schematic-pin { gap: 3px; color: #e8f1ef; font-size: 7px; }
-.component-arduino-uno .schematic-pin i { border-color: #d3e0dc; background: #172127; }
+.component-arduino-uno .schematic-pin { gap: 4px; color: #f1fffc; font-size: 10px; font-weight: 600; line-height: 1; text-shadow: 0 1px 2px #071015, 0 0 4px #071015; }
+.component-arduino-uno .schematic-pin span { opacity: 1; }
+.component-arduino-uno .schematic-pin i { width: 9px; height: 9px; border: 2px solid #e4f1ee; background: #10191e; }
 .component-arduino-uno .schematic-pin.connected i {
+  width: 11px;
+  height: 11px;
   border-color: #e9fbff;
   background: var(--pin-wire-color, #42d7bd);
   box-shadow: 0 0 0 2px #071018, 0 0 9px color-mix(in srgb, var(--pin-wire-color, #42d7bd) 68%, white);
@@ -366,9 +381,6 @@
 .wire-bridge { width: 10px; height: 7px; border-width: 2px; background: #091017; box-shadow: none; }
 .wire-route.highlighted .wire-bridge { border-color: var(--wire-color); box-shadow: none; }
 .wire-junction { box-shadow: none; }
-.wire-endpoint-label { position: absolute; z-index: 8; padding: 5px 8px; border: 1px solid var(--wire-color); border-radius: 5px; background: #0c1822; color: #eef7ff; font: 11px/1.4 var(--font-mono, monospace); white-space: nowrap; pointer-events: none; box-shadow: 0 3px 12px #0008; transform: translate(12px, -100%); }
-.wire-endpoint-label.side-left { transform: translate(calc(-100% - 12px), -100%); }
-.wire-endpoint-label.side-bottom { transform: translate(12px, 12px); }
 .connection-panel { position: absolute; z-index: 20; top: 12px; left: 12px; width: min(320px, calc(100% - 24px)); max-height: calc(100% - 130px); display: flex; flex-direction: column; padding: 12px; border: 1px solid #304854; border-radius: 10px; background: #0b141ef5; box-shadow: 0 12px 36px #0006; }
 .connection-panel-heading { display: flex; justify-content: space-between; align-items: center; color: #e8f5fc; }
 .connection-panel-heading small { margin-left: 6px; color: #92b4c7; }
@@ -387,3 +399,8 @@
 .wire-trace-card span { color: #afc7d9; margin-top: 4px; }
 .wire-trace-card small { color: #ffd18b; margin-top: 5px; }
 .wire-trace-card button { flex-shrink: 0; font-size: 11px; }
+
+.symbol-registry__state { position: absolute; z-index: 2; top: calc(100% + 8px); left: 50%; transform-origin: top center; display: grid; gap: 3px; min-width: 112px; max-width: 230px; padding: 5px 9px; border: 1px solid #617f92; border-radius: 5px; background: #0b1c27; color: #f0f8ff; text-align: center; pointer-events: none; }
+.symbol-registry__state strong { font: 600 12px/1.3 var(--font-body, sans-serif); white-space: nowrap; }
+.symbol-registry__state small { color: #b7d8e8; font: 10px/1.4 var(--font-mono, monospace); }
+.symbol-registry__state small:empty { display: none; }

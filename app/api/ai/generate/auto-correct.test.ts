@@ -8,7 +8,7 @@ function autoCorrectPinNames(content: string): { corrected: string; changes: num
   let corrected = content;
   let changes = 0;
   
-  const corrections: Array<[RegExp, string | ((match: string, ...args: any[]) => string)]> = [
+  const corrections: Array<[RegExp, string]> = [
     // Ground pins - all variations
     [/"pin":\s*"GND1"/g, '"pin": "GND"'],
     [/"pin":\s*"GND4"/g, '"pin": "GND2"'],
@@ -51,13 +51,13 @@ function autoCorrectPinNames(content: string): { corrected: string; changes: num
     [/"pin":\s*"T1"/gi, '"pin": "1"'],
     [/"pin":\s*"T2"/gi, '"pin": "2"'],
     // Arduino digital pins - lowercase d
-    [/"pin":\s*"d(\d+)"/gi, (match, num) => `"pin": "D${num}"`],
-    [/"pin":\s*"digital(\d+)"/gi, (match, num) => `"pin": "D${num}"`],
-    [/"pin":\s*"DIG(\d+)"/gi, (match, num) => `"pin": "D${num}"`],
+    [/"pin":\s*"d(\d+)"/gi, '"pin": "D$1"'],
+    [/"pin":\s*"digital(\d+)"/gi, '"pin": "D$1"'],
+    [/"pin":\s*"DIG(\d+)"/gi, '"pin": "D$1"'],
     // Arduino analog pins - lowercase a  
-    [/"pin":\s*"a(\d+)"/gi, (match, num) => `"pin": "A${num}"`],
-    [/"pin":\s*"analog(\d+)"/gi, (match, num) => `"pin": "A${num}"`],
-    [/"pin":\s*"AIN(\d+)"/gi, (match, num) => `"pin": "A${num}"`],
+    [/"pin":\s*"a(\d+)"/gi, '"pin": "A$1"'],
+    [/"pin":\s*"analog(\d+)"/gi, '"pin": "A$1"'],
+    [/"pin":\s*"AIN(\d+)"/gi, '"pin": "A$1"'],
     // RGB LED pins
     [/"pin":\s*"RED"/gi, '"pin": "R"'],
     [/"pin":\s*"GREEN"/gi, '"pin": "G"'],
@@ -70,11 +70,7 @@ function autoCorrectPinNames(content: string): { corrected: string; changes: num
   
   for (const [pattern, replacement] of corrections) {
     const before = corrected;
-    if (typeof replacement === 'function') {
-      corrected = corrected.replace(pattern, replacement as any);
-    } else {
-      corrected = corrected.replace(pattern, replacement);
-    }
+    corrected = corrected.replace(pattern, replacement);
     if (corrected !== before) {
       changes++;
     }

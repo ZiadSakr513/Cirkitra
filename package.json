@@ -12,8 +12,9 @@
     "dev:sites": "vinext dev",
     "build:sites": "vinext build",
     "start:sites": "vinext start",
-    "test": "npm run build && node --experimental-transform-types --test tests/rendered-html.test.mjs tests/no-canned-ai.test.mjs tests/studio-components.test.mjs app/api/ai/generate/route.test.ts lib/circuit/catalog.test.ts lib/circuit/project.test.ts lib/schematic/geometry.test.ts lib/simulator/simulator.test.ts lib/simulator/motor.test.ts",
+    "test": "npm run build && node --experimental-transform-types --test tests/rendered-html.test.mjs tests/no-canned-ai.test.mjs tests/studio-components.test.mjs app/api/ai/generate/route.test.ts lib/circuit/catalog.test.ts lib/circuit/project.test.ts lib/schematic/geometry.test.ts lib/simulator/simulator.test.ts lib/simulator/motor.test.ts lib/circuit/expanded.test.ts lib/circuit/publication.test.ts lib/simulator/expanded.test.ts lib/simulator/devices.test.ts lib/simulator/one-wire.test.ts lib/simulator/power.test.ts lib/simulator/sht31.test.ts lib/simulator/lora.test.ts lib/simulator/xbee.test.ts lib/simulator/bq27441.test.ts lib/simulator/bosch-registers.test.ts",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern work --ignore-pattern outputs",
+    "catalog:discover": "node --experimental-transform-types scripts/discover-components.ts",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {

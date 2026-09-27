@@ -1,3 +1,8 @@
+import { solveCircuit } from "./circuit-state.ts";
+import { DeviceRuntime, type DeviceValue } from "./devices.ts";
+import { deviceInstances, splitDeviceArguments, DEVICE_CONSTANTS } from "./device-api.ts";
+import type { CircuitProject } from "../circuit/types.ts";
+import { COMPONENT_CATALOG } from "../circuit/catalog.ts";
 import { createInitialPinStates, parseUnoPinLabel, UNO_PWM_PINS } from "./pins.ts";
 import { compileArduinoSketch, evaluateRuntimeExpression } from "./parser.ts";
 import type {
@@ -85,6 +90,8 @@ function freezeSnapshot(
  * pause/resume behavior repeatable.
  */
 export class ArduinoSimulator {
+  private devices?: DeviceRuntime;
+  private project?: CircuitProject;
   private compiled: CompiledArduinoSketch;
   private status: SimulatorStatus = "idle";
   private phase: SimulatorPhase = "setup";
@@ -136,6 +143,17 @@ export class ArduinoSimulator {
     );
   }
 
+  attachProject(project: CircuitProject) {
+    const changed = this.project && JSON.stringify([this.project.components.map(c => [c.id, c.type]), this.project.connections]) !== JSON.stringify([project.components.map(c => [c.id, c.type]), project.connections]);
+    this.project = project;
+    if (!this.devices) this.devices = new DeviceRuntime(project, this.compiled.source);
+    else this.devices.configure(project);
+    if (changed) this.reset(); else this.commit();
+  }
+  injectPacket(componentId: string, payload: string) {
+    if (this.status !== "running") return false;
+    const delivered = this.devices?.injectPacket(componentId, payload) ?? false; this.commit(); return delivered;
+  }
   getSnapshot = (): SimulatorSnapshot => this.snapshot;
 
   getCompiledSketch(): CompiledArduinoSketch {
@@ -177,11 +195,13 @@ export class ArduinoSimulator {
     this.lcds.clear();
     this.tones.clear();
     this.componentStates = {};
+    this.devices?.reset(this.compiled.source);
     this.commit();
     return this.snapshot;
   }
 
   run(): SimulatorSnapshot {
+    if (this.project?.components.some(c => !COMPONENT_CATALOG[c.type])) { this.status = "error"; this.commit(); return this.snapshot; }
     if (this.status !== "error" && this.status !== "completed") {
       this.status = "running";
       this.commit();
@@ -211,6 +231,7 @@ export class ArduinoSimulator {
    * advances the virtual clock by its complete duration in the same step.
    */
   step(): SimulatorSnapshot {
+    if (this.project?.components.some(c => !COMPONENT_CATALOG[c.type])) { this.status = "error"; this.commit(); return this.snapshot; }
     if (this.status === "error" || this.status === "completed") {
       return this.snapshot;
     }
@@ -233,7 +254,7 @@ export class ArduinoSimulator {
     if (instruction) {
       this.execute(instruction);
       this.programCounter += 1;
-      if (instruction.kind === "delay") {
+      if (this.waitRemainingMs > 0) {
         this.timeMs += this.waitRemainingMs;
         this.waitRemainingMs = 0;
       }
@@ -256,7 +277,14 @@ export class ArduinoSimulator {
     if (this.status !== "running") return this.snapshot;
 
     let budget = realDeltaMs * this.speed;
-    this.timeMs += budget;
+    if (![...this.compiled.setup, ...this.compiled.loop].some(i => i.kind === "delay")) {
+      // Library conversions may block even when a sketch contains no delay().
+      // Consume that wait on the same clock before evaluating millis-based code.
+      const elapsed = Math.min(budget, this.waitRemainingMs);
+      this.waitRemainingMs -= elapsed;
+      this.timeMs += budget;
+      budget = 0;
+    }
     let operations = 0;
 
     while (this.status === "running" && operations < this.maxOperationsPerAdvance) {
@@ -266,6 +294,7 @@ export class ArduinoSimulator {
       if (this.waitRemainingMs > 0) {
         if (budget <= 0) break;
         const elapsed = Math.min(budget, this.waitRemainingMs);
+        this.timeMs += elapsed;
         this.waitRemainingMs -= elapsed;
         budget -= elapsed;
         if (this.waitRemainingMs > 0) break;
@@ -279,6 +308,7 @@ export class ArduinoSimulator {
       operations += 1;
     }
 
+    this.timeMs += budget;
     this.commit();
     return this.snapshot;
   }
@@ -387,7 +417,55 @@ export class ArduinoSimulator {
     }
   }
 
-  private execute(instruction: SketchInstruction): void {
+  private updateDevices() {
+    this.devices?.tick(this.timeMs, this.pins);
+    if (!this.project || !this.devices || !this.snapshot) return;
+    const solution = solveCircuit(this.project, { ...this.snapshot, pins: this.pins, timeMs: this.timeMs, componentStates: this.devices.states, deviceDrives: this.devices.drives, deviceBridges: this.devices.bridges });
+    for (const [number, value] of Object.entries(solution.digitalInputs)) if (this.pins[Number(number)]?.mode !== "OUTPUT") { this.pins[Number(number)].digitalValue = value; this.pins[Number(number)].pwmValue = value * 255; }
+    for (const [number, value] of Object.entries(solution.analogInputs)) this.analogInputs.set(Number(number), value);
+    this.componentStates = { ...solution.componentStates, ...this.devices.states };
+  }
+  private execute(instruction: SketchInstruction) {
+    this.updateDevices(); this.executeInstruction(instruction);
+    if (this.devices?.pendingDelayMs) { this.waitRemainingMs = this.devices.pendingDelayMs; this.devices.pendingDelayMs = 0; }
+    this.updateDevices();
+  }
+  private executeInstruction(instruction: SketchInstruction): void {
+    if (instruction.kind === "bufferDeclare") {
+      const size = Math.trunc(this.evaluate(instruction.size) ?? 0);
+      if (size < 0 || size > 4096 || !this.devices) return;
+      this.devices.values.set(instruction.name, Array.from({ length: size }, (_, i) => i < instruction.values.length ? Number(this.deviceValue(instruction.values[i])) & 255 : 0)); return;
+    }
+    if (instruction.kind === "bufferWrite") {
+      const buffer = this.devices?.values.get(instruction.name), index = Math.trunc(this.evaluate(instruction.index) ?? -1);
+      if (Array.isArray(buffer) && index >= 0 && index < buffer.length) buffer[index] = Number(this.deviceValue(instruction.expression)) & 255;
+      else this.devices?.diagnostics.push({ severity: "error", code: "BUFFER_BOUNDS", line: instruction.line, message: `${instruction.name}[${index}] is outside its declared byte buffer.` });
+      return;
+    }
+    if (instruction.kind === "deviceCall") {
+      const args = instruction.args.map(arg => this.deviceValue(arg));
+      if (instruction.instance === "__core" && instruction.method === "shiftOut") {
+        const [data, clock, order, value] = args.map(Number);
+        for (let bit = 0; bit < 8; bit++) {
+          const d = this.pins[data], c = this.pins[clock];
+          if (!d || !c || d.mode !== "OUTPUT" || c.mode !== "OUTPUT") break;
+          d.pwmValue = ((value >> (order ? 7 - bit : bit)) & 1) * 255; d.digitalValue = d.pwmValue ? 1 : 0;
+          c.pwmValue = 0; c.digitalValue = 0; this.updateDevices();
+          c.pwmValue = 255; c.digitalValue = 1; this.updateDevices();
+          c.pwmValue = 0; c.digitalValue = 0; this.updateDevices();
+        }
+      } else {
+        this.devices?.invoke(instruction.instance, instruction.method, args, text => this.deviceValue(text));
+        if (this.devices?.pendingDelayMs) { this.waitRemainingMs = this.devices.pendingDelayMs; this.devices.pendingDelayMs = 0; }
+      }
+      return;
+    }
+    if (instruction.kind === "serialExpression") {
+      const value = this.deviceValue(instruction.expression);
+      this.serial.push({ id: this.nextSerialId++, timestampMs: this.timeMs, text: String(value), newline: instruction.newline });
+      this.serial = this.serial.slice(-this.maxSerialEntries); return;
+    }
+
     if (instruction.kind === "jump") {
       this.programCounter = instruction.target - 1;
       return;
@@ -513,6 +591,22 @@ export class ArduinoSimulator {
     if (changed) pin.lastChangedAtMs = this.timeMs;
   }
 
+  private deviceValue(text: string): DeviceValue {
+    const value = text.trim();
+    if (/^"[\s\S]*"$/.test(value)) { try { return JSON.parse(value) as string; } catch { return value.slice(1, -1); } }
+    if (/^'.'$/.test(value)) return value.charCodeAt(1);
+    if (this.devices?.values.has(value)) return this.devices.values.get(value)!;
+    if (value.startsWith("&")) return value;
+    if (deviceInstances(this.compiled.source).has(value) || value === "Serial") return value;
+    if (/^SPISettings\(/.test(value)) return 0;
+    const segments = value.split(".");
+    if (segments.length > 1 && this.devices?.values.has(segments[0])) {
+      let result: DeviceValue = this.devices.values.get(segments.shift()!)!;
+      for (const segment of segments) { if (typeof result !== "object" || Array.isArray(result)) return NaN; result = result[segment]; }
+      return result;
+    }
+    return this.evaluate(value) ?? NaN;
+  }
   private evaluate(expression: string): number | undefined {
     const values = new Map(this.variables);
     values.set("LOW", 0);
@@ -521,9 +615,40 @@ export class ArduinoSimulator {
     values.set("true", 1);
     values.set("LED_BUILTIN", 13);
     for (let analog = 0; analog < 6; analog += 1) values.set(`A${analog}`, 14 + analog);
-    const normalized = expression.replace(/\b([A-Za-z_]\w*)\.read\s*\(\s*\)/g, "servoRead_$1()");
+    for (const [name, value] of Object.entries(DEVICE_CONSTANTS)) values.set(name, value);
+    let expanded = expression.replace(/\b([A-Za-z_]\w*)\.getResponse\(\)/g, "$1__response");
+    expanded = expanded.replace(/\bsizeof\s*\(\s*([A-Za-z_]\w*)\s*\)/g, (_text, name: string) => { const buffer = this.devices?.values.get(name); return String(Array.isArray(buffer) ? buffer.length : 1); });
+    const callPattern = /([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*\(/g;
+    let match: RegExpExecArray | null;
+    while ((match = callPattern.exec(expanded))) {
+      if (!deviceInstances(this.compiled.source).has(match[1])) continue;
+      let depth = 1, end = callPattern.lastIndex; let quote = "";
+      for (; end < expanded.length && depth; end++) {
+        const char = expanded[end];
+        if (quote) { if (char === "\\") end++; else if (char === quote) quote = ""; }
+        else if (char === '"' || char === "'") quote = char;
+        else if (char === "(") depth++; else if (char === ")") depth--;
+      }
+      if (depth) return undefined;
+      const args = splitDeviceArguments(expanded.slice(callPattern.lastIndex, end - 1)).map(arg => this.deviceValue(arg));
+      this.updateDevices();
+      const result = this.devices?.invoke(match[1], match[2], args, text => this.deviceValue(text));
+      const placeholder = `__deviceResult${values.size}`; values.set(placeholder, Number(result));
+      expanded = expanded.slice(0, match.index) + placeholder + expanded.slice(end); callPattern.lastIndex = 0;
+    }
+    expanded = expanded.replace(/\b([A-Za-z_]\w*)\s*\[([^\]]+)\]/g, (_whole, name: string, index: string) => {
+      const buffer = this.devices?.values.get(name), offset = Math.trunc(this.evaluate(index) ?? -1);
+      const placeholder = `__bufferResult${values.size}`;
+      values.set(placeholder, Array.isArray(buffer) ? buffer[offset] ?? NaN : NaN); return placeholder;
+    });
+    expanded = expanded.replace(/\b([A-Za-z_]\w*)(\.[A-Za-z_]\w*)+/g, (path: string) => {
+      if (!this.devices?.values.has(path.split(".")[0])) return path;
+      const placeholder = `__structuredResult${values.size}`; values.set(placeholder, Number(this.deviceValue(path))); return placeholder;
+    });
+    const normalized = expanded.replace(/\b([A-Za-z_]\w*)\.read\s*\(\s*\)/g, "servoRead_$1()");
     const functions: Record<string, (...args: number[]) => number> = {
       millis: () => this.timeMs,
+      isnan: value => Number(Number.isNaN(value)),
       digitalRead: (pin) => this.pins[Math.trunc(pin)]?.digitalValue ?? 0,
       analogRead: (pin) => this.analogInputs.get(Math.trunc(pin)) ?? 0,
       pulseIn: (pin) => this.pulseInputs.get(Math.trunc(pin)) ?? 0,
@@ -544,6 +669,7 @@ export class ArduinoSimulator {
   }
 
   private commit(): void {
+    this.updateDevices();
     this.snapshot = freezeSnapshot(
       this.status,
       this.phase,
@@ -557,6 +683,7 @@ export class ArduinoSimulator {
       this.compiled,
       [...this.servos.values()], [...this.lcds.values()], [...this.tones.values()], this.componentStates,
     );
+    if (this.devices) this.snapshot = Object.freeze({ ...this.snapshot, componentStates: Object.freeze({ ...this.snapshot.componentStates, ...this.devices.states }), deviceDrives: this.devices.drives.map(d => ({ ...d })), deviceBridges: this.devices.bridges.map(b => ({ ...b })), diagnostics: [...this.snapshot.diagnostics, ...this.devices.diagnostics, ...(this.project?.components.filter(c => !COMPONENT_CATALOG[c.type]).map(c => ({ severity: "error" as const, code: "component-unavailable", message: `${c.label} has no accepted simulation model. Saved wiring is preserved.` })) ?? [])] });
     for (const listener of this.listeners) listener(this.snapshot);
   }
 }

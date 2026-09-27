@@ -5,7 +5,7 @@ import test from "node:test";
 const studioUrl = new URL("../app/studio.tsx", import.meta.url);
 
 test("prompt generation never falls back to a predefined circuit or reply", async () => {
-  const source = await readFile(studioUrl, "utf8");
+  const source = (await readFile(studioUrl, "utf8")).replace(/\r\n/g, "\n");
   const submitPrompt = source.match(
     /const submitPrompt = async[\s\S]*?\n  };\n\n  const exportProject/,
   )?.[0];

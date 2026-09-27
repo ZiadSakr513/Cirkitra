@@ -1,4 +1,6 @@
+import { deviceInstances, DEVICE_CONSTANTS } from "./device-api.ts";
 import { isUnoPin, UNO_PWM_PINS, unoPinLabel } from "./pins.ts";
+import { validateLibraryCalls } from "./libraries.ts";
 import type {
   CompiledArduinoSketch,
   SimulatorDiagnostic,
@@ -447,7 +449,9 @@ export function evaluateRuntimeExpression(
   const tokens = tokenizeExpression(expression.trim());
   if (!tokens) return undefined;
   const result = new ExpressionParser(tokens, variables, functions).parse();
-  return result !== undefined && Number.isFinite(result) ? result : undefined;
+  // Failed sensor reads must overwrite the previous reading with NaN so
+  // sketches can detect them with isnan() and stop actuators safely.
+  return result !== undefined && (Number.isFinite(result) || Number.isNaN(result)) ? result : undefined;
 }
 
 function evaluateStatic(
@@ -759,6 +763,7 @@ function compileExecutableBody(
 ): SketchInstruction[] {
   if (!body) return [];
   const instructions: SketchInstruction[] = [];
+  const functionReturns: Array<Extract<SketchInstruction, { kind: "jump" }>> = [];
   const text = body.body;
 
   const skipWhitespace = (start: number) => {
@@ -793,8 +798,19 @@ function compileExecutableBody(
     return elseClose === undefined ? undefined : elseClose + 1;
   };
   const compileSimple = (statement: string, localStart: number) => {
-    const trimmed = statement.trim();
+    const trimmed = statement.trim().replace(/\b([A-Za-z_]\w*)\.getResponse\(\)/g, "$1__response");
     const sourceInfo = { line: lineAt(source, body.startIndex + localStart), source: trimmed };
+    if (/^return\s*;$/.test(trimmed)) {
+      const jump = { kind: "jump" as const, target: 0, ...sourceInfo };
+      functionReturns.push(jump); instructions.push(jump); return;
+    }
+    const buffer = /^(?:const\s+)?(?:byte|uint8_t|DeviceAddress)\s+([A-Za-z_]\w*)\s*(?:\[\s*([^\]]*)\s*\])?\s*(?:=\s*\{([^}]*)\})?\s*;$/.exec(trimmed);
+    if (buffer && (trimmed.startsWith("DeviceAddress") || trimmed.includes("["))) {
+      const items = buffer[3] ? splitArguments(buffer[3]) ?? [] : [];
+      instructions.push({ kind: "bufferDeclare", name: buffer[1], size: buffer[2] || String(items.length || 8), values: items, ...sourceInfo }); return;
+    }
+    const bufferWrite = /^([A-Za-z_]\w*)\s*\[([^\]]+)\]\s*=\s*([^;]+);$/.exec(trimmed);
+    if (bufferWrite) { instructions.push({ kind: "bufferWrite", name: bufferWrite[1], index: bufferWrite[2], expression: bufferWrite[3], ...sourceInfo }); return; }
     const declaration = /^(?:(?:const\s+)?(?:unsigned\s+)?(?:int|long|short|byte|uint8_t|uint16_t|size_t|bool|float|double))\s+([A-Za-z_]\w*)(?:\s*=\s*([^;]+))?\s*;$/.exec(trimmed);
     if (declaration) {
       instructions.push({ kind: "declare", name: declaration[1], expression: declaration[2]?.trim() ?? "0", ...sourceInfo });
@@ -821,6 +837,18 @@ function compileExecutableBody(
         addArgumentError(diagnostics, sourceInfo.line, `${instance}.${method}`, "well-formed arguments");
         return;
       }
+      const adapter = deviceInstances(source).get(instance)?.api;
+      if (adapter) {
+        const arity = adapter.methods[method];
+        if (!arity || args.length < arity[0] || args.length > arity[1]) addArgumentError(diagnostics, sourceInfo.line, `${instance}.${method}`, arity ? `${arity[0]}..${arity[1]} arguments` : "a registered method");
+        else instructions.push({ kind: "deviceCall", instance, method, args, ...sourceInfo });
+        return;
+      }
+      if (instance === "Serial" && (method === "print" || method === "println") && args.length >= 1) {
+        const staticValue = printValue(args[0], constants);
+        if (staticValue !== undefined) instructions.push({ kind: "serialPrint", value: staticValue, newline: method === "println", ...sourceInfo });
+        else instructions.push({ kind: "serialExpression", expression: args[0], newline: method === "println", ...sourceInfo }); return;
+      }
       if (instance === "Serial" && method === "begin") return;
       if (instance === "Serial" && (method === "print" || method === "println") && args.length >= 1) {
         const value = printValue(args[0], constants);
@@ -836,6 +864,14 @@ function compileExecutableBody(
       else diagnostics.push({ severity: "error", code: "UNSUPPORTED_CALL", message: `${instance}.${method}() is outside the simulator subset.`, line: sourceInfo.line });
       return;
     }
+    const shiftCall = /^shiftOut\s*\(([\s\S]*)\)\s*;$/.exec(trimmed);
+    if (shiftCall) {
+      const args = splitArguments(shiftCall[1]);
+      if (args?.length === 4) instructions.push({ kind: "deviceCall", instance: "__core", method: "shiftOut", args, ...sourceInfo });
+      else addArgumentError(diagnostics, sourceInfo.line, "shiftOut", "four arguments");
+      return;
+    }
+    if (/^(?:sensors_event_t|DeviceAddress)\s+[A-Za-z_]/.test(trimmed)) return;
     const toneCall = /^(tone|noTone)\s*\(([\s\S]*)\)\s*;$/.exec(trimmed);
     if (toneCall) {
       const args = splitArguments(toneCall[2]);
@@ -928,6 +964,7 @@ function compileExecutableBody(
     }
   };
   compileRange(0, text.length);
+  functionReturns.forEach(instruction => { instruction.target = instructions.length; });
   return instructions;
 }
 
@@ -951,7 +988,9 @@ function collectGlobalVariables(source: string): Record<string, number> {
 export function compileArduinoSketch(source: string): CompiledArduinoSketch {
   const diagnostics: SimulatorDiagnostic[] = [];
   const masked = maskComments(source);
+  diagnostics.push(...validateLibraryCalls(masked));
   const constants = collectConstants(masked);
+  Object.entries(DEVICE_CONSTANTS).forEach(([key, value]) => constants.set(key, value));
   const setupBody = extractFunction(masked, "setup", diagnostics);
   const loopBody = extractFunction(masked, "loop", diagnostics);
 
