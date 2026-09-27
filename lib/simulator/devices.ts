@@ -9,6 +9,7 @@ import { LoRaModel } from "./lora.ts";
 import { Sht31Model } from "./sht31.ts";
 import { OneWireRuntime, sensorRom } from "./one-wire.ts";
 import { PowerRuntime, type PowerResult } from "./power.ts";
+import type { MotorSupplyLoad } from "./motor-loads.ts";
 import { STATEFUL_MODEL_TYPES } from "./stateful-models.ts";
 
 export type DeviceValue = number | string | boolean | number[] | { [key: string]: DeviceValue };
@@ -108,10 +109,10 @@ export class DeviceRuntime {
     if (candidates.length > 1) { this.error("I2C_ADDRESS_CONFLICT", `Multiple connected devices respond at 0x${address.toString(16)}. Change address straps or isolate a mux channel.`); return undefined; }
     return candidates[0];
   }
-  tick(timeMs: number, pins: readonly UnoPinState[]) {
+  tick(timeMs: number, pins: readonly UnoPinState[], motorLoads: readonly MotorSupplyLoad[] = []) {
     this.time = timeMs;
     // A switch's own upstream connection is checked before publishing downstream bridges.
-    this.powerResult = this.power.solve(this.project, timeMs, this.powerControls, this.charging);
+    this.powerResult = this.power.solve(this.project, timeMs, this.powerControls, this.charging, motorLoads);
     for (const diagnostic of this.powerResult.diagnostics) this.error(diagnostic.code, diagnostic.message);
     this.wiring = new DeviceWiring(this.project, pins, [], this.powerResult.voltage);
     this.bridges = [];

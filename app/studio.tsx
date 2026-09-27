@@ -30,7 +30,8 @@ import {
 } from "../lib/circuit";
 import {
   ArduinoSimulator,
-  isBuzzerCircuitPowered,
+  isBuzzerActive,
+  isUninitializedMotorControlWarning,
   isLedCircuitPowered,
   resolveBuzzerCircuitBindings,
   resolveComponentBoardPins,
@@ -295,6 +296,7 @@ export function CircuitStudio() {
   const [dragState, setDragState] = useState<{ id: string; startX: number; startY: number; currentX: number; currentY: number; componentX: number; componentY: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
+  const ultrasonicEchoPinsRef = useRef<Set<string>>(new Set());
   const [simulator] = useState(() => new ArduinoSimulator(initialProject.code));
   const [snapshot, setSnapshot] = useState<SimulatorSnapshot>(() => simulator.getSnapshot());
 
@@ -655,7 +657,8 @@ export function CircuitStudio() {
   );
   
   const circuitMessages = useMemo<CompileMessage[]>(() => {
-    const diagnostics = solveCircuit(project, snapshot).diagnostics;
+    const diagnostics = solveCircuit(project, snapshot).diagnostics
+      .filter(item => !isUninitializedMotorControlWarning(project, snapshot, item));
     return diagnostics.map((item) => ({ 
       severity: item.severity, 
       message: item.message 
@@ -664,29 +667,20 @@ export function CircuitStudio() {
   
   const problemMessages = useMemo(() => [...compileMessages, ...circuitMessages], [compileMessages, circuitMessages]);
   const enableRepair = useMemo(() => connectFloatingMotorDriverEnables(project), [project]);
+  const hasEnableRepair = enableRepair !== project;
   const missingEnableCount = enableRepair.connections.length - project.connections.length;
   useEffect(() => {
+    const powered = solveCircuit(project, simulator.getSnapshot()).componentStates;
+    const echoPins = new Set<string>();
     project.components.forEach((component) => {
-      if (component.type === "pir-sensor") {
-        resolveComponentIoPins(project, component.id, "OUT").forEach((pin) => simulator.setDigitalInput(pin, component.properties?.motion === true));
-      }
-      if (component.type === "temperature-sensor") {
-        const temperature = Number(component.properties?.temperatureC ?? 24);
-        const analogValue = Math.round(((temperature / 100 + 0.5) / 5) * 1023);
-        resolveComponentIoPins(project, component.id, "OUT").forEach((pin) => simulator.setAnalogInput(pin, analogValue));
-      }
       if (component.type === "hc-sr04") {
         const distance = Number(component.properties?.distanceCm ?? 100);
-        resolveComponentIoPins(project, component.id, "ECHO").forEach((pin) => simulator.setPulseInput(pin, distance * 58.3));
-      }
-      if (component.type === "push-button") {
-        const pressed = component.properties?.pressed === true;
-        const normallyClosed = component.properties?.normallyClosed === true;
-        const level = pressed !== normallyClosed ? 0 : 1;
-        ["1", "2"].flatMap((terminal) => resolveComponentIoPins(project, component.id, terminal))
-          .forEach((pin) => simulator.setDigitalInput(pin, level));
+        const duration = powered[component.id]?.powered ? distance * 58.3 : 0;
+        resolveComponentIoPins(project, component.id, "ECHO").forEach((pin) => { simulator.setPulseInput(pin, duration); echoPins.add(pin); });
       }
     });
+    ultrasonicEchoPinsRef.current.forEach(pin => { if (!echoPins.has(pin)) simulator.setPulseInput(pin, 0); });
+    ultrasonicEchoPinsRef.current = echoPins;
   }, [project, simulator]);
   const wireRoutes = useMemo(() => {
     const inputs = project.connections.flatMap((connection) => {
@@ -1215,7 +1209,7 @@ export function CircuitStudio() {
                 const segments = route.segments;
                 const wireTitle = `W${wireIndex + 1}: ${fromComponent.label} · ${fromPin.label} → ${toComponent.label} · ${toPin.label}. Click to trace.`;
                 return (
-                  <div className={`wire-route ${highlightedWireId === connection.id ? "highlighted" : ""}`} key={connection.id} style={{ "--wire-color": connection.color ?? "#47b86b" } as React.CSSProperties}>
+                  <div className={`wire-route ${route.overlaid ? "overlaid" : ""} ${highlightedWireId === connection.id ? "highlighted" : ""}`} key={connection.id} style={{ "--wire-color": connection.color ?? "#47b86b" } as React.CSSProperties}>
                     {segments.map((segment, index) => {
                       const horizontal = segment.from.y === segment.to.y;
                       return (
@@ -1261,14 +1255,10 @@ export function CircuitStudio() {
                   ledCircuitBindings.get(component.id),
                   snapshot,
                 );
-                const isBuzzerOn = component.type === "buzzer" && isBuzzerCircuitPowered(
+                const isBuzzerOn = component.type === "buzzer" && isBuzzerActive(
                   buzzerCircuitBindings.get(component.id),
                   snapshot,
                 );
-                const componentPins = component.type === "buzzer"
-                  ? resolveComponentBoardPins(project, component.id, "+").map(parseUnoPinLabel).filter((pin): pin is number => pin !== undefined)
-                  : [];
-                const toneOn = component.type === "buzzer" && snapshot.tones.some((tone) => tone.active && componentPins.includes(tone.pin));
                 const servoState = component.type === "servo"
                   ? snapshot.servos.find((servo) => resolveComponentBoardPins(project, component.id, "SIG").some((pin) => parseUnoPinLabel(pin) === servo.pin))
                   : undefined;
@@ -1279,7 +1269,9 @@ export function CircuitStudio() {
                   : component.type === "lcd-16x2" && lcdState
                     ? { ...component.properties, text: lcdState.lines.join("\n") }
                     : { ...component.properties, __electricalState: JSON.stringify(electricalState ?? null) };
-                const isPowered = (electricalState?.powered ?? (isLedOn || isBuzzerOn)) || toneOn || Boolean(servoState?.attached) || Boolean(lcdState) || Boolean(electricalState?.powered);
+                const isPowered = component.type === "buzzer"
+                  ? isBuzzerOn
+                  : (electricalState?.powered ?? isLedOn) || Boolean(servoState?.attached) || Boolean(lcdState) || Boolean(electricalState?.powered);
                 
                 // Apply CSS transform during drag - GPU accelerated, no wire recalc!
                 const isDragging = dragState?.id === component.id;
@@ -1349,7 +1341,6 @@ export function CircuitStudio() {
             {tracedWire && <div className="wire-trace-card" onPointerDown={(event) => event.stopPropagation()}>
               <span className="trace-swatch" style={{ background: tracedWire.color ?? "#42d7bd" }} />
               <div><strong>W{project.connections.indexOf(tracedWire) + 1} · {endpointLabel(tracedWire.from)}</strong><span>→ {endpointLabel(tracedWire.to)}</span>
-                {wireRoutes.get(tracedWire.id)?.blocked && <small>Linked by matching labels. Move parts apart to make room for a full path.</small>}
               </div>
               <button onClick={() => { commitProject({ ...project, connections: project.connections.filter((wire) => wire.id !== tracedWire.id) }); setPinnedWireId(null); setHighlightedWireId(null); announce("Wire removed"); }}>Remove wire</button>
               <button onClick={() => { setPinnedWireId(null); setHighlightedWireId(null); }} aria-label="Clear wire trace">×</button>
@@ -1520,7 +1511,7 @@ export function CircuitStudio() {
           <div className="drawer-content">
             {bottomTab === "code" && <div className="code-editor"><pre aria-hidden="true">{project.code.split("\n").map((_, index) => <span key={index}>{index + 1}</span>)}</pre><textarea spellCheck={false} aria-label="Arduino code" value={project.code} onChange={(event) => { setProject((current) => ({ ...current, code: event.target.value })); setBuildState("idle"); }} onBlur={() => commitProject(projectRef.current)} /></div>}
             {bottomTab === "serial" && <div className="serial-console"><header><span>9600 baud</span><button onClick={() => simulator.clearSerial()}>Clear output</button></header><div>{snapshot.serial.length ? snapshot.serial.map((entry) => <p key={entry.id}><time>{(entry.timestampMs / 1000).toFixed(2)}s</time><span>{entry.text}{entry.newline ? "" : "_"}</span></p>) : <div className="console-empty">Run the simulation to see Serial output here.<small>Serial.begin(9600) detected automatically</small></div>}</div></div>}
-            {bottomTab === "problems" && <div className="problems-list">{missingEnableCount > 0 && <button className="motor-enable-repair" onClick={() => { commitProject(enableRepair); announce(`Connected ${missingEnableCount} motor driver enable ${missingEnableCount === 1 ? "pin" : "pins"} to 5V`); }}><span>↗</span><strong>Connect {missingEnableCount} disconnected motor driver {missingEnableCount === 1 ? "enable" : "enables"} to Arduino 5V</strong><small>Fix wiring</small></button>}{problemMessages.length ? problemMessages.map((message, index) => <button key={index} onClick={() => setBottomTab("code")}><span className={message.severity}>{message.severity === "error" ? "×" : "!"}</span><strong>{message.message}</strong><small>{message.line ? `Sketch.ino:${message.line}` : "Circuit"}</small></button>) : <div className="console-empty"><span className="success-check">✓</span>No build problems detected.<small>The supported simulation subset is ready.</small></div>}</div>}
+            {bottomTab === "problems" && <div className="problems-list">{hasEnableRepair && <button className="motor-enable-repair" onClick={() => { commitProject(enableRepair); announce(missingEnableCount > 0 ? `Repaired ${missingEnableCount} motor driver enable ${missingEnableCount === 1 ? "pin" : "pins"}` : "Repaired floating motor driver standby wiring"); }}><span>↗</span><strong>{missingEnableCount > 0 ? `Connect ${missingEnableCount} disconnected motor driver enable or standby ${missingEnableCount === 1 ? "pin" : "pins"}` : "Fix floating motor driver standby wiring"}</strong><small>Fix wiring</small></button>}{problemMessages.length ? problemMessages.map((message, index) => <button key={index} onClick={() => setBottomTab("code")}><span className={message.severity}>{message.severity === "error" ? "×" : "!"}</span><strong>{message.message}</strong><small>{message.line ? `Sketch.ino:${message.line}` : "Circuit"}</small></button>) : <div className="console-empty"><span className="success-check">✓</span>No build problems detected.<small>The supported simulation subset is ready.</small></div>}</div>}
           </div>
         )}
       </section>

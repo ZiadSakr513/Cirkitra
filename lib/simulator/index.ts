@@ -1,7 +1,9 @@
 export { ArduinoSimulator } from "./engine.ts";
 export { compileArduinoSketch } from "./parser.ts";
 export {
+  isBuzzerActive,
   isBuzzerCircuitPowered,
+  isUninitializedMotorControlWarning,
   isLedCircuitPowered,
   resolveBuzzerCircuitBindings,
   resolveComponentBoardPins,

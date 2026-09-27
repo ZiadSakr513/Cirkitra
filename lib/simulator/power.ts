@@ -1,6 +1,7 @@
 import type { CircuitComponent, CircuitProject } from "../circuit/types.ts";
 import { POWER_TERMINAL_GROUPS } from "../circuit/terminal-groups.ts";
 import type { SimulatedComponentState, SimulatorDiagnostic } from "./types.ts";
+import type { MotorSupplyLoad } from "./motor-loads.ts";
 
 type Branch = { id: string; a: string; b: string; value: number };
 const key = (id: string, pin: string) => `${id}:${pin}`;
@@ -16,7 +17,7 @@ export class PowerRuntime {
   private charge = new Map<string, number>();
   private lastTime = 0;
   reset() { this.charge.clear(); this.lastTime = 0; }
-  solve(project: CircuitProject, timeMs: number, controls: Readonly<Record<string, number>> = {}, charging: Readonly<Record<string, number>> = {}): PowerResult {
+  solve(project: CircuitProject, timeMs: number, controls: Readonly<Record<string, number>> = {}, charging: Readonly<Record<string, number>> = {}, motorLoads: readonly MotorSupplyLoad[] = []): PowerResult {
     const dt = Math.max(0, timeMs - this.lastTime) / 3600000; this.lastTime = timeMs;
     const parent = new Map<string, string>();
     const find = (p: string): string => { if (!parent.has(p)) parent.set(p, p); const root = parent.get(p)!; if (root === p) return p; const next = find(root); parent.set(p, next); return next; };
@@ -48,6 +49,12 @@ export class PowerRuntime {
         else if (controls[`${c.id}:battery`]) add(resistors, c, "BAT_2", "OUT_10", 0.1);
         if (controls[`${c.id}:charge`]) add(currents, c, "IN", "VSS", controls[`${c.id}:charge`], ":charging");
       }
+    }
+    for (const load of motorLoads) {
+      const driver = project.components.find(c => c.id === load.driverId);
+      const motor = project.components.find(c => c.id === load.motorId);
+      if (!driver || !motor || motor.type !== "dc-motor" || !Number.isFinite(load.current) || load.current <= 0) continue;
+      currents.push({ id: `${driver.id}:motor:${motor.id}`, a: node(driver.id, load.supplyPin), b: node(driver.id, load.returnPin), value: load.current });
     }
     // Only grounded connected subgraphs are solvable; isolated nodes remain floating.
     const graph = new Map<string, Set<string>>();
@@ -82,7 +89,10 @@ export class PowerRuntime {
     const voltages = new Map<string, number>([[reference, 0]]);
     if (valid) nodes.forEach((n, i) => voltages.set(n, matrix[i][size]));
     const currentMap = new Map<string, number>();
-    if (valid) activeSources.forEach((b, i) => currentMap.set(b.id, -matrix[nodes.length + i][size]));
+    if (valid) activeSources.forEach((b, i) => {
+      const current = -matrix[nodes.length + i][size];
+      currentMap.set(b.id, Math.abs(current) < 1e-12 ? 0 : current);
+    });
     if (valid) resistors.forEach(b => currentMap.set(b.id, ((voltages.get(b.a) ?? 0) - (voltages.get(b.b) ?? 0)) / b.value));
     const states: Record<string, SimulatedComponentState> = {};
     for (const c of project.components.filter(c => ["battery-cell", "dc-supply", "dc-load", "ideal-mosfet"].includes(c.type))) {

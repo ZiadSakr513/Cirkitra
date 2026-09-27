@@ -64,7 +64,8 @@ export interface CoordinatedWireRoute {
   id: string;
   segments: WireSegment[];
   bridges: WireBridge[];
-  blocked?: boolean;
+  /** The route is complete but must paint above symbols to stay visible. */
+  overlaid?: boolean;
 }
 
 /**
@@ -421,6 +422,40 @@ function channelRoute(start: Point, end: Point, obstacles: readonly Bounds[], oc
   return undefined;
 }
 
+/**
+ * Keep a wire continuous when overlapping parts leave no obstacle-free route.
+ * The route follows an outer channel where possible, choosing the candidate
+ * that crosses the fewest expanded component bounds before considering length.
+ */
+function perimeterRoute(start: Point, end: Point, obstacles: readonly Bounds[], margin: number): WireSegment[] {
+  const left = Math.min(start.x, end.x, ...obstacles.map((bounds) => bounds.left)) - margin;
+  const right = Math.max(start.x, end.x, ...obstacles.map((bounds) => bounds.right)) + margin;
+  const top = Math.min(start.y, end.y, ...obstacles.map((bounds) => bounds.top)) - margin;
+  const bottom = Math.max(start.y, end.y, ...obstacles.map((bounds) => bounds.bottom)) + margin;
+  const pointRoutes = [
+    [start, { x: left, y: start.y }, { x: left, y: end.y }, end],
+    [start, { x: right, y: start.y }, { x: right, y: end.y }, end],
+    [start, { x: start.x, y: top }, { x: end.x, y: top }, end],
+    [start, { x: start.x, y: bottom }, { x: end.x, y: bottom }, end],
+    ...[left, right].flatMap((laneX) => [top, bottom].map((laneY) => [
+      start,
+      { x: laneX, y: start.y },
+      { x: laneX, y: laneY },
+      { x: end.x, y: laneY },
+      end,
+    ])),
+  ];
+  return pointRoutes
+    .map(segmentsFromPoints)
+    .sort((a, b) => {
+      const crossingsA = a.reduce((count, segment) => count + obstacles.filter((bounds) => segmentCrossesBounds(segment, bounds)).length, 0);
+      const crossingsB = b.reduce((count, segment) => count + obstacles.filter((bounds) => segmentCrossesBounds(segment, bounds)).length, 0);
+      const lengthA = a.reduce((sum, segment) => sum + segmentLength(segment), 0);
+      const lengthB = b.reduce((sum, segment) => sum + segmentLength(segment), 0);
+      return crossingsA - crossingsB || lengthA - lengthB || a.length - b.length;
+    })[0] ?? [];
+}
+
 /** Route all wires together so later wires avoid lanes already in use. */
 export function coordinatedWireRoutes(
   wires: readonly CoordinatedWireInput[],
@@ -428,8 +463,8 @@ export function coordinatedWireRoutes(
   clearance = 18,
 ): CoordinatedWireRoute[] {
   const safeClearance = Number.isFinite(clearance) ? Math.max(8, clearance) : 18;
-  const obstacles = components.map((component) => {
-    const bounds = componentBounds(component);
+  const componentFootprints = components.map((component) => componentBounds(component));
+  const obstacles = componentFootprints.map((bounds) => {
     return { left: bounds.left - safeClearance, top: bounds.top - safeClearance, right: bounds.right + safeClearance, bottom: bounds.bottom + safeClearance };
   });
   const routes: CoordinatedWireRoute[] = [];
@@ -451,14 +486,10 @@ export function coordinatedWireRoutes(
     const best = candidates[0];
     const searched = !best || best.score > 10_000
       ? channelRoute(start, end, obstacles, occupied) : undefined;
-    const middle = searched ?? best?.segments ?? [];
-    // Never draw a misleading shortcut through a component if the layout is blocked.
-    if (!middle.length && (start.x !== end.x || start.y !== end.y)) {
-      routes.push({ id: wire.id, segments: [startLead, endLead], bridges: [], blocked: true });
-      continue;
-    }
+    const middle = searched ?? best?.segments ?? perimeterRoute(start, end, obstacles, safeClearance * 2);
     const segments = [startLead, ...middle, endLead].filter((segment) => segmentLength(segment) > 0);
-    routes.push({ id: wire.id, segments, bridges: [] });
+    const overlaid = segments.some((segment) => componentFootprints.some((bounds) => segmentCrossesBounds(segment, bounds)));
+    routes.push({ id: wire.id, segments, bridges: [], ...(overlaid ? { overlaid: true } : {}) });
     occupied.push(...middle);
   }
 

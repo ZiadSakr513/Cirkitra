@@ -12,7 +12,7 @@ export function selectGenerationComponents(prompt: string, target: GenerationTar
   const ids = new Set([...essentials, ...currentTypes]);
   const normalize = (text: string) => text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
   const requested = ` ${normalize(prompt)} `;
-  const genericAliases = new Set(["sensor", "sensors", "pressure", "temperature", "humidity", "mux", "multiplexer", "wireless", "radio", "i2c", "spi", "uart", "module", "chip", "driver", "motor", "battery", "power"]);
+  const genericAliases = new Set(["sensor", "sensors", "pressure", "temperature", "humidity", "mux", "multiplexer", "wireless", "radio", "i2c", "spi", "uart", "module", "chip", "driver", "motor driver", "motor drivers", "h bridge", "h bridges", "battery", "power"]);
   const explicitlyRequested = new Set<string>();
   // Explicit hardware names must survive scoring, including "DC supply" in a
   // long prompt dominated by sensor and bus keywords.
@@ -29,8 +29,15 @@ export function selectGenerationComponents(prompt: string, target: GenerationTar
   if (explicitlyNamedHardware.length === 0) scored.slice(0, 16).forEach(({ part }) => ids.add(part.id));
   if (/motor|fan|car|robot|driver|bridge/i.test(prompt)) {
     ids.add("dc-motor");
-    const requestedDrivers = ["l293d", "tb6612fng", "drv8833", "l298"].filter(id => explicitlyRequested.has(id));
-    (requestedDrivers.length ? requestedDrivers : ["l293d"]).forEach(id => ids.add(id));
+    const driverTypes = ["l293d", "tb6612fng", "drv8833", "l298"];
+    const requestedDrivers = driverTypes.filter(id => explicitlyRequested.has(id));
+    const selectedDrivers = requestedDrivers.length ? requestedDrivers : ["l293d"];
+    // Generic phrases such as "a motor driver" must not retrieve every
+    // supported bridge and invite the model to emit several alternatives.
+    for (const id of driverTypes) {
+      if (!selectedDrivers.includes(id) && !currentTypes.includes(id)) ids.delete(id);
+    }
+    selectedDrivers.forEach(id => ids.add(id));
   }
   if (/lcd|display/i.test(prompt)) ids.add("lcd-16x2");
   if (/button|mute/i.test(prompt)) ids.add("push-button");

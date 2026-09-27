@@ -15,6 +15,7 @@ import {
   ArduinoSimulator,
   compileArduinoSketch,
   isBuzzerCircuitPowered,
+  isBuzzerActive,
   isLedCircuitPowered,
   resolveBuzzerCircuitBindings,
   resolveComponentIoPins,
@@ -186,6 +187,17 @@ test("evaluates state and ternary expressions passed to digitalWrite", () => {
   assert.equal(simulator.getSnapshot().pins[8].digitalValue, 0);
 });
 
+test("evaluates computed PWM expressions at simulation time", () => {
+  const simulator = new ArduinoSimulator(`
+    void setup() { pinMode(5, OUTPUT); }
+    void loop() { analogWrite(5, map(60, 0, 100, 0, 255)); delay(10); }
+  `);
+  simulator.run();
+  simulator.advance(0);
+  assert.equal(simulator.getSnapshot().pins[5].pwmValue, 153);
+  assert.equal(simulator.getSnapshot().pins[5].digitalValue, 1);
+});
+
 test("supports named external inputs and stable subscription snapshots", () => {
   const simulator = new ArduinoSimulator(blinkSketch);
   const received: number[] = [];
@@ -305,6 +317,60 @@ test("powers a buzzer only while voltage is applied across its terminals", () =>
   assert.equal(isBuzzerCircuitPowered(binding, simulator.getSnapshot()), false);
 });
 
+test("silences buzzer activity while paused and restores it on resume", () => {
+  const project = createDefaultBlinkProject();
+  project.components = [
+    project.components.find((component) => component.type === "arduino-uno")!,
+    { id: "buzzer1", type: "buzzer", label: "Buzzer", x: 500, y: 250 },
+  ];
+  project.connections = [
+    { id: "wire-buzzer-positive", from: { componentId: "uno", pin: "D8" }, to: { componentId: "buzzer1", pin: "+" } },
+    { id: "wire-buzzer-ground", from: { componentId: "buzzer1", pin: "-" }, to: { componentId: "uno", pin: "GND" } },
+  ];
+  project.code = `
+    void setup() { pinMode(8, OUTPUT); }
+    void loop() {
+      digitalWrite(8, HIGH); delay(1000);
+      digitalWrite(8, LOW); delay(1000);
+    }
+  `;
+  const binding = resolveBuzzerCircuitBindings(project).get("buzzer1");
+  const simulator = new ArduinoSimulator(project.code);
+  simulator.run();
+  simulator.advance(0);
+
+  assert.equal(isBuzzerActive(binding, simulator.getSnapshot()), true);
+  simulator.pause();
+  assert.equal(isBuzzerCircuitPowered(binding, simulator.getSnapshot()), true, "pause preserves the last electrical output");
+  assert.equal(isBuzzerActive(binding, simulator.getSnapshot()), false, "paused simulation must not show an active buzzer");
+  simulator.run();
+  assert.equal(isBuzzerActive(binding, simulator.getSnapshot()), true, "resume restores activity from the continuing sketch");
+  simulator.reset();
+  assert.equal(isBuzzerActive(binding, simulator.getSnapshot()), false, "reset leaves the buzzer inactive");
+});
+
+test("stops tone-driven buzzer activity when simulation is paused", () => {
+  const project = createDefaultBlinkProject();
+  project.components = [
+    project.components.find((component) => component.type === "arduino-uno")!,
+    { id: "buzzer1", type: "buzzer", label: "Buzzer", x: 500, y: 250 },
+  ];
+  project.connections = [
+    { id: "wire-buzzer-positive", from: { componentId: "uno", pin: "D8" }, to: { componentId: "buzzer1", pin: "+" } },
+    { id: "wire-buzzer-ground", from: { componentId: "buzzer1", pin: "-" }, to: { componentId: "uno", pin: "GND" } },
+  ];
+  const binding = resolveBuzzerCircuitBindings(project).get("buzzer1");
+  const simulator = new ArduinoSimulator("void setup(){} void loop(){ tone(8, 1200); delay(1000); }");
+  simulator.attachProject(project);
+  simulator.run();
+  simulator.advance(0);
+
+  assert.equal(simulator.getSnapshot().tones.some((tone) => tone.active), true);
+  assert.equal(isBuzzerActive(binding, simulator.getSnapshot()), true);
+  simulator.pause();
+  assert.equal(isBuzzerActive(binding, simulator.getSnapshot()), false);
+});
+
 test("simulates smart-room sensor expressions, servo, LCD, tone, and bounded loops", () => {
   const simulator = new ArduinoSimulator(`
     #include <Servo.h>
@@ -367,6 +433,42 @@ function electricalProject(
 ): CircuitProject {
   return { schemaVersion: 1, id: "electrical-test", name: "Electrical test", description: "", board: "arduino-uno", code: "void setup(){} void loop(){}", components, connections };
 }
+
+test("legacy analog, motion, and ultrasonic sensors require real power and wired outputs", () => {
+  const project = electricalProject([
+    { id: "uno", type: "arduino-uno", label: "Uno", x: 0, y: 0 },
+    { id: "temperature", type: "temperature-sensor", label: "Temperature", x: 300, y: 0, properties: { temperatureC: 30 } },
+    { id: "pir", type: "pir-sensor", label: "Motion", x: 300, y: 160, properties: { motion: true } },
+    { id: "ultrasonic", type: "hc-sr04", label: "Distance", x: 300, y: 320, properties: { distanceCm: 42 } },
+  ], [
+    { id: "temp-power", from: { componentId: "uno", pin: "5V" }, to: { componentId: "temperature", pin: "VCC" } },
+    { id: "temp-ground", from: { componentId: "uno", pin: "GND" }, to: { componentId: "temperature", pin: "GND" } },
+    { id: "temp-output", from: { componentId: "temperature", pin: "OUT" }, to: { componentId: "uno", pin: "A0" } },
+    { id: "pir-power", from: { componentId: "uno", pin: "5V" }, to: { componentId: "pir", pin: "VCC" } },
+    { id: "pir-ground", from: { componentId: "uno", pin: "GND" }, to: { componentId: "pir", pin: "GND" } },
+    { id: "pir-output", from: { componentId: "pir", pin: "OUT" }, to: { componentId: "uno", pin: "D2" } },
+    { id: "ultrasonic-power", from: { componentId: "uno", pin: "5V" }, to: { componentId: "ultrasonic", pin: "VCC" } },
+    { id: "ultrasonic-ground", from: { componentId: "uno", pin: "GND" }, to: { componentId: "ultrasonic", pin: "GND" } },
+    { id: "ultrasonic-echo", from: { componentId: "ultrasonic", pin: "ECHO" }, to: { componentId: "uno", pin: "D4" } },
+  ]);
+  const simulator = new ArduinoSimulator("void setup(){} void loop(){delay(10);}");
+  simulator.attachProject(project); simulator.run(); simulator.advance(0);
+  const good = solveCircuit(project, simulator.getSnapshot());
+  assert.equal(good.componentStates.temperature.powered, true);
+  assert.equal(good.componentStates.temperature.readings?.temperatureC, 30);
+  assert.ok(Math.abs((good.analogInputs[14] ?? 0) - Math.round(0.8 / 5 * 1023)) <= 1);
+  assert.equal(good.componentStates.pir.level, "high");
+  assert.equal(good.digitalInputs[2], 1);
+  assert.equal(good.componentStates.ultrasonic.readings?.distanceCm, 42);
+
+  project.connections = project.connections.filter(wire => wire.id !== "temp-power" && wire.id !== "pir-ground" && wire.id !== "ultrasonic-power");
+  simulator.attachProject(project); simulator.run(); simulator.advance(0);
+  const unpowered = solveCircuit(project, simulator.getSnapshot());
+  for (const id of ["temperature", "pir", "ultrasonic"]) assert.equal(unpowered.componentStates[id].powered, false, id);
+  assert.equal(unpowered.digitalInputs[2], undefined);
+  assert.equal(unpowered.analogInputs[14], undefined);
+  assert.equal(simulator.getSnapshot().componentStates.temperature.readings?.temperatureC, undefined);
+});
 
 test("solves all powered logic-gate truth tables and feeds the result into Uno inputs", () => {
   const gateTypes = ["logic-and", "logic-or", "logic-xor", "logic-nand", "logic-nor", "logic-not"];

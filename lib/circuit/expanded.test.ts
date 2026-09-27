@@ -37,3 +37,13 @@ test("AI catalog retrieval includes only simulated parts and library discovery o
   const candidates = discoverLibraryCandidates({ libraries: [{ name: "LoRa", version: "1" }, { name: "LoRa", version: "2" }, { name: "Math" }] }, "lora");
   assert.equal(candidates.length, 1); assert.deepEqual(candidates[0].versions, ["1", "2"]); assert.equal(candidates[0].reviewStatus, "needs-hardware-review");
 });
+
+test("generic motor-driver requests retrieve one driver while explicit requests keep the named part", () => {
+  const generic = selectGenerationComponents("Build a room controller with a BME280, LCD, DC fan, and one motor driver", "simulation").map(part => part.id);
+  assert.equal(generic.filter(id => ["l293d", "tb6612fng", "drv8833", "l298"].includes(id)).length, 1);
+  assert.ok(generic.includes("l293d"));
+
+  const explicit = selectGenerationComponents("Build a room controller with a BME280, LCD, DC fan, and TB6612FNG motor driver", "simulation").map(part => part.id);
+  assert.ok(explicit.includes("tb6612fng"));
+  assert.equal(explicit.filter(id => ["l293d", "tb6612fng", "drv8833", "l298"].includes(id)).length, 1);
+});

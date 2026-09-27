@@ -680,11 +680,11 @@ function compileBody(
       }
       const pin = evaluateStatic(args[0], constants);
       const rawValue = evaluateStatic(args[1], constants);
-      if (pin === undefined || !isUnoPin(pin) || rawValue === undefined) {
+      if (pin === undefined || !isUnoPin(pin)) {
         diagnostics.push({
           severity: "error",
           code: "INVALID_ANALOG_WRITE",
-          message: `${callee} requires a valid Uno pin and a static numeric value.`,
+          message: `${callee} requires a valid Uno pin.`,
           line,
         });
         continue;
@@ -696,6 +696,10 @@ function compileBody(
           message: `${unoPinLabel(pin)} is not a PWM-capable Arduino Uno pin.`,
           line,
         });
+      }
+      if (rawValue === undefined) {
+        instructions.push({ kind: "analogWriteExpression", pin, expression: args[1].trim(), ...sourceInfo });
+        continue;
       }
       const value = Math.round(Math.min(255, Math.max(0, rawValue)));
       if (value !== rawValue) {

@@ -73,25 +73,79 @@ export function normalizeGroundReturns(project: CircuitProject): CircuitProject 
   return { ...project, components: [...project.components, ...additions], connections };
 }
 
-/** Tie disconnected, used L293D channels high so an existing motor circuit can run. */
-export function connectFloatingMotorDriverEnables(project: CircuitProject): CircuitProject {
+/** Tie active, unmanaged motor-driver standby/enable pins to a valid high rail. */
+export function connectFloatingMotorDriverEnables(
+  project: CircuitProject,
+  options: { preserveStandbyControl?: boolean } = {},
+): CircuitProject {
   const uno = project.components.find((component) => component.type === "arduino-uno");
-  if (!uno) return project;
-  const connections = [...project.connections];
+  const connections = project.connections.map((connection) => ({
+    ...connection,
+    from: { ...connection.from },
+    to: { ...connection.to },
+  }));
   const usedIds = new Set(connections.map((connection) => connection.id));
-  for (const driver of project.components.filter((component) => component.type === "l293d")) {
-    for (const [enable, outputs] of [["EN1", ["OUT1", "OUT2"]], ["EN2", ["OUT3", "OUT4"]]] as const) {
-      const connected = (pin: string) => connections.some(({ from, to }) =>
-        (from.componentId === driver.id && from.pin === pin) || (to.componentId === driver.id && to.pin === pin));
-      if (connected(enable) || !outputs.some(connected)) continue;
-      let id = `enable-${driver.id}-${enable}`;
-      let suffix = 2;
-      while (usedIds.has(id)) id = `enable-${driver.id}-${enable}-${suffix++}`;
-      usedIds.add(id);
-      connections.push({ id, from: { componentId: uno.id, pin: "5V" }, to: { componentId: driver.id, pin: enable }, color: "#f59e0b" });
+  let changed = false;
+  const preserveStandbyControl = options.preserveStandbyControl === true
+    || /\b(?:pinMode|digitalWrite|analogWrite)\s*\([^)]*\b(?:STBY|standby|nSLEEP)\w*\b/i.test(project.code);
+  const connected = (componentId: string, pin: string) => connections.some(({ from, to }) =>
+    (from.componentId === componentId && from.pin === pin) || (to.componentId === componentId && to.pin === pin));
+  const addConnection = (idBase: string, from: CircuitConnection["from"], to: CircuitConnection["to"]) => {
+    let id = idBase;
+    let suffix = 2;
+    while (usedIds.has(id)) id = `${idBase}-${suffix++}`;
+    usedIds.add(id);
+    connections.push({ id, from, to, color: "#f59e0b" });
+    changed = true;
+  };
+
+  for (const driver of project.components) {
+    if (driver.type === "l293d" && uno) {
+      for (const [enable, outputs] of [["EN1", ["OUT1", "OUT2"]], ["EN2", ["OUT3", "OUT4"]]] as const) {
+        if (connected(driver.id, enable) || !outputs.some((pin) => connected(driver.id, pin))) continue;
+        addConnection(`enable-${driver.id}-${enable}`, { componentId: uno.id, pin: "5V" }, { componentId: driver.id, pin: enable });
+      }
+    }
+
+    if (driver.type === "tb6612fng") {
+      const motorOutputs = ["AO1_1", "AO1_2", "AO2_5", "AO2_6", "BO1_11", "BO1_12", "BO2_7", "BO2_8"];
+      if (!motorOutputs.some((pin) => connected(driver.id, pin))) continue;
+      const logicSupply = connections.find(({ from, to }) =>
+        (from.componentId === driver.id && from.pin === "VCC") || (to.componentId === driver.id && to.pin === "VCC"));
+      if (!logicSupply) continue;
+      const supplyEndpoint = logicSupply.from.componentId === driver.id && logicSupply.from.pin === "VCC"
+        ? logicSupply.to
+        : logicSupply.from;
+      const standbyWire = connections.find(({ from, to }) =>
+        (from.componentId === driver.id && from.pin === "STBY") || (to.componentId === driver.id && to.pin === "STBY"));
+      if (!standbyWire) {
+        if (preserveStandbyControl) continue;
+        addConnection(`enable-${driver.id}-STBY`, supplyEndpoint, { componentId: driver.id, pin: "STBY" });
+        continue;
+      }
+
+      if (preserveStandbyControl) continue;
+
+      const standbyEndpoint = standbyWire.from.componentId === driver.id && standbyWire.from.pin === "STBY"
+        ? standbyWire.to
+        : standbyWire.from;
+      if (standbyEndpoint.componentId !== uno?.id) continue;
+      const pinMatch = standbyEndpoint.pin.match(/^(D|A)(\d+)$/);
+      if (!pinMatch) continue;
+      const codePin = Number(pinMatch[2]) + (pinMatch[1] === "A" ? 14 : 0);
+      const codeRefsPin = (pin: string, number: number) => new RegExp(`\\b(?:${pin}|${number})\\b`, "i").test(project.code);
+      if (codeRefsPin(standbyEndpoint.pin, codePin) || (pinMatch[1] === "A" && codeRefsPin(standbyEndpoint.pin, Number(pinMatch[2])))) continue;
+
+      // A TB6612 STBY wire ending at an unused MCU input is physically connected
+      // but electrically floating. Replace that endpoint with the known VCC net.
+      const wireIndex = connections.findIndex(({ id }) => id === standbyWire.id);
+      const repairedWire = connections[wireIndex];
+      if (repairedWire.from.componentId === driver.id && repairedWire.from.pin === "STBY") connections[wireIndex] = { ...repairedWire, to: supplyEndpoint };
+      else connections[wireIndex] = { ...repairedWire, from: supplyEndpoint };
+      changed = true;
     }
   }
-  return connections.length === project.connections.length ? project : { ...project, connections };
+  return changed ? { ...project, connections } : project;
 }
 
 /**

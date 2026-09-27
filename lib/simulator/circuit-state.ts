@@ -211,6 +211,19 @@ export function isBuzzerCircuitPowered(
     && binding.negativeBoardPins.some((pin) => boardPinLevel(pin, snapshot) === 0);
 }
 
+/** True only while a buzzer is powered or toned during active simulation. */
+export function isBuzzerActive(
+  binding: BuzzerCircuitBinding | undefined,
+  snapshot: SimulatorSnapshot,
+): boolean {
+  if (!binding || snapshot.status !== "running") return false;
+
+  const toneActive = snapshot.tones.some((tone) =>
+    tone.active && binding.positiveBoardPins.some((pin) => parseUnoPinLabel(pin) === tone.pin),
+  );
+  return toneActive || isBuzzerCircuitPowered(binding, snapshot);
+}
+
 export interface CircuitSolution {
   digitalInputs: Readonly<Record<number, 0 | 1>>;
   analogInputs: Readonly<Record<number, number>>;
@@ -256,6 +269,20 @@ export function solveCircuit(
       componentStates[id] = { type, powered: network.stable && !!result?.powered, channels: result?.outputs };
       if (!result?.powered) diagnostics.push({ severity: "warning", code: "component-unpowered", message: `${component.label}: connect its supply and ground pins.` });
       if (result?.missing.length) diagnostics.push({ severity: "warning", code: "floating-control", message: `${component.label}: undriven control or sense pins: ${[...new Set(result.missing)].join(", ")}.` });
+    } else if (["hc-sr04", "temperature-sensor", "pir-sensor"].includes(type)) {
+      const isPowered = network.stable && high(id, "VCC") && low(id, "GND");
+      if (type === "temperature-sensor") {
+        const temperature = Number(component.properties?.temperatureC ?? 24);
+        const output = isPowered ? reading(id, "OUT").value : undefined;
+        componentStates[id] = { type, powered: isPowered, ...(output === undefined ? {} : { analogValue: Math.round(output * 1023) }), readings: isPowered ? { temperatureC: temperature } : {} };
+      } else if (type === "pir-sensor") {
+        const motion = isPowered && component.properties?.motion === true;
+        componentStates[id] = { type, powered: isPowered, level: !isPowered ? "floating" : motion ? "high" : "low", readings: isPowered ? { motion: Number(motion) } : {} };
+      } else {
+        const distance = Number(component.properties?.distanceCm ?? 100);
+        componentStates[id] = { type, powered: isPowered, readings: isPowered ? { distanceCm: distance } : {} };
+      }
+      if (!isPowered) diagnostics.push({ severity: "warning", code: "component-unpowered", message: `${component.label}: connect its supply and ground pins.` });
     } else if (type === "led" || type === "buzzer") {
       const a = reading(id, type === "led" ? "A" : "+");
       const b = reading(id, type === "led" ? "K" : "-");
@@ -314,4 +341,30 @@ export function solveCircuit(
     analogInputs[pin.number] = Math.round(item.value * 1023);
   }));
   return { digitalInputs, analogInputs, componentStates, diagnostics };
+}
+
+/** Ignore motor-control floating warnings during sketch startup only when the
+ * reported pins are physically wired to Uno I/O that has not been configured yet. */
+export function isUninitializedMotorControlWarning(
+  project: CircuitProject,
+  snapshot: SimulatorSnapshot,
+  diagnostic: SimulatorDiagnostic,
+): boolean {
+  if (diagnostic.code !== "floating-control" || snapshot.phase !== "setup") return false;
+  const match = diagnostic.message.match(/^(.+?): undriven control or sense pins: (.+)\.$/);
+  if (!match) return false;
+  const driver = project.components.find(component => component.label === match[1]
+    && ["tb6612fng", "drv8833", "l298", "l293d"].includes(component.type));
+  if (!driver) return false;
+  const missingPins = match[2].split(",").map(pin => pin.trim()).filter(Boolean);
+  return missingPins.length > 0 && missingPins.every(pin => {
+    const wires = project.connections.filter(connection =>
+      [connection.from, connection.to].some(endpoint => endpoint.componentId === driver.id && endpoint.pin === pin));
+    return wires.length > 0 && wires.every(connection => {
+      const peer = connection.from.componentId === driver.id && connection.from.pin === pin ? connection.to : connection.from;
+      const peerComponent = project.components.find(component => component.id === peer.componentId);
+      const unoPin = parseUnoPinLabel(peer.pin);
+      return peerComponent?.type === "arduino-uno" && unoPin !== undefined && snapshot.pins[unoPin]?.mode === "INPUT";
+    });
+  });
 }

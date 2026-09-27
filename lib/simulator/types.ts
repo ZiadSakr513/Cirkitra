@@ -58,6 +58,11 @@ export type SketchInstruction =
       value: number;
     })
   | (InstructionSource & {
+      kind: "analogWriteExpression";
+      pin: number;
+      expression: string;
+    })
+  | (InstructionSource & {
       kind: "delay";
       durationMs: number;
     })

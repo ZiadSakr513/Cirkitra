@@ -800,8 +800,16 @@ const LEGACY_COMPONENTS = {
         min: 0,
         max: 100_000,
       },
+      currentAtFullDrive: {
+        label: "Estimated current at full drive",
+        kind: "number",
+        defaultValue: 0.2,
+        unit: "A",
+        min: 0,
+        max: 20,
+      },
     },
-    defaultProperties: { rpm: 6000 },
+    defaultProperties: { rpm: 6000, currentAtFullDrive: 0.2 },
   },
   l293d: {
     id: "l293d",

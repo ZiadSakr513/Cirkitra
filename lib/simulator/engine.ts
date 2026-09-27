@@ -1,5 +1,6 @@
 import { solveCircuit } from "./circuit-state.ts";
 import { DeviceRuntime, type DeviceValue } from "./devices.ts";
+import { deriveMotorSupplyLoads, type MotorSupplyLoad } from "./motor-loads.ts";
 import { deviceInstances, splitDeviceArguments, DEVICE_CONSTANTS } from "./device-api.ts";
 import type { CircuitProject } from "../circuit/types.ts";
 import { COMPONENT_CATALOG } from "../circuit/catalog.ts";
@@ -92,6 +93,7 @@ function freezeSnapshot(
 export class ArduinoSimulator {
   private devices?: DeviceRuntime;
   private project?: CircuitProject;
+  private motorLoads: readonly MotorSupplyLoad[] = [];
   private compiled: CompiledArduinoSketch;
   private status: SimulatorStatus = "idle";
   private phase: SimulatorPhase = "setup";
@@ -195,6 +197,7 @@ export class ArduinoSimulator {
     this.lcds.clear();
     this.tones.clear();
     this.componentStates = {};
+    this.motorLoads = [];
     this.devices?.reset(this.compiled.source);
     this.commit();
     return this.snapshot;
@@ -418,9 +421,19 @@ export class ArduinoSimulator {
   }
 
   private updateDevices() {
-    this.devices?.tick(this.timeMs, this.pins);
+    this.devices?.tick(this.timeMs, this.pins, this.motorLoads);
     if (!this.project || !this.devices || !this.snapshot) return;
-    const solution = solveCircuit(this.project, { ...this.snapshot, pins: this.pins, timeMs: this.timeMs, componentStates: this.devices.states, deviceDrives: this.devices.drives, deviceBridges: this.devices.bridges });
+    const project = this.project, devices = this.devices, snapshot = this.snapshot;
+    const solve = () => solveCircuit(project, { ...snapshot, pins: this.pins, timeMs: this.timeMs, componentStates: devices.states, deviceDrives: devices.drives, deviceBridges: devices.bridges });
+    let solution = solve();
+    const nextMotorLoads = deriveMotorSupplyLoads(project, solution.componentStates);
+    if (JSON.stringify(nextMotorLoads) !== JSON.stringify(this.motorLoads)) {
+      this.motorLoads = nextMotorLoads;
+      // Re-solve DC power at the same simulated instant so the supply meter
+      // and battery charge see motor demand immediately, without advancing time.
+      devices.tick(this.timeMs, this.pins, this.motorLoads);
+      solution = solve();
+    }
     for (const [number, value] of Object.entries(solution.digitalInputs)) if (this.pins[Number(number)]?.mode !== "OUTPUT") { this.pins[Number(number)].digitalValue = value; this.pins[Number(number)].pwmValue = value * 255; }
     for (const [number, value] of Object.entries(solution.analogInputs)) this.analogInputs.set(Number(number), value);
     this.componentStates = { ...solution.componentStates, ...this.devices.states };
@@ -577,17 +590,23 @@ export class ArduinoSimulator {
       return;
     }
 
+    const rawPwm = instruction.kind === "analogWrite"
+      ? instruction.value
+      : this.evaluate(instruction.expression);
+    const pwmValue = rawPwm === undefined || !Number.isFinite(rawPwm)
+      ? 0
+      : Math.round(Math.min(255, Math.max(0, rawPwm)));
     const digitalValue: DigitalLevel = UNO_PWM_PINS.has(instruction.pin)
-      ? instruction.value > 0
+      ? pwmValue > 0
         ? 1
         : 0
-      : instruction.value >= 128
+      : pwmValue >= 128
         ? 1
         : 0;
     const changed =
-      pin.digitalValue !== digitalValue || pin.pwmValue !== instruction.value;
+      pin.digitalValue !== digitalValue || pin.pwmValue !== pwmValue;
     pin.digitalValue = digitalValue;
-    pin.pwmValue = instruction.value;
+    pin.pwmValue = pwmValue;
     if (changed) pin.lastChangedAtMs = this.timeMs;
   }
 

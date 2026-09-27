@@ -153,7 +153,7 @@ function xbeeExample(): CircuitProject {
   p.components[1].properties = { apiMode: 2, baudRate: 9600, peerEnabled: true, panId: 4660, peerPanId: 4660, destination: "0013A20000000001" };
   rail("VCC", "3V3"); rail("GND", "GND"); rail("RESET", "5V"); rail("DIO8", "GND");
   wire("device", "DOUT", "uno", "D2"); wire("device", "DIN", "uno", "D3");
-  p.code = `#include <XBee.h>\n#include <SoftwareSerial.h>\nSoftwareSerial port(2,3); XBee radio; XBeeAddress64 address(0x0013a200,1); byte payload[2]={65,66}; ZBTxRequest request(address,payload,sizeof(payload)); ZBTxStatusResponse response; void setup(){ Serial.begin(9600); port.begin(9600); radio.setSerial(port); radio.begin(9600); delay(150); } void loop(){ radio.send(request); delay(20); radio.readPacket(); radio.getResponse().getZBTxStatusResponse(response); Serial.println(response.getDeliveryStatus()); delay(1000); }`;
+  p.code = `#include <XBee.h>\n#include <SoftwareSerial.h>\nSoftwareSerial port(2,3); XBee radio; XBeeAddress64 address(0x0013a200,1); byte payload[2]={65,66}; ZBTxRequest request(address,payload,sizeof(payload)); ZBTxStatusResponse response; void setup(){ Serial.begin(9600); port.begin(9600); radio.setSerial(port); radio.begin(9600); delay(150); } void loop(){ radio.send(request); delay(20); radio.readPacket(); if(radio.getResponse().isAvailable() && radio.getResponse().getApiId()==ZB_TX_STATUS_RESPONSE){ radio.getResponse().getZBTxStatusResponse(response); Serial.println(response.getDeliveryStatus()); } delay(1000); }`;
   return p;
 }
 function powerPrimitiveExample(type: "dc-supply" | "battery-cell" | "dc-load" | "ideal-mosfet"): CircuitProject {

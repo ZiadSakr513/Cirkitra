@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ArduinoSimulator, solveCircuit } from "./index.ts";
+import { ArduinoSimulator, isUninitializedMotorControlWarning, solveCircuit } from "./index.ts";
 import { connectFloatingMotorDriverEnables, createDefaultBlinkProject, type CircuitProject } from "../circuit/index.ts";
+import { COMPONENT_EXAMPLES } from "../circuit/component-examples.ts";
 import { motorDisplay } from "../schematic/motor-display.ts";
 
 function fixture() {
@@ -47,6 +48,46 @@ test("disabled, unpowered and disconnected motors coast instead of falsely runni
   }
 });
 
+test("running motors draw their configured simulated current from the motor supply", () => {
+  const { project, simulator } = fixture();
+  project.components.push({ id: "motor-supply", type: "dc-supply", label: "Motor supply", x: 0, y: 400, properties: { voltage: 9, enabled: true } });
+  project.components.find(component => component.id === "left")!.properties = { currentAtFullDrive: 0.4 };
+  project.components.find(component => component.id === "right")!.properties = { currentAtFullDrive: 0.2 };
+  project.connections = project.connections.filter(wire => !(wire.from.componentId === "uno" && wire.from.pin === "5V" && wire.to.componentId === "driver" && wire.to.pin === "VS"));
+  const wire = (from: string, pin: string, to: string, target: string) => project.connections.push({ id: `motor-power-${project.connections.length}`, from: { componentId: from, pin }, to: { componentId: to, pin: target } });
+  wire("motor-supply", "+", "driver", "VS"); wire("motor-supply", "-", "uno", "GND");
+  simulator.attachProject(project); simulator.run(); simulator.advance(0);
+  const supply = simulator.getSnapshot().componentStates["motor-supply"];
+  const expected = 0.4 * (191 / 255) + 0.2 * (128 / 255);
+  assert.ok(Math.abs((supply.readings?.current ?? 0) - expected) < 0.002, JSON.stringify(supply));
+  assert.equal(supply.readings?.voltage, 9);
+
+  simulator.load("void setup(){ pinMode(5,OUTPUT); pinMode(6,OUTPUT); analogWrite(5,0); analogWrite(6,0); } void loop(){ delay(100); }");
+  simulator.run(); simulator.advance(0);
+  assert.equal(simulator.getSnapshot().componentStates["motor-supply"].readings?.current, 0);
+});
+
+test("all expanded H-bridge families transfer active motor demand to their supply", () => {
+  const supplies = [
+    { type: "tb6612fng", pins: ["VM1", "VM2", "VM3"] },
+    { type: "drv8833", pins: ["VM"] },
+    { type: "l298", pins: ["VS"] },
+  ];
+  for (const { type: driverType, pins } of supplies) {
+    const project = COMPONENT_EXAMPLES[driverType]();
+    project.components.push({ id: "motor-supply", type: "dc-supply", label: "Motor supply", x: 0, y: 400, properties: { voltage: 9, enabled: true } });
+    project.connections = project.connections.filter(wire => !(wire.from.componentId === "device" && pins.includes(wire.from.pin)));
+    for (const pin of pins) project.connections.push({ id: `${driverType}-supply-${pin}`, from: { componentId: "motor-supply", pin: "+" }, to: { componentId: "device", pin } });
+    project.connections.push({ id: `${driverType}-return`, from: { componentId: "motor-supply", pin: "-" }, to: { componentId: "uno", pin: "GND" } });
+    const simulator = new ArduinoSimulator(project.code); simulator.attachProject(project); simulator.run(); simulator.advance(0);
+    const snapshot = simulator.getSnapshot();
+    const expected = ["motor-a", "motor-b"].reduce((sum, id) => sum + 0.2 * (snapshot.componentStates[id]?.speed ?? 0), 0);
+    assert.ok(expected > 0, `${driverType} example must run a motor`);
+    assert.ok(Math.abs((snapshot.componentStates["motor-supply"].readings?.current ?? 0) - expected) < 0.003, `${driverType}: ${JSON.stringify({ expected, supply: snapshot.componentStates["motor-supply"], diagnostics: snapshot.diagnostics })}`);
+    assert.deepEqual(snapshot.diagnostics.filter(diagnostic => diagnostic.severity === "error"), [], driverType);
+  }
+});
+
 test("one grounded L293D leg powers both motor channels but warns about physical wiring", () => {
   const {project, simulator} = fixture();
   project.connections = project.connections.filter(w =>
@@ -72,6 +113,23 @@ test("disconnected enable pins keep motors stopped until repaired", () => {
   const running = solveCircuit(repaired, simulator.getSnapshot());
   assert.equal(running.componentStates.left.direction, "forward");
   assert.equal(running.componentStates.right.direction, "reverse");
+});
+
+test("motor input warnings are hidden only until wired Arduino controls finish setup", () => {
+  const project = COMPONENT_EXAMPLES.tb6612fng();
+  const simulator = new ArduinoSimulator(project.code);
+  simulator.attachProject(project);
+  const startup = simulator.getSnapshot();
+  const warning = solveCircuit(project, startup).diagnostics.find(item => item.code === "floating-control");
+  assert.ok(warning);
+  assert.equal(isUninitializedMotorControlWarning(project, startup, warning), true);
+
+  const unconfigured = new ArduinoSimulator("void setup(){} void loop(){ delay(100); }");
+  unconfigured.attachProject(project); unconfigured.run(); unconfigured.advance(0);
+  const runningSnapshot = unconfigured.getSnapshot();
+  const persistentWarning = solveCircuit(project, runningSnapshot).diagnostics.find(item => item.code === "floating-control");
+  assert.ok(persistentWarning);
+  assert.equal(isUninitializedMotorControlWarning(project, runningSnapshot, persistentWarning), false);
 });
 
 test("equal driven terminals brake", () => {

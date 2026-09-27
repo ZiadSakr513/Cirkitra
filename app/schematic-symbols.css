@@ -372,6 +372,8 @@
 /* Quiet, crisp wires; a traced connection is the only bright path. */
 .wire-segment::before { box-shadow: 0 0 0 1px #091017; border-radius: 0; }
 .wire-route.highlighted { z-index: 5; }
+.wire-route.overlaid { z-index: 3; }
+.wire-route.overlaid .wire-segment::before { box-shadow: 0 0 0 2px #091017, 0 0 5px color-mix(in srgb, var(--wire-color) 65%, transparent); }
 .tracing-wire .wire-route:not(.highlighted) { opacity: .12; }
 .tracing-wire .schematic-component { opacity: .65; }
 .tracing-wire .schematic-component:has(.wire-highlighted) { opacity: 1; }

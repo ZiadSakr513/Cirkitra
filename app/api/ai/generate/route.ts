@@ -1,4 +1,5 @@
 import {
+  connectFloatingMotorDriverEnables,
   normalizeGroundReturns,
   COMPONENT_CATALOG as REGISTRY,
   simulationCapability,
@@ -14,10 +15,11 @@ import { DEVICE_APIS } from "../../../../lib/simulator/device-api.ts";
 
 type GenerationContext = { target: GenerationTarget; prompt: string; components: ReturnType<typeof selectGenerationComponents> };
 const WIRING_GUIDANCE: Record<string, string> = {
-  bme280: "For I2C: VDD, VDDIO and CSB to 3V3; both GND_1 and GND_7 to ground; SDO to ground for address 0x76; SDI=SDA and SCK=SCL. Wire these pins; properties are not power connections.",
+  bme280: "This is the bare BME280 chip, so it has no onboard I2C pull-ups. For I2C: VDD, VDDIO and CSB to 3V3; both GND_1 and GND_7 to ground; SDO to ground for address 0x76; SDI to Uno A4/SDA and SCK to Uno A5/SCL. Add TWO separate 4.7k ohm resistor components: one from the SDI/SDA net to 3V3 and one from the SCK/SCL net to 3V3. Do not use the user's 220 ohm LED resistor as a bus pull-up. Wire these pins; properties are not power connections.",
+  l293d: "For one small 5V motor, connect both VSS and VS to Arduino 5V, and connect GND1, GND2, GND3 and GND4 to common ground. Arduino VIN is an input, not a power output: never use VIN to supply VS. Connect motor channel A between OUT1 and OUT2; EN1 must go to a PWM pin or 5V, and IN1/IN2 to digital outputs. Hold unused channel B disabled with EN2, IN3 and IN4 low. For a motor requiring a separate supply, use a supported DC supply with its negative tied to common ground and its positive connected to VS.",
   tca9548a: "VCC and RESET high, GND grounded. Strap A0/A1/A2 low for 0x70. Upstream SDA and SCL each need a 4.7k pull-up to 3V3. Every used downstream channel needs its own 4.7k pull-up from SDn and SCn to 3V3. For two same-address BME280s, west SDI/SCK go to SD0/SC0 and east SDI/SCK to SD1/SC1; code must select channels 0 and 1 respectively before each begin/read. Never route the MCP23017 through a downstream channel.",
   mcp23017: "Use #include <Adafruit_MCP23X17.h> and Adafruit_MCP23X17 io; then io.begin_I2C(0x20). VDD and RESET high, VSS low, A0/A1/A2 low for 0x20. For a circuit with a TCA9548A, connect MCP SDA directly to the same upstream Uno A4/SDA net and MCP SCL to the same upstream Uno A5/SCL net; do NOT connect it to SDn/SCn. The shared upstream SDA and SCL each need a 4.7k pull-up to 3V3. GPA0..GPA7 map to GPIO 0..7; GPB0..GPB7 to 8..15.",
-  tb6612fng: "Connect VCC to logic supply, VM1/VM2/VM3 to motor supply, GND and all PGND pins to common ground. STBY must be wired to the pin actually used by code. Channel A motor connects between AO1_1 and AO2_5 (AO1_2 is another pad of AO1, NOT the opposite output). AIN1/AIN2 set direction and PWMA sets PWM. Drive all used control pins; tie unused controls low.",
+  tb6612fng: "Connect VCC to logic supply, VM1/VM2/VM3 to motor supply, GND and all PGND pins to common ground. If the sketch does not control standby, connect STBY to the same logic supply as VCC. If code controls standby, connect STBY to that configured digital output and drive it HIGH before enabling a motor. Channel A motor connects between AO1_1 and AO2_5 (AO1_2 is another pad of AO1, NOT the opposite output). AIN1/AIN2 set direction and PWMA sets PWM. Drive all used control pins; tie unused controls low.",
   "dc-supply": "Pins are literally + and -. Set properties.voltage as a number and properties.enabled as a boolean. Connect - to common ground and + to driver motor supply, never short different supply rails together.",
 };
 
@@ -226,6 +228,7 @@ VALIDATION RULES - THESE MUST BE FOLLOWED EXACTLY:
 - Arduino CODE RULES - Your code will be compiled and executed:
   * Must include EXACTLY "void setup()" and "void loop()" - these exact function signatures
   * Use these core Arduino functions plus the registered device adapter methods listed above: millis(), delay(), pinMode(), digitalRead(), digitalWrite(), analogRead(), analogWrite(), pulseIn(), map(), constrain(), isnan(), min(), max(), tone(), noTone(), Serial.begin(), Serial.print(), Serial.println()
+  * Uno schematic labels D0 through D13 correspond to integer code pins 0 through 13. In C++ use numeric pins (for example pinMode(6, OUTPUT), digitalWrite(6, HIGH), analogWrite(5, 153)); never write D6 or D5 as code identifiers.
   * For Servo: Include <Servo.h>, create Servo object, use .attach(), .write(), .read()
   * For LCD: Include <LiquidCrystal.h>, create LiquidCrystal object, use .begin(), .clear(), .setCursor(), .print(), .println()
   * NO custom helper functions, NO recursion, NO switch statements, NO unbounded while loops
@@ -235,6 +238,7 @@ VALIDATION RULES - THESE MUST BE FOLLOWED EXACTLY:
 - Fill every required field. Use null for properties that don't apply.
 - Emit concise ordinary decimal numbers. Do not use scientific notation or redundant zero padding. Only include property keys defined for that component; defaults may be omitted.
 - When the request says a fan or motor must stop if a sensor is missing, unpowered, disconnected, or unreadable, retain initialization results and check sensor readings with isnan() before using them. On failure, print a useful Serial message and explicitly set motor PWM to 0 and driver controls to a stopped state immediately; do not leave a previous motor output latched.
+- When the request uses a push button to switch, toggle, select, or change behavior, wire one button terminal to a digital input configured as INPUT_PULLUP and the other to GND. Read it as active-low and detect the HIGH-to-LOW press edge exactly once. If debouncing, track the raw reading separately from the stable button state and only update the stable state after the debounce interval; never overwrite the previous stable state on every sample before the edge is handled. Make the requested button action observable in the circuit.
 
 EXAMPLE CONNECTION (COPY THIS EXACT PATTERN):
 {
@@ -478,6 +482,39 @@ function sanitizeProperties(
   return Object.keys(result).length ? result : undefined;
 }
 
+function simulateButtonScenario(project: SharedCircuitProject, code: string, buttonId: string | undefined): ReturnType<ArduinoSimulator["getSnapshot"]>[] {
+  const scenario = structuredClone(project);
+  for (const component of scenario.components) {
+    if (component.type === "push-button") {
+      component.properties = { ...component.properties, pressed: component.id === buttonId };
+    }
+    if (component.properties && typeof component.properties.temperature === "number") {
+      // Exercise a typical threshold controller where a changed target should
+      // be visible in at least one output.
+      component.properties.temperature = 26;
+    }
+  }
+  const simulator = new ArduinoSimulator(code);
+  simulator.attachProject(scenario);
+  simulator.run();
+  const frames = [simulator.getSnapshot()];
+  for (let step = 0; step < 40; step += 1) frames.push(simulator.advance(100));
+  return frames;
+}
+
+function hasObservableButtonEffect(project: SharedCircuitProject, released: ReturnType<typeof simulateButtonScenario>, pressed: ReturnType<typeof simulateButtonScenario>): boolean {
+  const visibleState = (snapshot: ReturnType<ArduinoSimulator["getSnapshot"]>) => ({
+    outputPins: snapshot.pins.filter(pin => pin.mode === "OUTPUT").map(pin => [pin.number, pin.digitalValue, pin.pwmValue]),
+    lcds: snapshot.lcds.map(lcd => [lcd.instance, ...lcd.lines]),
+    serial: snapshot.serial.map(entry => entry.text),
+    devices: Object.fromEntries(Object.entries(snapshot.componentStates).filter(([id]) => {
+      const type = project.components.find(component => component.id === id)?.type;
+      return type !== "push-button" && type !== "arduino-uno";
+    })),
+  });
+  return released.some((frame, index) => JSON.stringify(visibleState(frame)) !== JSON.stringify(visibleState(pressed[index])));
+}
+
 function validateGeneratedEnvelope(value: unknown, context: GenerationContext): ValidationResult {
   const issues: string[] = [];
   if (!isRecord(value)) {
@@ -662,6 +699,13 @@ function validateGeneratedEnvelope(value: unknown, context: GenerationContext): 
   };
 
   if (!issues.length) {
+    envelope.project = connectFloatingMotorDriverEnables(
+      envelope.project as unknown as SharedCircuitProject,
+      { preserveStandbyControl: /\b(?:control|toggle|switch|drive|driven|manage|set)\b.{0,50}\b(?:STBY|standby|nSLEEP)\b|\b(?:STBY|standby|nSLEEP)\b.{0,50}\b(?:control|toggle|switch|drive|driven|manage|set)\b/i.test(context.prompt) },
+    ) as unknown as GeneratedEnvelope["project"];
+  }
+
+  if (!issues.length) {
     validatePartWiring(envelope.project as unknown as SharedCircuitProject).forEach(diagnostic => issues.push(`project.circuit ${diagnostic.code}: ${diagnostic.message}`));
   }
   if (!issues.length && code) {
@@ -670,9 +714,15 @@ function validateGeneratedEnvelope(value: unknown, context: GenerationContext): 
     simulator.attachProject(normalizedProject);
     simulator.run();
     simulator.advance(0);
-    const solution = solveCircuit(normalizedProject, simulator.getSnapshot());
-    const circuitDiagnostics = [...solution.diagnostics, ...simulator.getSnapshot().diagnostics]
+    const simulationSnapshots = [simulator.getSnapshot()];
+    for (let second = 0; second < 10; second += 1) simulationSnapshots.push(simulator.advance(1_000));
+    const simulationSolutions = simulationSnapshots.map((snapshot) => solveCircuit(normalizedProject, snapshot));
+    const circuitDiagnostics = [...new Map(simulationSnapshots.flatMap((snapshot, index) => [
+      ...simulationSolutions[index].diagnostics,
+      ...snapshot.diagnostics,
+    ]).map((diagnostic) => [`${diagnostic.code}:${diagnostic.message}`, diagnostic])).values()]
       .filter((diagnostic) => diagnostic.severity === "error" || ["motor-driver-enable-floating", "component-unpowered", "floating-control"].includes(diagnostic.code));
+    const solution = simulationSolutions.at(-1)!;
     circuitDiagnostics
       .slice(0, 8)
       .forEach((diagnostic) => issues.push(`project.circuit ${diagnostic.code}: ${diagnostic.message}`));
@@ -687,6 +737,19 @@ function validateGeneratedEnvelope(value: unknown, context: GenerationContext): 
         issues.push(`project.circuit: ${driver.label} needs the supplies and ground connections listed in its component definition before its motors can run.`);
       }
     });
+    const buttonActionRequested = /\bbutton\b.{0,80}\b(?:switch|toggle|select|change|cycle|adjust)\b|\b(?:switch|toggle|select|change|cycle|adjust)\b.{0,80}\bbutton\b/i.test(context.prompt);
+    if (buttonActionRequested && !issues.length) {
+      const buttons = normalizedProject.components.filter(component => component.type === "push-button");
+      const released = simulateButtonScenario(normalizedProject, code, undefined);
+      for (const button of buttons) {
+        const pressed = simulateButtonScenario(normalizedProject, code, button.id);
+        if (!hasObservableButtonEffect(normalizedProject, released, pressed)) {
+          issues.push(`project.code button behavior: pressing ${button.label} produces no observable circuit change. Wire it to a digital input using INPUT_PULLUP with its other terminal at GND, detect the active-low HIGH-to-LOW press edge once, and ensure the requested action changes an output or displayed/serial value.`);
+          break;
+        }
+      }
+      if (!buttons.length) issues.push("project.circuit button behavior: the request uses a button but the circuit contains no push-button component.");
+    }
     const failSafeRequested = /\b(?:unpowered|unavailable|disconnected|missing|unreadable|sensor failure)\b/i.test(context.prompt) && /\b(?:fan|motor)\b/i.test(context.prompt);
     const sensorDataPins: Record<string, string[]> = {
       bme280: ["SDI"], bmp280: ["SDI"], "sht31-dis": ["SDA"], "mpu-6050": ["SDA"],
@@ -802,10 +865,52 @@ function validationIssueCode(issue: string): string {
 }
 
 function logRecoveryFailure(stage: "initial" | "repair" | "regenerate" | "repair2" | "regenerate2" | "repair3" | "regenerate3", issues: string[]) {
-  console.warn("[ai-generation-recovery]", {
+  console.warn(`[ai-generation-recovery] ${JSON.stringify({
     stage,
     issueCodes: [...new Set(issues.map(validationIssueCode))].slice(0, 20),
-  });
+  })}`);
+}
+
+/** Convert schematic-style Uno labels in generated C++ to valid Arduino pin numbers. */
+function normalizeUnoDigitalPinNames(code: string): string {
+  let output = "";
+  let state: "code" | "line-comment" | "block-comment" | "string" | "char" = "code";
+  for (let index = 0; index < code.length;) {
+    const current = code[index];
+    const next = code[index + 1];
+    if (state === "line-comment") {
+      output += current;
+      index += 1;
+      if (current === "\n") state = "code";
+      continue;
+    }
+    if (state === "block-comment") {
+      output += current;
+      index += 1;
+      if (current === "*" && next === "/") { output += "/"; index += 1; state = "code"; }
+      continue;
+    }
+    if (state === "string" || state === "char") {
+      output += current;
+      index += 1;
+      if (current === "\\" && index < code.length) { output += code[index]; index += 1; }
+      else if ((state === "string" && current === '"') || (state === "char" && current === "'")) state = "code";
+      continue;
+    }
+    if (current === "/" && next === "/") { output += "//"; index += 2; state = "line-comment"; continue; }
+    if (current === "/" && next === "*") { output += "/*"; index += 2; state = "block-comment"; continue; }
+    if (current === '"') { output += current; index += 1; state = "string"; continue; }
+    if (current === "'") { output += current; index += 1; state = "char"; continue; }
+
+    const previous = output.at(-1);
+    const pin = (previous === undefined || !/[A-Za-z0-9_]/.test(previous))
+      ? /^D(1[0-3]|[0-9])\b/.exec(code.slice(index))
+      : null;
+    if (pin) { output += pin[1]; index += pin[0].length; continue; }
+    output += current;
+    index += 1;
+  }
+  return output;
 }
 
 // Auto-correct common pin name mistakes
@@ -965,6 +1070,10 @@ async function generateAttempt(options: {
     parsed = parseModelJson(content);
   } catch {
     return { kind: "invalid", content, issues: ["response invalid_json"] };
+  }
+
+  if (isRecord(parsed) && isRecord(parsed.project) && typeof parsed.project.code === "string") {
+    parsed.project.code = normalizeUnoDigitalPinNames(parsed.project.code);
   }
 
   const validated = validateGeneratedEnvelope(parsed, options.context);

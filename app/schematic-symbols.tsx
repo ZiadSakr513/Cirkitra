@@ -463,7 +463,7 @@ export function SchematicSymbol({
     case "hc-sr04":
       return <UltrasonicSymbol powered={powered} />;
     case "pir-sensor":
-      return <PirSymbol powered={powered} motion={properties.motion === true} />;
+      return <PirSymbol powered={powered} motion={powered && properties.motion === true} />;
     case "temperature-sensor":
       return <TemperatureSymbol powered={powered} temperature={numericProperty(properties, "temperatureC", 24, -40, 125)} />;
     default:

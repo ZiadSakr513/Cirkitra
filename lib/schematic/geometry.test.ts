@@ -282,7 +282,7 @@ test("27 crossed signals keep independent lanes and reserve future pin leads", (
   const routes = coordinatedWireRoutes(wires, components);
   assert.deepEqual(routes, coordinatedWireRoutes(wires, components));
   for (const [index, route] of routes.entries()) {
-    assert.equal(route.blocked, undefined);
+    assert.equal(route.overlaid, undefined);
     assert.deepEqual(route.segments[0].from, wires[index].from.point);
     assert.deepEqual(route.segments.at(-1)!.to, wires[index].to.point);
     for (let segmentIndex = 1; segmentIndex < route.segments.length; segmentIndex++) {
@@ -311,12 +311,23 @@ test("27 crossed signals keep independent lanes and reserve future pin leads", (
   }
 });
 
-test("blocked layouts report a labelled connection instead of a false path through a body", () => {
+test("overlapping parts do not hide a complete wire from connected pins", () => {
   const [route] = coordinatedWireRoutes([{
-    id: "blocked",
-    from: { point: { x: 30, y: 40 }, side: "right" },
-    to: { point: { x: 400, y: 40 }, side: "left" },
-  }], [{ type: "arduino-uno", x: 0, y: 0 }]);
-  assert.equal(route.blocked, true);
-  assert.equal(route.segments.length, 2);
+    id: "crowded",
+    from: { point: { x: 320, y: 175 }, side: "right" },
+    to: { point: { x: 600, y: 175 }, side: "left" },
+  }], [
+    { type: "arduino-uno", x: 0, y: 0 },
+    { type: "unknown-symbol", x: 600, y: 135 },
+    { type: "unknown-symbol", x: 330, y: 130 },
+  ]);
+  assert.equal(route.overlaid, true);
+  assert.ok(route.segments.length >= 3);
+  assert.deepEqual(route.segments[0].from, { x: 320, y: 175 });
+  assert.deepEqual(route.segments.at(-1)?.to, { x: 600, y: 175 });
+  for (let index = 0; index < route.segments.length; index += 1) {
+    const segment = route.segments[index];
+    assert.ok(segment.from.x === segment.to.x || segment.from.y === segment.to.y);
+    if (index > 0) assert.deepEqual(route.segments[index - 1].to, segment.from);
+  }
 });

@@ -42,6 +42,70 @@ test("published runnable examples pass the generation endpoint without repair", 
   });
 });
 
+test("normalizes schematic-style D pin names in generated Arduino code", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = structuredClone(generatedEnvelope.project);
+  project.code = `// D12 in a comment stays text\n#define LED_PIN D13\nvoid setup(){ pinMode(LED_PIN, OUTPUT); }\nvoid loop(){ digitalWrite(LED_PIN, HIGH); Serial.println("D11 stays text"); delay(10); }`;
+  globalThis.fetch = async () => modelResponse(JSON.stringify({ project, explanation: "Blink circuit", assumptions: [], warnings: [] }));
+
+  const response = await POST(generationRequest());
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.match(body.project.code, /#define LED_PIN 13/);
+  assert.match(body.project.code, /\/\/ D12 in a comment stays text/);
+  assert.match(body.project.code, /Serial\.println\("D11 stays text"\)/);
+});
+
+test("generation repairs a button debounce sketch that never changes the circuit", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = createDefaultBlinkProject();
+  project.name = "Button controlled LED";
+  project.components.push({ id: "button", type: "push-button", label: "Button", x: 420, y: 360 });
+  project.connections.push(
+    { id: "button-input", from: { componentId: "button", pin: "1" }, to: { componentId: "uno", pin: "D2" } },
+    { id: "button-ground", from: { componentId: "button", pin: "2" }, to: { componentId: "uno", pin: "GND" } },
+  );
+  const broken = structuredClone(project);
+  broken.code = `bool lastButtonState = HIGH; unsigned long lastDebounceTime = 0; unsigned long debounceDelay = 50;
+void setup(){ pinMode(13, OUTPUT); pinMode(2, INPUT_PULLUP); }
+void loop(){ int reading = digitalRead(2); if (reading != lastButtonState) lastDebounceTime = millis(); if ((millis() - lastDebounceTime) > debounceDelay) { if (reading == LOW && lastButtonState == HIGH) digitalWrite(13, HIGH); } lastButtonState = reading; delay(10); }`;
+  const repaired = structuredClone(project);
+  repaired.code = `int lastButtonState = HIGH; bool ledOn = false;
+void setup(){ pinMode(13, OUTPUT); pinMode(2, INPUT_PULLUP); }
+void loop(){ int reading = digitalRead(2); if (reading == LOW && lastButtonState == HIGH) { ledOn = true; } lastButtonState = reading; digitalWrite(13, ledOn ? HIGH : LOW); delay(10); }`;
+  let calls = 0;
+  let repairIssues: string[] = [];
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    repairIssues = content.validationIssues ?? [];
+    return modelResponse(JSON.stringify({ project: content.validationIssues ? repaired : broken, explanation: "Button controlled LED", warnings: [], assumptions: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: "Use the push button to toggle the LED." }),
+  }));
+  assert.equal(response.status, 200, JSON.stringify(repairIssues));
+  assert.equal(calls, 2);
+  assert.ok(repairIssues.some(issue => issue.includes("button behavior") && issue.includes("no observable circuit change")));
+});
+
 test("greenhouse mux, expander and externally supplied fan respond to live conditions", () => {
   const project = greenhouseExample();
   const sim = new ArduinoSimulator(project.code); sim.attachProject(project); sim.run(); sim.advance(100);
@@ -49,17 +113,21 @@ test("greenhouse mux, expander and externally supplied fan respond to live condi
   const states = sim.getSnapshot().componentStates;
   assert.equal(states["fan-motor-a"].direction, "forward");
   assert.ok(Math.abs(states["fan-motor-a"].speed! - 191 / 255) < 0.001);
+  assert.ok(Math.abs((states["fan-supply"].readings?.current ?? 0) - 0.2 * (191 / 255)) < 0.002, JSON.stringify(states["fan-supply"]));
   for (const id of ["io-led", "led-1", "led-2"]) assert.equal(states[id].powered, true);
   project.components.find(c => c.id === "sensor")!.properties!.temperature = 24;
   project.components.find(c => c.id === "east")!.properties!.temperature = 26;
   sim.attachProject(project); sim.advance(500);
   assert.equal(sim.getSnapshot().componentStates["fan-motor-a"].speed, 0);
+  assert.equal(sim.getSnapshot().componentStates["fan-supply"].readings?.current, 0);
   project.components.find(c => c.id === "sensor")!.properties!.temperature = 34;
   sim.attachProject(project); sim.advance(500);
   assert.ok(sim.getSnapshot().componentStates["fan-motor-a"].speed! > 0);
+  assert.ok((sim.getSnapshot().componentStates["fan-supply"].readings?.current ?? 0) > 0.14);
   project.components.find(c => c.id === "fan-supply")!.properties!.enabled = false;
   sim.attachProject(project); sim.advance(500);
   assert.equal(sim.getSnapshot().componentStates["fan-motor-a"].direction, "coast");
+  assert.equal(sim.getSnapshot().componentStates["fan-supply"].readings?.current, 0);
   project.components.find(c => c.id === "fan-supply")!.properties!.enabled = true;
   project.connections = project.connections.filter(w => !(w.from.componentId === "fan-supply" && w.from.pin === "-"));
   sim.attachProject(project); sim.advance(500);
@@ -90,6 +158,133 @@ test("generation still rejects a sensor with missing mandatory power", async con
   const response = await POST(new Request("http://localhost/api/ai/generate", { method: "POST", body: JSON.stringify({ prompt: "Create a BME280 circuit" }) }));
   assert.equal(response.status, 502);
   assert.ok(issues.some(issue => issue.includes("component-unpowered")));
+});
+
+test("generation repairs a TB6612FNG with a disconnected STBY pin before publication", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = COMPONENT_EXAMPLES.tb6612fng();
+  project.connections = project.connections.filter((connection) =>
+    ![connection.from, connection.to].some((endpoint) => endpoint.componentId === "device" && endpoint.pin === "STBY"));
+  let calls = 0;
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    const input = JSON.parse(request.contents[0].parts[0].text);
+    if (input.validationIssues) assert.fail(`unexpected repair attempt: ${JSON.stringify(input.validationIssues)}`);
+    return modelResponse(JSON.stringify({ project, explanation: "TB6612 motor driver", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", body: JSON.stringify({ prompt: "Create a TB6612FNG motor driver circuit" }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(calls, 1, "a safe disconnected standby fix should not spend an AI repair attempt");
+  assert.ok(body.project.connections.some((connection: { from: { componentId: string; pin: string }; to: { componentId: string; pin: string } }) =>
+    [connection.from, connection.to].some((endpoint) => endpoint.componentId === "device" && endpoint.pin === "STBY")));
+});
+
+test("generation reroutes an undriven TB6612 standby wire from an unused Uno pin", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = COMPONENT_EXAMPLES.tb6612fng();
+  const standbyWire = project.connections.find((connection) =>
+    [connection.from, connection.to].some((endpoint) => endpoint.componentId === "device" && endpoint.pin === "STBY"));
+  assert.ok(standbyWire);
+  if (standbyWire.from.componentId === "device" && standbyWire.from.pin === "STBY") standbyWire.to = { componentId: "uno", pin: "D7" };
+  else standbyWire.from = { componentId: "uno", pin: "D7" };
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return modelResponse(JSON.stringify({ project, explanation: "TB6612 motor driver", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", body: JSON.stringify({ prompt: "Create a TB6612FNG motor driver circuit" }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(calls, 1, "the unused MCU input should be replaced before preflight");
+  const vccWire = body.project.connections.find((connection: { from: { componentId: string; pin: string }; to: { componentId: string; pin: string } }) =>
+    [connection.from, connection.to].some((endpoint) => endpoint.componentId === "device" && endpoint.pin === "VCC"));
+  const fixedStandbyWire = body.project.connections.find((connection: { from: { componentId: string; pin: string }; to: { componentId: string; pin: string } }) =>
+    [connection.from, connection.to].some((endpoint) => endpoint.componentId === "device" && endpoint.pin === "STBY"));
+  assert.ok(vccWire && fixedStandbyWire);
+  const vccPeer = vccWire.from.componentId === "device" && vccWire.from.pin === "VCC" ? vccWire.to : vccWire.from;
+  const standbyPeer = fixedStandbyWire.from.componentId === "device" && fixedStandbyWire.from.pin === "STBY" ? fixedStandbyWire.to : fixedStandbyWire.from;
+  assert.deepEqual(standbyPeer, vccPeer);
+});
+
+test("generation repairs an undriven TB6612 standby pin connected through a floating net", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const repairedProject = COMPONENT_EXAMPLES.tb6612fng();
+  const invalidProject = structuredClone(repairedProject);
+  const standby = invalidProject.connections.find((connection) =>
+    [connection.from, connection.to].some((endpoint) => endpoint.componentId === "device" && endpoint.pin === "STBY"));
+  assert.ok(standby);
+  invalidProject.components.push({ id: "floating", type: "resistor", label: "Floating standby net", x: 0, y: 0 });
+  if (standby.from.componentId === "device" && standby.from.pin === "STBY") standby.to = { componentId: "floating", pin: "1" };
+  else standby.from = { componentId: "floating", pin: "1" };
+  invalidProject.connections.push({ id: "floating-tail", from: { componentId: "floating", pin: "2" }, to: { componentId: "uno", pin: "D7" } });
+
+  let calls = 0;
+  let repairIssues: string[] = [];
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    const input = JSON.parse(request.contents[0].parts[0].text);
+    repairIssues = input.validationIssues ?? [];
+    const project = input.validationIssues ? repairedProject : invalidProject;
+    return modelResponse(JSON.stringify({ project, explanation: "TB6612 motor driver", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", body: JSON.stringify({ prompt: "Create a TB6612FNG motor driver circuit" }),
+  }));
+  assert.equal(response.status, 200);
+  assert.equal(calls, 2, "the floating-control diagnostic must trigger a repair attempt");
+  assert.ok(repairIssues.some((issue) => issue.includes("floating-control") && issue.includes("STBY")));
+});
+
+test("generation rejects motor controls that stay undriven after sketch startup", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const invalidProject = COMPONENT_EXAMPLES.tb6612fng();
+  invalidProject.code = "void setup(){} void loop(){ delay(100); }";
+  const repairedProject = COMPONENT_EXAMPLES.tb6612fng();
+  let calls = 0; let repairIssues: string[] = [];
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    const input = JSON.parse(request.contents[0].parts[0].text);
+    repairIssues = input.validationIssues ?? [];
+    return modelResponse(JSON.stringify({ project: input.validationIssues ? repairedProject : invalidProject, explanation: "TB6612 motor driver", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", body: JSON.stringify({ prompt: "Create a TB6612FNG motor driver circuit" }),
+  }));
+  assert.equal(response.status, 200);
+  assert.equal(calls, 2, "unresolved motor controls must be repaired before generation succeeds");
+  assert.ok(repairIssues.some(issue => issue.includes("floating-control") && issue.includes("PWMA")));
 });
 
 const generatedEnvelope = {
@@ -255,7 +450,7 @@ test("forwards only the default and selected Gemini models", async (context) => 
     const headers = new Headers(request.init?.headers);
     const body = JSON.parse(String(request.init?.body));
     assert.equal(headers.get("x-goog-api-key"), "test-secret");
-    assert.equal(body.generationConfig.maxOutputTokens, 65_536);
+    assert.equal(body.generationConfig.maxOutputTokens, 32_768);
     assert.equal(body.generationConfig.responseMimeType, "application/json");
     assert.equal(body.generationConfig.responseSchema.type, "object");
     assert.ok(body.generationConfig.responseSchema.properties.project);

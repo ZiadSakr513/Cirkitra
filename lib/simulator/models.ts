@@ -102,6 +102,20 @@ const decoder: ElectricalModel = { evaluate(c) {
   for (let index = 0; index < 8; index++) r.outputs[`Y${index}`] = enabled && index === selected ? 0 : 1;
   return r;
 } };
+const analogTemperatureSensor: ElectricalModel = { evaluate(c) {
+  const r = result(c, ["VCC"], ["GND"]);
+  if (r.powered) {
+    const temperature = Number(c.component.properties?.temperatureC ?? 24);
+    const volts = 0.5 + (Number.isFinite(temperature) ? temperature : 24) / 100;
+    r.outputs.OUT = Math.max(0, Math.min(1, volts / 5));
+  }
+  return r;
+} };
+const pirSensor: ElectricalModel = { evaluate(c) {
+  const r = result(c, ["VCC"], ["GND"]);
+  if (r.powered) r.outputs.OUT = Number(c.component.properties?.motion === true);
+  return r;
+} };
 function gate(operation: (a: boolean, b: boolean) => boolean, unary = false): ElectricalModel {
   return { evaluate(c) {
     const r = result(c, ["VCC"], ["GND"]);
@@ -114,6 +128,7 @@ function gate(operation: (a: boolean, b: boolean) => boolean, unary = false): El
 export const ELECTRICAL_MODELS: Readonly<Record<string, ElectricalModel>> = {
   "mux-4067": mux(16, "I", ["GND"]), "mux-4051": mux(8, "A", ["GND", "VEE"]),
   "decoder-138": decoder, "driver-tb6612": tb6612, "driver-drv8833": drv8833, "driver-l298": l298, l293d,
+  "temperature-sensor": analogTemperatureSensor, "pir-sensor": pirSensor,
   "logic-and": gate((a, b) => a && b), "logic-or": gate((a, b) => a || b), "logic-xor": gate((a, b) => a !== b),
   "logic-nand": gate((a, b) => !(a && b)), "logic-nor": gate((a, b) => !(a || b)), "logic-not": gate(a => !a, true),
   potentiometer: { evaluate(c) {
