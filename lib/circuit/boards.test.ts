@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BOARD_IDS, BOARD_PROFILES, isBoardAnalogPin, isBoardDigitalOutputPin, isBoardPin, isBoardPwmPin, resolveBoardPin } from "./boards.ts";
+import { BOARD_COMPONENTS, BOARD_IDS, BOARD_PROFILES, isBoardAnalogPin, isBoardDigitalOutputPin, isBoardPin, isBoardPwmPin, resolveBoardPin } from "./boards.ts";
 import { compileArduinoSketch } from "../simulator/parser.ts";
 
 test("the supported board profiles cover the existing Uno and five named boards", () => {
@@ -30,6 +30,31 @@ test("ESP profiles map silkscreen pins, reserve flash pins, and enforce input-on
   assert.equal(resolveBoardPin("esp8266-nodemcu-v1", "D1"), 5);
   assert.equal(resolveBoardPin("esp8266-nodemcu-v1", "D5"), 14);
   assert.equal(resolveBoardPin("esp8266-nodemcu-v1", "A0"), 17);
+});
+
+test("registered board terminals all sit on side headers, not floating top or bottom rows", () => {
+  for (const boardId of BOARD_IDS.filter(id => id !== "arduino-uno")) {
+    const component = BOARD_COMPONENTS[boardId];
+    assert.ok(component, `${boardId} has a catalog definition`);
+    assert.ok(component.pins.length > 0, `${boardId} exposes connector pins`);
+    for (const pin of component.pins) {
+      assert.ok(pin.side === "left" || pin.side === "right", `${boardId}.${pin.id} is on a side header, got ${pin.side}`);
+    }
+    const expected = [
+      ...BOARD_PROFILES[boardId].ioPins.filter(pin => pin.runtimePin >= 0 && !pin.onboard).map(pin => pin.id),
+      ...Object.keys(BOARD_PROFILES[boardId].rails),
+      ...BOARD_PROFILES[boardId].groundPins,
+    ].sort();
+    assert.deepEqual(component.pins.map(pin => pin.id).sort(), expected, `${boardId} keeps every pin ID exactly once`);
+  }
+});
+
+test("ESP32 DevKitC power and ground pins occupy their documented J2 and J3 header positions", () => {
+  const pins = BOARD_COMPONENTS["esp32-devkitc-v4"].pins;
+  const row = (side: "left" | "right") => pins.filter(pin => pin.side === side).sort((a, b) => a.order - b.order).map(pin => pin.id);
+  assert.deepEqual(row("left"), ["3V3", "GPIO36", "GPIO39", "GPIO34", "GPIO35", "GPIO32", "GPIO33", "GPIO25", "GPIO26", "GPIO27", "GPIO14", "GPIO12", "GND", "GPIO13", "GPIO9", "GPIO10", "GPIO11", "5V"]);
+  assert.deepEqual(row("right"), ["GND2", "GPIO23", "GPIO22", "GPIO1", "GPIO3", "GPIO21", "GND3", "GPIO19", "GPIO18", "GPIO5", "GPIO17", "GPIO16", "GPIO4", "GPIO0", "GPIO2", "GPIO15", "GPIO8", "GPIO7", "GPIO6"]);
+  assert.equal(new Set(pins.map(pin => pin.id)).size, pins.length, "all electrical endpoints remain uniquely addressable");
 });
 
 test("Pico exposes only header GPIOs plus its onboard LED and ADC pins", () => {

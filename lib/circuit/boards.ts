@@ -202,16 +202,47 @@ function ioPinDefinition(pin: BoardIoPin, index: number, side: "left" | "right")
   return { id: pin.id, label: pin.label, direction: pin.reserved ? "passive" : pin.inputOnly ? "input" : "bidirectional", signals: pin.reserved ? [] : pin.signals ?? ["digital"], side, order: index, noConnect: pin.reserved };
 }
 
-function boardDefinition(profile: BoardProfile): ComponentDefinition {
+type BoardHeaderRows = { left: string[]; right: string[] };
+
+/** Physical J2/J3 row order for the registered ESP32-DevKitC V4, viewed from above with USB at the top. */
+const ESP32_DEVKITC_HEADER_ROWS: BoardHeaderRows = {
+  left: ["3V3", "GPIO36", "GPIO39", "GPIO34", "GPIO35", "GPIO32", "GPIO33", "GPIO25", "GPIO26", "GPIO27", "GPIO14", "GPIO12", "GND", "GPIO13", "GPIO9", "GPIO10", "GPIO11", "5V"],
+  right: ["GND2", "GPIO23", "GPIO22", "GPIO1", "GPIO3", "GPIO21", "GND3", "GPIO19", "GPIO18", "GPIO5", "GPIO17", "GPIO16", "GPIO4", "GPIO0", "GPIO2", "GPIO15", "GPIO8", "GPIO7", "GPIO6"],
+};
+
+function boardHeaderRows(profile: BoardProfile): BoardHeaderRows {
+  if (profile.id === "esp32-devkitc-v4") {
+    return { left: [...ESP32_DEVKITC_HEADER_ROWS.left], right: [...ESP32_DEVKITC_HEADER_ROWS.right] };
+  }
+
   const physicalIo = profile.ioPins.filter(pin => pin.runtimePin >= 0 && !pin.onboard);
   const half = Math.ceil(physicalIo.length / 2);
-  const pinDefinitions = physicalIo.map((pin, index) => ioPinDefinition(pin, index < half ? index : index - half, index < half ? "left" : "right"));
-  const power = [
-    ...Object.entries(profile.rails).map(([id]) => ({ id, label: id, direction: "power" as const, signals: ["power"] as const, side: "top" as const, order: 0 })),
-    ...profile.groundPins.map((id, index) => ({ id, label: "GND", direction: "power" as const, signals: ["ground"] as const, side: "bottom" as const, order: index })),
-  ];
-  const ioHalf = Math.max(physicalIo.length / 2, 1);
-  const height = Math.max(240, Math.ceil(ioHalf) * 19 + 82);
+  const rows: BoardHeaderRows = {
+    left: physicalIo.slice(0, half).map(pin => pin.id),
+    right: physicalIo.slice(half).map(pin => pin.id),
+  };
+  // Keep supply and ground terminals on the board's two edge headers instead
+  // of drawing fictitious connector rows above and below the board artwork.
+  for (const id of [...Object.keys(profile.rails), ...profile.groundPins]) {
+    const row = rows.left.length <= rows.right.length ? rows.left : rows.right;
+    row.push(id);
+  }
+  return rows;
+}
+
+function boardDefinition(profile: BoardProfile): ComponentDefinition {
+  const physicalIo = profile.ioPins.filter(pin => pin.runtimePin >= 0 && !pin.onboard);
+  const headerRows = boardHeaderRows(profile);
+  const ioById = new Map(physicalIo.map(pin => [pin.id, pin]));
+  const powerById = new Map<string, Pick<ComponentPinDefinition, "id" | "label" | "direction" | "signals">>();
+  for (const id of Object.keys(profile.rails)) powerById.set(id, { id, label: id, direction: "power", signals: ["power"] });
+  for (const id of profile.groundPins) powerById.set(id, { id, label: "GND", direction: "power", signals: ["ground"] });
+  const pinsForRow = (ids: readonly string[], side: "left" | "right") => ids.map((id, order) => {
+    const ioPin = ioById.get(id);
+    return ioPin ? ioPinDefinition(ioPin, order, side) : { ...powerById.get(id)!, side, order };
+  });
+  const pinDefinitions = [...pinsForRow(headerRows.left, "left"), ...pinsForRow(headerRows.right, "right")];
+  const height = Math.max(240, Math.max(headerRows.left.length, headerRows.right.length) * 19 + 82);
   const width = profile.id === "arduino-mega-2560" ? 340 : profile.id.includes("esp") ? 230 : 270;
   const properties: Record<string, ComponentPropertyDefinition> = profile.id.startsWith("esp") ? {
     networkSsid: { kind: "string", label: "Virtual Wi-Fi network", defaultValue: "CirkitraNet" },
@@ -226,7 +257,7 @@ function boardDefinition(profile: BoardProfile): ComponentDefinition {
     id: profile.id, displayName: profile.displayName, category: "boards",
     description: `${profile.variant} development board with ${profile.mcu} simulation profile.`,
     width, height, accent: "#0f9d9a", simulated: true,
-    pins: [...pinDefinitions, ...power], properties, defaultProperties: Object.fromEntries(Object.entries(properties).map(([key, property]) => [key, property.defaultValue])), symbol: "module",
+    pins: pinDefinitions, properties, defaultProperties: Object.fromEntries(Object.entries(properties).map(([key, property]) => [key, property.defaultValue])), symbol: "module",
     simulation: { capability: "simulated", model: `board-profile:${profile.id}`, behavior: `Board-specific GPIO, ADC, PWM, UART, I2C, and SPI profile at ${profile.logicVoltage}V logic.`, limitations: "Only the documented browser-simulator API subset executes; the model is not a cycle-accurate MCU or electrical analog analysis." },
     metadata: {
       manufacturer: profile.manufacturer, variant: profile.variant, kind: "module", aliases: [profile.mcu], interfaces: ["GPIO", "ADC", "PWM", "UART", "I2C", "SPI", ...(profile.id.startsWith("esp") ? ["Wi-Fi"] : [])],
