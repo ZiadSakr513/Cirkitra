@@ -3,7 +3,7 @@ import { CircuitStudio } from "../studio";
 
 export const metadata: Metadata = {
   title: "Circuit Workbench",
-  description: "Build, edit, and simulate Arduino circuits with Cirkitra.",
+  description: "Build, edit, and simulate circuits for supported microcontroller boards with Cirkitra.",
   robots: { index: false, follow: true },
   alternates: { canonical: "/studio" },
 };
