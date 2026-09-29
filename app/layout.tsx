@@ -16,6 +16,9 @@ export const metadata: Metadata = {
   },
   description,
   applicationName: title,
+  verification: {
+    google: "2UUPcb4kjCjUl59CceQ00moJzJQG6Kx319xbkPZUbco",
+  },
   keywords: [
     "microcontroller circuit simulator",
     "AI circuit design",
