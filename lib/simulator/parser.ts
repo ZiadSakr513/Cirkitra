@@ -1,5 +1,5 @@
 import { deviceInstances, DEVICE_CONSTANTS } from "./device-api.ts";
-import { isUnoPin, UNO_PWM_PINS, unoPinLabel } from "./pins.ts";
+import { boardApiConstants, boardPinLabel, getBoardProfile, isBoardDigitalOutputPin, isBoardDigitalPin, isBoardPwmPin } from "../circuit/boards.ts";
 import { validateLibraryCalls } from "./libraries.ts";
 import type {
   CompiledArduinoSketch,
@@ -11,6 +11,7 @@ import type {
 interface FunctionBody {
   body: string;
   startIndex: number;
+  parameters?: string[];
 }
 
 interface Statement {
@@ -110,10 +111,11 @@ function findClosingBrace(source: string, openingBrace: number): number | undefi
 
 function extractFunction(
   source: string,
-  name: "setup" | "loop",
+  name: string,
   diagnostics: SimulatorDiagnostic[],
 ): FunctionBody | undefined {
-  const matcher = new RegExp(`\\bvoid\\s+${name}\\s*\\(\\s*\\)\\s*\\{`, "m");
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const matcher = new RegExp(`\\bvoid\\s+${escapedName}\\s*\\(([^)]*)\\)\\s*\\{`, "m");
   const match = matcher.exec(source);
   if (!match) return undefined;
 
@@ -132,6 +134,7 @@ function extractFunction(
   return {
     body: source.slice(openingBrace + 1, closingBrace),
     startIndex: openingBrace + 1,
+    parameters: (match[1] ?? "").split(",").map(parameter => parameter.trim().split(/\s+/).at(-1) ?? "").filter(parameter => /^[A-Za-z_]\w*$/.test(parameter)),
   };
 }
 
@@ -464,7 +467,7 @@ function evaluateStatic(
   return result !== undefined && Number.isFinite(result) ? result : undefined;
 }
 
-function defaultConstants(): Map<string, number> {
+function defaultConstants(boardId = "arduino-uno"): Map<string, number> {
   const constants = new Map<string, number>([
     ["LOW", 0],
     ["HIGH", 1],
@@ -472,14 +475,12 @@ function defaultConstants(): Map<string, number> {
     ["true", 1],
     ["LED_BUILTIN", 13],
   ]);
-  for (let analog = 0; analog < 6; analog += 1) {
-    constants.set(`A${analog}`, 14 + analog);
-  }
+  Object.entries(boardApiConstants(boardId)).forEach(([name, value]) => constants.set(name, value));
   return constants;
 }
 
-function collectConstants(source: string): Map<string, number> {
-  const constants = defaultConstants();
+function collectConstants(source: string, boardId = "arduino-uno"): Map<string, number> {
+  const constants = defaultConstants(boardId);
   const pending: Array<[string, string]> = [];
 
   for (const match of source.matchAll(/^\s*#define\s+([A-Za-z_]\w*)\s+([^\r\n]+)/gm)) {
@@ -551,6 +552,32 @@ function printValue(
   return number === undefined ? undefined : String(number);
 }
 
+function staticPrintValue(
+  expression: string,
+  constants: ReadonlyMap<string, number>,
+  source: string,
+  boardId: string,
+): string | undefined {
+  const trimmed = expression.trim();
+  const literal = decodeStringLiteral(trimmed);
+  if (literal !== undefined) return literal;
+
+  const tokens = tokenizeExpression(trimmed);
+  if (!tokens) return undefined;
+
+  // `collectConstants` also contains initial values for mutable globals so
+  // other compile-time contexts can resolve pin declarations. Those values
+  // must not be baked into Serial output: a variable can change while the
+  // sketch runs. Only preprocessor and built-in constants are safe to fold.
+  const staticNames = new Set([
+    ...defaultConstants(boardId).keys(),
+    ...Object.keys(DEVICE_CONSTANTS),
+    ...[...source.matchAll(/^\s*#define\s+([A-Za-z_]\w*)\b/gm)].map(match => match[1]),
+  ]);
+  if (tokens.some(token => token.type === "identifier" && !staticNames.has(token.value))) return undefined;
+  return printValue(trimmed, constants);
+}
+
 function addArgumentError(
   diagnostics: SimulatorDiagnostic[],
   line: number,
@@ -570,6 +597,7 @@ function compileBody(
   body: FunctionBody | undefined,
   constants: ReadonlyMap<string, number>,
   diagnostics: SimulatorDiagnostic[],
+  boardId = "arduino-uno",
 ): SketchInstruction[] {
   if (!body) return [];
 
@@ -627,11 +655,11 @@ function compileBody(
         rawMode === "INPUT" || rawMode === "OUTPUT" || rawMode === "INPUT_PULLUP"
           ? rawMode
           : undefined;
-      if (pin === undefined || !isUnoPin(pin) || !mode) {
+      if (pin === undefined || !mode || (mode === "INPUT" ? !isBoardDigitalPin(boardId, pin) : !isBoardDigitalOutputPin(boardId, pin))) {
         diagnostics.push({
           severity: "error",
           code: "INVALID_PIN_MODE",
-          message: `${callee} requires a valid Uno pin and INPUT, OUTPUT, or INPUT_PULLUP.`,
+          message: `${callee} requires a valid ${boardId} pin and INPUT, OUTPUT, or INPUT_PULLUP; output modes cannot use input-only pins.`,
           line,
         });
         continue;
@@ -647,11 +675,11 @@ function compileBody(
       }
       const pin = evaluateStatic(args[0], constants);
       const value = evaluateStatic(args[1], constants);
-      if (pin === undefined || !isUnoPin(pin)) {
+      if (pin === undefined || !isBoardDigitalOutputPin(boardId, pin)) {
         diagnostics.push({
           severity: "error",
           code: "INVALID_DIGITAL_WRITE",
-          message: `${callee} requires a valid Uno pin and HIGH/LOW (or 1/0).`,
+          message: `${callee} requires an output-capable ${boardId} pin and HIGH/LOW (or 1/0).`,
           line,
         });
         continue;
@@ -680,20 +708,20 @@ function compileBody(
       }
       const pin = evaluateStatic(args[0], constants);
       const rawValue = evaluateStatic(args[1], constants);
-      if (pin === undefined || !isUnoPin(pin)) {
+      if (pin === undefined || !isBoardDigitalOutputPin(boardId, pin)) {
         diagnostics.push({
           severity: "error",
           code: "INVALID_ANALOG_WRITE",
-          message: `${callee} requires a valid Uno pin.`,
+          message: `${callee} requires an output-capable ${boardId} pin.`,
           line,
         });
         continue;
       }
-      if (!UNO_PWM_PINS.has(pin)) {
+      if (!isBoardPwmPin(boardId, pin)) {
         diagnostics.push({
           severity: "warning",
           code: "NON_PWM_PIN",
-          message: `${unoPinLabel(pin)} is not a PWM-capable Arduino Uno pin.`,
+          message: `${boardPinLabel(boardId, pin)} is not a PWM-capable ${boardId} pin.`,
           line,
         });
       }
@@ -729,22 +757,10 @@ function compileBody(
     }
 
     if (callee === "Serial.println" || callee === "Serial.print") {
-      const value = args.length <= 1 ? printValue(args[0] ?? "", constants) : undefined;
-      if (value === undefined) {
-        diagnostics.push({
-          severity: "warning",
-          code: "DYNAMIC_SERIAL_VALUE",
-          message: `${callee} currently supports strings, characters, and static numeric expressions.`,
-          line,
-        });
-        continue;
-      }
-      instructions.push({
-        kind: "serialPrint",
-        value,
-        newline: callee === "Serial.println",
-        ...sourceInfo,
-      });
+      const value = args.length <= 1 ? staticPrintValue(args[0] ?? "", constants, source, boardId) : undefined;
+      if (value !== undefined) instructions.push({ kind: "serialPrint", value, newline: callee === "Serial.println", ...sourceInfo });
+      else if (args.length <= 1) instructions.push({ kind: "serialExpression", expression: args[0] ?? "", newline: callee === "Serial.println", ...sourceInfo });
+      else addArgumentError(diagnostics, line, callee, "zero or one value");
       continue;
     }
 
@@ -764,6 +780,7 @@ function compileExecutableBody(
   body: FunctionBody | undefined,
   constants: ReadonlyMap<string, number>,
   diagnostics: SimulatorDiagnostic[],
+  boardId = "arduino-uno",
 ): SketchInstruction[] {
   if (!body) return [];
   const instructions: SketchInstruction[] = [];
@@ -783,27 +800,53 @@ function compileExecutableBody(
     }
     return undefined;
   };
-  const conditionalEnd = (start: number): number | undefined => {
-    if (!/^if\b/.test(text.slice(start))) return undefined;
-    const openParen = skipWhitespace(start + 2);
-    if (text[openParen] !== "(") return undefined;
-    const closeParen = matching(openParen, "(", ")");
-    if (closeParen === undefined) return undefined;
-    const openBrace = skipWhitespace(closeParen + 1);
-    if (text[openBrace] !== "{") return undefined;
-    const closeBrace = matching(openBrace, "{", "}");
-    if (closeBrace === undefined) return undefined;
-    const afterThen = skipWhitespace(closeBrace + 1);
-    if (!/^else\b/.test(text.slice(afterThen))) return closeBrace + 1;
-    const elseStart = skipWhitespace(afterThen + 4);
-    if (/^if\b/.test(text.slice(elseStart))) return conditionalEnd(elseStart);
-    if (text[elseStart] !== "{") return elseStart;
-    const elseClose = matching(elseStart, "{", "}");
-    return elseClose === undefined ? undefined : elseClose + 1;
+  const findStatementEnd = (start: number, limit = text.length): number | undefined => {
+    const statementStart = skipWhitespace(start);
+    if (statementStart >= limit) return undefined;
+    if (text[statementStart] === "{") {
+      const close = matching(statementStart, "{", "}");
+      return close === undefined || close >= limit ? undefined : close + 1;
+    }
+    if (/^if\b/.test(text.slice(statementStart))) {
+      const openParen = skipWhitespace(statementStart + 2);
+      if (text[openParen] !== "(") return undefined;
+      const closeParen = matching(openParen, "(", ")");
+      if (closeParen === undefined) return undefined;
+      const thenEnd = findStatementEnd(skipWhitespace(closeParen + 1), limit);
+      if (thenEnd === undefined) return undefined;
+      const afterThen = skipWhitespace(thenEnd);
+      if (!/^else\b/.test(text.slice(afterThen))) return thenEnd;
+      return findStatementEnd(skipWhitespace(afterThen + 4), limit);
+    }
+    let parentheses = 0;
+    let brackets = 0;
+    let quote = "";
+    for (let cursor = statementStart; cursor < limit; cursor += 1) {
+      const character = text[cursor];
+      if (quote) {
+        if (character === "\\") cursor += 1;
+        else if (character === quote) quote = "";
+        continue;
+      }
+      if (character === "\"" || character === "'") { quote = character; continue; }
+      if (character === "(") parentheses += 1;
+      else if (character === ")") parentheses -= 1;
+      else if (character === "[") brackets += 1;
+      else if (character === "]") brackets -= 1;
+      else if (character === ";" && parentheses === 0 && brackets === 0) return cursor + 1;
+    }
+    return undefined;
+  };
+  const compileStatement = (start: number, end: number) => {
+    const statementStart = skipWhitespace(start);
+    if (text[statementStart] === "{") compileRange(statementStart + 1, end - 1);
+    else compileRange(statementStart, end);
   };
   const compileSimple = (statement: string, localStart: number) => {
     const trimmed = statement.trim().replace(/\b([A-Za-z_]\w*)\.getResponse\(\)/g, "$1__response");
     const sourceInfo = { line: lineAt(source, body.startIndex + localStart), source: trimmed };
+    const sdFileOpen = /^File\s+([A-Za-z_]\w*)\s*=\s*SD\.open\(([^,]+),\s*([^)]*)\)\s*;$/.exec(trimmed);
+    if (sdFileOpen) { instructions.push({ kind: "fileOpen", name: sdFileOpen[1], path: sdFileOpen[2].trim(), mode: sdFileOpen[3].trim(), ...sourceInfo }); return; }
     if (/^return\s*;$/.test(trimmed)) {
       const jump = { kind: "jump" as const, target: 0, ...sourceInfo };
       functionReturns.push(jump); instructions.push(jump); return;
@@ -841,7 +884,7 @@ function compileExecutableBody(
         addArgumentError(diagnostics, sourceInfo.line, `${instance}.${method}`, "well-formed arguments");
         return;
       }
-      const adapter = deviceInstances(source).get(instance)?.api;
+      const adapter = deviceInstances(source, boardId).get(instance)?.api;
       if (adapter) {
         const arity = adapter.methods[method];
         if (!arity || args.length < arity[0] || args.length > arity[1]) addArgumentError(diagnostics, sourceInfo.line, `${instance}.${method}`, arity ? `${arity[0]}..${arity[1]} arguments` : "a registered method");
@@ -849,13 +892,13 @@ function compileExecutableBody(
         return;
       }
       if (instance === "Serial" && (method === "print" || method === "println") && args.length >= 1) {
-        const staticValue = printValue(args[0], constants);
+        const staticValue = staticPrintValue(args[0], constants, source, boardId);
         if (staticValue !== undefined) instructions.push({ kind: "serialPrint", value: staticValue, newline: method === "println", ...sourceInfo });
         else instructions.push({ kind: "serialExpression", expression: args[0], newline: method === "println", ...sourceInfo }); return;
       }
       if (instance === "Serial" && method === "begin") return;
       if (instance === "Serial" && (method === "print" || method === "println") && args.length >= 1) {
-        const value = printValue(args[0], constants);
+        const value = staticPrintValue(args[0], constants, source, boardId);
         if (value !== undefined) instructions.push({ kind: "serialPrint", value, newline: method === "println", ...sourceInfo });
         else diagnostics.push({ severity: "warning", code: "DYNAMIC_SERIAL_VALUE", message: `Serial.${method} currently supports strings and static numeric expressions.`, line: sourceInfo.line });
       }
@@ -884,7 +927,7 @@ function compileExecutableBody(
       } else addArgumentError(diagnostics, sourceInfo.line, toneCall[1], toneCall[1] === "tone" ? "a pin and frequency" : "a pin");
       return;
     }
-    const compiled = compileBody(source, { body: trimmed, startIndex: body.startIndex + localStart }, constants, diagnostics);
+    const compiled = compileBody(source, { body: trimmed, startIndex: body.startIndex + localStart }, constants, diagnostics, boardId);
     instructions.push(...compiled);
   };
 
@@ -898,10 +941,12 @@ function compileExecutableBody(
         if (text[openParen] !== "(") break;
         const closeParen = matching(openParen, "(", ")");
         if (closeParen === undefined) break;
-        const openBrace = skipWhitespace(closeParen + 1);
-        if (text[openBrace] !== "{") break;
-        const closeBrace = matching(openBrace, "{", "}");
-        if (closeBrace === undefined) break;
+        const statementStart = skipWhitespace(closeParen + 1);
+        const statementEnd = findStatementEnd(statementStart, rangeEnd);
+        if (statementEnd === undefined) {
+          diagnostics.push({ severity: "error", code: "INVALID_CONTROL_FLOW", message: `${isFor ? "for" : "while"} requires a supported statement or block.`, line: lineAt(source, body.startIndex + cursor) });
+          break;
+        }
         let condition = text.slice(openParen + 1, closeParen).trim();
         let increment = "";
         if (isFor) {
@@ -917,11 +962,11 @@ function compileExecutableBody(
         const loopStart = instructions.length;
         const jumpIfIndex = instructions.length;
         instructions.push({ kind: "jumpIfFalse", expression: condition, target: 0, line: lineAt(source, body.startIndex + cursor), source: `${isFor ? "for" : "while"} (${condition})` });
-        compileRange(openBrace + 1, closeBrace);
-        if (increment) compileSimple(`${increment};`, closeBrace);
-        instructions.push({ kind: "jump", target: loopStart, line: lineAt(source, body.startIndex + closeBrace), source: "loop" });
+        compileStatement(statementStart, statementEnd);
+        if (increment) compileSimple(`${increment};`, statementEnd);
+        instructions.push({ kind: "jump", target: loopStart, line: lineAt(source, body.startIndex + statementEnd), source: "loop" });
         (instructions[jumpIfIndex] as Extract<SketchInstruction, { kind: "jumpIfFalse" }>).target = instructions.length;
-        cursor = closeBrace + 1;
+        cursor = statementEnd;
         continue;
       }
       if (/^if\b/.test(text.slice(cursor))) {
@@ -929,31 +974,29 @@ function compileExecutableBody(
         if (text[openParen] !== "(") break;
         const closeParen = matching(openParen, "(", ")");
         if (closeParen === undefined) break;
-        const openBrace = skipWhitespace(closeParen + 1);
-        if (text[openBrace] !== "{") break;
-        const closeBrace = matching(openBrace, "{", "}");
-        if (closeBrace === undefined) break;
+        const statementStart = skipWhitespace(closeParen + 1);
+        const thenEnd = findStatementEnd(statementStart, rangeEnd);
+        if (thenEnd === undefined) {
+          diagnostics.push({ severity: "error", code: "INVALID_CONTROL_FLOW", message: "if requires a supported statement or block.", line: lineAt(source, body.startIndex + cursor) });
+          break;
+        }
         const condition = text.slice(openParen + 1, closeParen).trim();
         const jumpIfIndex = instructions.length;
         instructions.push({ kind: "jumpIfFalse", expression: condition, target: 0, line: lineAt(source, body.startIndex + cursor), source: `if (${condition})` });
-        compileRange(openBrace + 1, closeBrace);
-        let next = skipWhitespace(closeBrace + 1);
+        compileStatement(statementStart, thenEnd);
+        let next = skipWhitespace(thenEnd);
         if (/^else\b/.test(text.slice(next))) {
           const jumpIndex = instructions.length;
           instructions.push({ kind: "jump", target: 0, line: lineAt(source, body.startIndex + next), source: "else" });
           (instructions[jumpIfIndex] as Extract<SketchInstruction, { kind: "jumpIfFalse" }>).target = instructions.length;
-          const elseBrace = skipWhitespace(next + 4);
-          if (text[elseBrace] === "{") {
-            const elseClose = matching(elseBrace, "{", "}");
-            if (elseClose === undefined) break;
-            compileRange(elseBrace + 1, elseClose);
-            next = elseClose + 1;
-          } else if (/^if\b/.test(text.slice(elseBrace))) {
-            const elseIfEnd = conditionalEnd(elseBrace);
-            if (elseIfEnd === undefined) break;
-            compileRange(elseBrace, elseIfEnd);
-            next = elseIfEnd;
+          const elseStart = skipWhitespace(next + 4);
+          const elseEnd = findStatementEnd(elseStart, rangeEnd);
+          if (elseEnd === undefined) {
+            diagnostics.push({ severity: "error", code: "INVALID_CONTROL_FLOW", message: "else requires a supported statement or block.", line: lineAt(source, body.startIndex + next) });
+            break;
           }
+          compileStatement(elseStart, elseEnd);
+          next = elseEnd;
           (instructions[jumpIndex] as Extract<SketchInstruction, { kind: "jump" }>).target = instructions.length;
         } else {
           (instructions[jumpIfIndex] as Extract<SketchInstruction, { kind: "jumpIfFalse" }>).target = instructions.length;
@@ -972,11 +1015,15 @@ function compileExecutableBody(
   return instructions;
 }
 
-function collectGlobalVariables(source: string): Record<string, number> {
+function collectGlobalVariables(source: string, boardId = "arduino-uno"): Record<string, number> {
   const globals: Record<string, number> = {};
   const setupIndex = source.search(/\bvoid\s+setup\s*\(/);
   const prefix = setupIndex >= 0 ? source.slice(0, setupIndex) : source;
-  const constants = defaultConstants();
+  const constants = defaultConstants(boardId);
+  for (const match of prefix.matchAll(/^\s*#define\s+([A-Za-z_]\w*)\s+([^\r\n]+)/gm)) {
+    const value = evaluateStatic(match[2].trim(), new Map([...constants, ...Object.entries(globals)]));
+    if (value !== undefined) { globals[match[1]] = value; constants.set(match[1], value); }
+  }
   for (const match of prefix.matchAll(/\b(?:unsigned\s+)?(?:int|long|short|byte|uint8_t|uint16_t|size_t|bool|float|double)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g)) {
     const value = evaluateStatic(match[2], new Map([...constants, ...Object.entries(globals)]));
     if (value !== undefined) globals[match[1]] = value;
@@ -989,14 +1036,31 @@ function collectGlobalVariables(source: string): Record<string, number> {
  * browser simulator. Unsupported statements produce diagnostics rather than
  * executing arbitrary JavaScript.
  */
-export function compileArduinoSketch(source: string): CompiledArduinoSketch {
+export function compileArduinoSketch(source: string, boardId = "arduino-uno"): CompiledArduinoSketch {
   const diagnostics: SimulatorDiagnostic[] = [];
   const masked = maskComments(source);
-  diagnostics.push(...validateLibraryCalls(masked));
-  const constants = collectConstants(masked);
+  diagnostics.push(...validateLibraryCalls(masked, boardId));
+  const uartCount = getBoardProfile(boardId)?.uart.length ?? 1;
+  for (const match of masked.matchAll(/\bSerial([1-3])\s*\./g)) {
+    const port = Number(match[1]);
+    if (port >= uartCount) diagnostics.push({ severity: "error", code: "UART_PORT_UNAVAILABLE", line: lineAt(source, match.index ?? 0), message: `Serial${port} is not available on ${boardId}; its profile exposes ${uartCount} hardware UART port${uartCount === 1 ? "" : "s"}.` });
+  }
+  const constants = collectConstants(masked, boardId);
   Object.entries(DEVICE_CONSTANTS).forEach(([key, value]) => constants.set(key, value));
   const setupBody = extractFunction(masked, "setup", diagnostics);
   const loopBody = extractFunction(masked, "loop", diagnostics);
+  const callbacks: { onReceive?: ReadonlyArray<SketchInstruction>; onRequest?: ReadonlyArray<SketchInstruction>; receiveParameter?: string } = {};
+  for (const kind of ["onReceive", "onRequest"] as const) {
+    const callbackName = new RegExp(`\\bWire\\s*\\.\\s*${kind}\\s*\\(\\s*([A-Za-z_]\\w*)\\s*\\)`).exec(masked)?.[1];
+    if (!callbackName) continue;
+    const callbackBody = extractFunction(masked, callbackName, diagnostics);
+    if (!callbackBody) {
+      diagnostics.push({ severity: "error", code: "I2C_CALLBACK_MISSING", message: `Wire.${kind}() refers to ${callbackName}, but that void function is not defined.` });
+      continue;
+    }
+    callbacks[kind] = compileExecutableBody(masked, callbackBody, constants, diagnostics, boardId);
+    if (kind === "onReceive") callbacks.receiveParameter = callbackBody.parameters?.[0];
+  }
 
   if (!loopBody) {
     diagnostics.push({
@@ -1006,14 +1070,15 @@ export function compileArduinoSketch(source: string): CompiledArduinoSketch {
     });
   }
 
-  const setup = compileExecutableBody(masked, setupBody, constants, diagnostics);
-  const loop = compileExecutableBody(masked, loopBody, constants, diagnostics);
+  const setup = compileExecutableBody(masked, setupBody, constants, diagnostics, boardId);
+  const loop = compileExecutableBody(masked, loopBody, constants, diagnostics, boardId);
 
   return {
     source,
     setup,
     loop,
-    globals: collectGlobalVariables(masked),
+    globals: collectGlobalVariables(masked, boardId),
+    ...(Object.keys(callbacks).length ? { i2cCallbacks: callbacks } : {}),
     diagnostics,
     valid: !diagnostics.some((diagnostic) => diagnostic.severity === "error"),
   };

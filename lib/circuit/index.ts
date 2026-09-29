@@ -1,4 +1,6 @@
 export * from "./types.ts";
+export * from "./boards.ts";
+export * from "./board-programs.ts";
 export * from "./catalog.ts";
 export * from "./schema.ts";
 export * from "./diagnostics.ts";

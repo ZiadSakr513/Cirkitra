@@ -7,18 +7,28 @@ import { solveNetwork } from "./network.ts";
 import { STATEFUL_MODEL_REGISTRY } from "./stateful-models.ts";
 import { POWER_MODEL_REGISTRY } from "./power-models.ts";
 import { validatePartWiring } from "../circuit/electrical-metadata.ts";
-import { parseUnoPinLabel } from "./pins.ts";
+import { resolveBoardPin, getBoardProfile, isBoardType } from "../circuit/boards.ts";
 import type { SimulatorSnapshot } from "./types.ts";
 import type { SimulatedComponentState, SimulatorDiagnostic } from "./types.ts";
 
 export interface LedCircuitBinding {
   anodeBoardPins: ReadonlyArray<string>;
   cathodeBoardPins: ReadonlyArray<string>;
+  anodeEndpoints?: ReadonlyArray<ResolvedBoardPin>;
+  cathodeEndpoints?: ReadonlyArray<ResolvedBoardPin>;
 }
 
 export interface BuzzerCircuitBinding {
   positiveBoardPins: ReadonlyArray<string>;
   negativeBoardPins: ReadonlyArray<string>;
+  positiveEndpoints?: ReadonlyArray<ResolvedBoardPin>;
+  negativeEndpoints?: ReadonlyArray<ResolvedBoardPin>;
+}
+
+export interface ResolvedBoardPin {
+  boardId: string;
+  componentId: string;
+  pin: string;
 }
 
 type ElectricalGraph = {
@@ -26,8 +36,6 @@ type ElectricalGraph = {
   endpoints: Map<string, ConnectionEndpoint>;
   componentTypes: Map<string, string>;
 };
-
-const UNO_HIGH_SUPPLY_PINS = new Set(["5V", "3V3", "IOREF"]);
 
 function endpointKey(endpoint: ConnectionEndpoint) {
   return `${endpoint.componentId}\u0000${endpoint.pin}`;
@@ -80,14 +88,11 @@ function buildElectricalGraph(project: CircuitProject): ElectricalGraph {
   return graph;
 }
 
-function reachableBoardPins(
-  graph: ElectricalGraph,
-  start: ConnectionEndpoint,
-): string[] {
+function reachableBoardPinEndpoints(graph: ElectricalGraph, start: ConnectionEndpoint): ResolvedBoardPin[] {
   const startKey = registerEndpoint(graph, start);
   const queue = [startKey];
   const visited = new Set<string>();
-  const boardPins = new Set<string>();
+  const boardPins = new Map<string, ResolvedBoardPin>();
 
   while (queue.length > 0) {
     const key = queue.shift();
@@ -98,12 +103,9 @@ function reachableBoardPins(
     if (!endpoint) continue;
     const componentType = graph.componentTypes.get(endpoint.componentId);
     if (componentType === "ground") {
-      boardPins.add("GND");
-      continue;
-    }
-    if (componentType === "arduino-uno") {
-      boardPins.add(endpoint.pin);
-      continue;
+      boardPins.set(`ground:${endpoint.componentId}:GND`, { boardId: "ground", componentId: endpoint.componentId, pin: "GND" });
+    } else if (componentType && isBoardType(componentType)) {
+      boardPins.set(`${componentType}:${endpoint.componentId}:${endpoint.pin}`, { boardId: componentType, componentId: endpoint.componentId, pin: endpoint.pin });
     }
 
     graph.adjacency.get(key)?.forEach((neighbor) => {
@@ -111,7 +113,11 @@ function reachableBoardPins(
     });
   }
 
-  return [...boardPins].sort();
+  return [...boardPins.values()].sort((a, b) => a.boardId.localeCompare(b.boardId) || a.componentId.localeCompare(b.componentId) || a.pin.localeCompare(b.pin));
+}
+
+function reachableBoardPins(graph: ElectricalGraph, start: ConnectionEndpoint): string[] {
+  return [...new Set(reachableBoardPinEndpoints(graph, start).map(endpoint => endpoint.boardId === "ground" ? "GND" : endpoint.pin))].sort();
 }
 
 /** Resolve any component pin through wires/passive parts to Arduino pins or rails. */
@@ -123,15 +129,20 @@ export function resolveComponentBoardPins(
   return reachableBoardPins(buildElectricalGraph(project), { componentId, pin });
 }
 
+/** Resolve wiring while retaining which physical board pin each net reaches. */
+export function resolveComponentBoardPinEndpoints(project: CircuitProject, componentId: string, pin: string): ReadonlyArray<ResolvedBoardPin> {
+  return reachableBoardPinEndpoints(buildElectricalGraph(project), { componentId, pin });
+}
+
 /** Resolve only addressable Uno I/O pins, excluding supply and ground rails. */
 export function resolveComponentIoPins(
   project: CircuitProject,
   componentId: string,
   pin: string,
 ): ReadonlyArray<string> {
-  return resolveComponentBoardPins(project, componentId, pin).filter(
-    (boardPin) => parseUnoPinLabel(boardPin) !== undefined,
-  );
+  return resolveComponentBoardPinEndpoints(project, componentId, pin)
+    .filter(endpoint => endpoint.boardId !== "ground" && resolveBoardPin(endpoint.boardId, endpoint.pin) !== undefined)
+    .map(endpoint => endpoint.pin);
 }
 
 /** Resolve each two-lead LED to the Uno pins connected to either side. */
@@ -152,6 +163,8 @@ export function resolveLedCircuitBindings(
         componentId: component.id,
         pin: "K",
       }),
+      anodeEndpoints: reachableBoardPinEndpoints(graph, { componentId: component.id, pin: "A" }),
+      cathodeEndpoints: reachableBoardPinEndpoints(graph, { componentId: component.id, pin: "K" }),
     });
   });
 
@@ -169,21 +182,30 @@ export function resolveBuzzerCircuitBindings(
     bindings.set(component.id, {
       positiveBoardPins: reachableBoardPins(graph, { componentId: component.id, pin: "+" }),
       negativeBoardPins: reachableBoardPins(graph, { componentId: component.id, pin: "-" }),
+      positiveEndpoints: reachableBoardPinEndpoints(graph, { componentId: component.id, pin: "+" }),
+      negativeEndpoints: reachableBoardPinEndpoints(graph, { componentId: component.id, pin: "-" }),
     });
   });
   return bindings;
 }
 
 function boardPinLevel(
-  pin: string,
+  pin: string | ResolvedBoardPin,
   snapshot: SimulatorSnapshot,
 ): 0 | 1 | undefined {
-  const normalized = pin.trim().toUpperCase();
+  const endpoint = typeof pin === "string" ? undefined : pin;
+  const normalized = (endpoint?.pin ?? pin as string).trim().toUpperCase();
   if (/^GND\d*$/.test(normalized)) return 0;
-  if (UNO_HIGH_SUPPLY_PINS.has(normalized)) return 1;
-
-  const number = parseUnoPinLabel(normalized);
-  return number === undefined ? undefined : snapshot.pins[number]?.digitalValue;
+  if (endpoint?.boardId === "ground") return 0;
+  const boardId = endpoint?.boardId ?? snapshot.primaryBoardType ?? "arduino-uno";
+  const profile = getBoardProfile(boardId);
+  if (profile?.rails[normalized] !== undefined) return 1;
+  const number = resolveBoardPin(boardId, normalized);
+  if (number === undefined) return undefined;
+  const pins = endpoint
+    ? snapshot.boardPins?.[endpoint.componentId] ?? (snapshot.primaryBoardId === endpoint.componentId || (!snapshot.primaryBoardId && snapshot.primaryBoardType === endpoint.boardId) ? snapshot.pins : undefined)
+    : snapshot.pins;
+  return pins?.[number]?.digitalValue;
 }
 
 /** True when the LED has a higher anode level than its cathode level. */
@@ -192,10 +214,10 @@ export function isLedCircuitPowered(
   snapshot: SimulatorSnapshot,
 ): boolean {
   if (!binding) return false;
-  const anodeHigh = binding.anodeBoardPins.some(
+  const anodeHigh = (binding.anodeEndpoints ?? binding.anodeBoardPins).some(
     (pin) => boardPinLevel(pin, snapshot) === 1,
   );
-  const cathodeLow = binding.cathodeBoardPins.some(
+  const cathodeLow = (binding.cathodeEndpoints ?? binding.cathodeBoardPins).some(
     (pin) => boardPinLevel(pin, snapshot) === 0,
   );
   return anodeHigh && cathodeLow;
@@ -207,8 +229,8 @@ export function isBuzzerCircuitPowered(
   snapshot: SimulatorSnapshot,
 ): boolean {
   if (!binding) return false;
-  return binding.positiveBoardPins.some((pin) => boardPinLevel(pin, snapshot) === 1)
-    && binding.negativeBoardPins.some((pin) => boardPinLevel(pin, snapshot) === 0);
+  return (binding.positiveEndpoints ?? binding.positiveBoardPins).some((pin) => boardPinLevel(pin, snapshot) === 1)
+    && (binding.negativeEndpoints ?? binding.negativeBoardPins).some((pin) => boardPinLevel(pin, snapshot) === 0);
 }
 
 /** True only while a buzzer is powered or toned during active simulation. */
@@ -218,15 +240,16 @@ export function isBuzzerActive(
 ): boolean {
   if (!binding || snapshot.status !== "running") return false;
 
-  const toneActive = snapshot.tones.some((tone) =>
-    tone.active && binding.positiveBoardPins.some((pin) => parseUnoPinLabel(pin) === tone.pin),
-  );
+  const toneActive = snapshot.tones.some(tone => tone.active && (binding.positiveEndpoints ?? []).some(endpoint =>
+    endpoint.boardId === tone.boardId && (endpoint.componentId === tone.boardComponentId || (!tone.boardComponentId && endpoint.boardId === snapshot.primaryBoardType)) && resolveBoardPin(endpoint.boardId, endpoint.pin) === tone.pin));
   return toneActive || isBuzzerCircuitPowered(binding, snapshot);
 }
 
 export interface CircuitSolution {
   digitalInputs: Readonly<Record<number, 0 | 1>>;
   analogInputs: Readonly<Record<number, number>>;
+  boardDigitalInputs: Readonly<Record<string, Readonly<Record<number, 0 | 1>>>>;
+  boardAnalogInputs: Readonly<Record<string, Readonly<Record<number, number>>>>;
   componentStates: Readonly<Record<string, SimulatedComponentState>>;
   diagnostics: ReadonlyArray<SimulatorDiagnostic>;
 }
@@ -256,7 +279,11 @@ export function solveCircuit(
   project.components.forEach((component) => {
     const { id, type } = component;
     const definition = getComponentDefinition(type);
-    if (definition && simulationCapability(definition) === "unavailable") {
+    if (isBoardType(type)) {
+      // Board profiles are controller runtimes, not external loads that need
+      // supply pins wired into their own component symbol.
+      componentStates[id] = { type, powered: true };
+    } else if (definition && simulationCapability(definition) === "unavailable") {
       componentStates[id] = { type, powered: false };
       diagnostics.push({ severity: "error", code: "component-unavailable", message: `${component.label} has no accepted simulation model yet. Its saved wiring is preserved; remove it from this circuit to run.` });
     } else if (definition?.simulation?.model && (STATEFUL_MODEL_REGISTRY[definition.simulation.model] || POWER_MODEL_REGISTRY[definition.simulation.model])) {
@@ -266,7 +293,10 @@ export function solveCircuit(
       if (STATEFUL_MODEL_REGISTRY[definition.simulation.model] && !state?.powered) diagnostics.push({ severity: "warning", code: "component-unpowered", message: `${component.label}: connect its supply and ground pins.` });
     } else if (definition?.simulation?.model) {
       const result = network.results.get(id);
-      componentStates[id] = { type, powered: network.stable && !!result?.powered, channels: result?.outputs };
+      const isPowered = network.stable && !!result?.powered;
+      componentStates[id] = type === "soil-moisture-sen0193"
+        ? { type, powered: isPowered, status: isPowered ? "Monitoring" : "Unpowered", analogValue: Math.round((result?.outputs.AOUT ?? 0) * 1023), readings: isPowered ? { moisture: Number(component.properties?.moisture ?? 50) } : {} }
+        : { type, powered: isPowered, channels: result?.outputs };
       if (!result?.powered) diagnostics.push({ severity: "warning", code: "component-unpowered", message: `${component.label}: connect its supply and ground pins.` });
       if (result?.missing.length) diagnostics.push({ severity: "warning", code: "floating-control", message: `${component.label}: undriven control or sense pins: ${[...new Set(result.missing)].join(", ")}.` });
     } else if (["hc-sr04", "temperature-sensor", "pir-sensor"].includes(type)) {
@@ -333,14 +363,28 @@ export function solveCircuit(
   });
 
   const digitalInputs: Record<number, 0 | 1> = {}; const analogInputs: Record<number, number> = {};
-  project.components.filter((item) => item.type === "arduino-uno").forEach((board) => snapshot.pins.forEach((pin) => {
-    if (pin.mode === "OUTPUT") return;
-    const item = reading(board.id, pin.label);
-    if (item.value === undefined || item.conflict) return;
-    digitalInputs[pin.number] = item.value >= 0.5 ? 1 : 0;
-    analogInputs[pin.number] = Math.round(item.value * 1023);
-  }));
-  return { digitalInputs, analogInputs, componentStates, diagnostics };
+  const boardDigitalInputs: Record<string, Record<number, 0 | 1>> = {};
+  const boardAnalogInputs: Record<string, Record<number, number>> = {};
+  const boards = project.components.filter(item => isBoardType(item.type));
+  boards.forEach(board => {
+    const pins = snapshot.boardPins?.[board.id]
+      ?? (snapshot.primaryBoardId === board.id || (!snapshot.primaryBoardId && board.type === project.board && board.id === boards.find(item => item.type === board.type)?.id) ? snapshot.pins : []);
+    const digital: Record<number, 0 | 1> = {}; const analog: Record<number, number> = {};
+    const adcMax = 2 ** (getBoardProfile(board.type)?.analogResolutionBits ?? 10) - 1;
+    pins.forEach(pin => {
+      if (pin.mode === "OUTPUT") return;
+      const item = reading(board.id, pin.label);
+      if (item.value === undefined || item.conflict) return;
+      digital[pin.number] = item.value >= 0.5 ? 1 : 0;
+      analog[pin.number] = Math.round(item.value * adcMax);
+    });
+    boardDigitalInputs[board.id] = digital;
+    boardAnalogInputs[board.id] = analog;
+    if (board.id === (snapshot.primaryBoardId ?? boards.find(item => item.type === project.board)?.id)) {
+      Object.assign(digitalInputs, digital); Object.assign(analogInputs, analog);
+    }
+  });
+  return { digitalInputs, analogInputs, boardDigitalInputs, boardAnalogInputs, componentStates, diagnostics };
 }
 
 /** Ignore motor-control floating warnings during sketch startup only when the
@@ -363,8 +407,11 @@ export function isUninitializedMotorControlWarning(
     return wires.length > 0 && wires.every(connection => {
       const peer = connection.from.componentId === driver.id && connection.from.pin === pin ? connection.to : connection.from;
       const peerComponent = project.components.find(component => component.id === peer.componentId);
-      const unoPin = parseUnoPinLabel(peer.pin);
-      return peerComponent?.type === "arduino-uno" && unoPin !== undefined && snapshot.pins[unoPin]?.mode === "INPUT";
+      if (!peerComponent || !isBoardType(peerComponent.type)) return false;
+      const number = resolveBoardPin(peerComponent.type, peer.pin);
+      const pins = snapshot.boardPins?.[peerComponent.id]
+        ?? (snapshot.primaryBoardId === peerComponent.id ? snapshot.pins : undefined);
+      return number !== undefined && pins?.[number]?.mode === "INPUT";
     });
   });
 }

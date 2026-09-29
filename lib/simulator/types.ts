@@ -36,6 +36,7 @@ export type SketchInstruction =
   | (InstructionSource & { kind: "bufferDeclare"; name: string; size: string; values: string[] })
   | (InstructionSource & { kind: "bufferWrite"; name: string; index: string; expression: string })
   | (InstructionSource & { kind: "deviceCall"; instance: string; method: string; args: string[] })
+  | (InstructionSource & { kind: "fileOpen"; name: string; path: string; mode: string })
   | (InstructionSource & { kind: "serialExpression"; expression: string; newline: boolean })
   | (InstructionSource & {
       kind: "pinMode";
@@ -133,14 +134,15 @@ export interface CompiledArduinoSketch {
   setup: ReadonlyArray<SketchInstruction>;
   loop: ReadonlyArray<SketchInstruction>;
   globals: Readonly<Record<string, number>>;
+  i2cCallbacks?: Readonly<{ onReceive?: ReadonlyArray<SketchInstruction>; onRequest?: ReadonlyArray<SketchInstruction>; receiveParameter?: string }>;
   diagnostics: ReadonlyArray<SimulatorDiagnostic>;
   valid: boolean;
 }
 
-export interface UnoPinState {
-  /** Arduino's numeric pin value: D0-D13 are 0-13 and A0-A5 are 14-19. */
+export interface BoardPinState {
+  /** Arduino-compatible runtime pin number for the selected board profile. */
   number: number;
-  /** Human-readable Uno label, for example D13 or A0. */
+  /** Physical header label or board GPIO name. */
   label: string;
   mode: UnoPinMode;
   digitalValue: DigitalLevel;
@@ -148,6 +150,8 @@ export interface UnoPinState {
   pwmValue: number;
   lastChangedAtMs: number;
 }
+/** Backwards-compatible name for projects and tests that target the Uno. */
+export type UnoPinState = BoardPinState;
 
 export interface SerialEntry {
   id: number;
@@ -156,9 +160,9 @@ export interface SerialEntry {
   newline: boolean;
 }
 
-export interface ServoState { instance: string; pin: number; angle: number; attached: boolean; }
+export interface ServoState { instance: string; pin: number; angle: number; attached: boolean; boardId?: string; boardComponentId?: string; }
 export interface LcdState { instance: string; columns: number; rows: number; column: number; row: number; lines: ReadonlyArray<string>; }
-export interface ToneState { pin: number; active: boolean; frequency: number; }
+export interface ToneState { pin: number; active: boolean; frequency: number; boardId?: string; boardComponentId?: string; }
 
 export type ElectricalLevel = "low" | "high" | "floating" | "conflict";
 export interface SimulatedComponentState {
@@ -175,6 +179,8 @@ export interface SimulatedComponentState {
   status?: string;
   fault?: string;
   packets?: readonly { timeMs: number; direction: "tx" | "rx"; payload: string; status: string }[];
+  display?: readonly string[];
+  pixels?: readonly { r: number; g: number; b: number }[];
 }
 
 export interface SimulatorSnapshot {
@@ -186,7 +192,18 @@ export interface SimulatorSnapshot {
   loopCount: number;
   waitRemainingMs: number;
   pins: ReadonlyArray<UnoPinState>;
+  primaryBoardId?: string;
+  primaryBoardType?: string;
+  /** Independent GPIO state for each placed board. `pins` remains the v1 primary-board alias. */
+  boardPins?: Readonly<Record<string, ReadonlyArray<BoardPinState>>>;
+  /** Full per-controller state for mixed-board projects. Child snapshots never contain this field. */
+  boardSnapshots?: Readonly<Record<string, SimulatorSnapshot>>;
+  /** Per-board solved input maps; the flat fields remain for v1 callers. */
+  boardDigitalInputs?: Readonly<Record<string, Readonly<Record<number, 0 | 1>>>>;
+  boardAnalogInputs?: Readonly<Record<string, Readonly<Record<number, number>>>>;
   serial: ReadonlyArray<SerialEntry>;
+  /** Serial output kept separately for each placed board in mixed-board runs. */
+  boardSerial?: Readonly<Record<string, ReadonlyArray<SerialEntry>>>;
   servos: ReadonlyArray<ServoState>;
   lcds: ReadonlyArray<LcdState>;
   tones: ReadonlyArray<ToneState>;
@@ -197,6 +214,10 @@ export interface SimulatorSnapshot {
 }
 
 export interface ArduinoSimulatorOptions {
+  /** Stable board profile id; defaults to the Uno for legacy callers. */
+  boardId?: string;
+  /** Optional placed-board id for mixed-board schematics. */
+  boardComponentId?: string;
   /** Virtual milliseconds per real millisecond. Defaults to 1. */
   speed?: number;
   /** Protects the UI from sketches with infinite zero-delay loops. */

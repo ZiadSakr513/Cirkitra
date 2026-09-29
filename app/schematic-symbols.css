@@ -3,10 +3,46 @@
 .symbol-registry { position: absolute; inset: 0; pointer-events: none; }
 .symbol-registry__body { position: absolute; inset: 3px 10px; border: 2px solid #53646d; border-radius: 8px; background: linear-gradient(110deg, #26333b, #131d25); display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 4px 42px; text-align: center; }
 .symbol-registry--module .symbol-registry__body { background: #11423e; border-color: #39887e; }
+.symbol-rtc__display { position: absolute; z-index: 1; top: 56px; left: 50%; min-width: 74px; padding: 5px 8px; transform: translateX(-50%); border: 1px solid #4a7580; border-radius: 4px; background: #07151a; color: #72f3d2; text-align: center; box-shadow: inset 0 0 10px #0008; }
+.symbol-rtc__display b { display: block; font: 700 11px var(--font-mono); letter-spacing: .5px; }
+.symbol-rtc__display small { display: block; margin-top: 2px; color: #a7c9c6; font: 7px var(--font-mono); }
+.symbol-sd__card { position: absolute; z-index: 1; top: 52px; left: 50%; width: 78px; height: 44px; padding-top: 6px; transform: translateX(-50%); border: 2px solid #b8c4ca; border-radius: 3px 3px 8px 3px; background: linear-gradient(145deg,#364953,#101a20); color: #edf6fb; text-align: center; box-shadow: 0 2px 7px #0009; }
+.symbol-sd__card::after { position: absolute; bottom: -2px; left: 9px; width: 30px; height: 5px; border-top: 2px solid #d4b75d; content: ""; }
+.symbol-sd__card b { display: block; font: 700 12px var(--font-mono); }
+.symbol-sd__card small { display: block; margin-top: 4px; color: #9ee5d6; font: 7px var(--font-mono); }
+.symbol-rfid__antenna { position: absolute; z-index: 1; top: 52px; left: 50%; display: grid; place-items: center; width: 72px; height: 48px; transform: translateX(-50%); }
+.symbol-rfid__antenna i { position: absolute; width: 24px; height: 28px; border: 1.5px solid #7be7d0; border-radius: 45%; opacity: .45; }
+.symbol-rfid__antenna i:nth-child(2) { width: 38px; height: 36px; opacity: .65; }
+.symbol-rfid__antenna i:nth-child(3) { width: 54px; height: 44px; opacity: .35; }
+.symbol-rfid__antenna b { z-index: 1; color: #e8ffff; font: 700 8px var(--font-mono); text-shadow: 0 1px 3px #000; }
+.symbol-a4988__step { position: absolute; z-index: 1; top: 54px; left: 50%; display: flex; align-items: flex-end; gap: 3px; transform: translateX(-50%); }
+.symbol-a4988__step i { width: 5px; height: 8px; border: 1px solid #9cb0b8; border-radius: 2px; background: #1b282e; }
+.symbol-a4988__step i:nth-child(2) { height: 13px; }.symbol-a4988__step i:nth-child(3) { height: 18px; border-color: #6ce7ca; background: #138d7b; }
+.symbol-a4988__step small { margin-left: 5px; color: #b2d4d4; font: 7px var(--font-mono); white-space: nowrap; }
+.symbol-stepper__rotor { position: absolute; z-index: 1; top: 65px; left: 50%; display: grid; place-items: center; width: 42px; height: 42px; border: 4px solid #9baeb5; border-radius: 50%; background: radial-gradient(circle,#a9b9bd 0 14%,#35474f 16% 60%,#111c22 62%); box-shadow: 0 2px 9px #000a,inset 0 0 0 2px #71858a; transition: transform 100ms ease; }
+.symbol-stepper__rotor i { position: absolute; top: 2px; width: 3px; height: 10px; border-radius: 2px; background: #61e2c6; }
+.symbol-stepper__rotor b { position: absolute; top: 44px; color: #cfe7eb; font: 7px var(--font-mono); white-space: nowrap; }
+.symbol-ws2812__pixels { position: absolute; z-index: 1; left: 50%; top: calc(50% + 28px); transform: translateX(-50%); display: flex; gap: 5px; }
+.symbol-ws2812__pixels i { display: block; width: 10px; height: 10px; border: 1px solid #8ba3ad; border-radius: 50%; background: #111b20; }
+.symbol-registry--ky-040 .symbol-registry__body { justify-content: flex-start; padding-top: 12px; }
+.symbol-ky040__wheel { position: absolute; z-index: 1; top: 68px; left: 50%; display: grid; place-items: center; width: 38px; height: 38px; border: 4px solid #a6b3ba; border-radius: 50%; background: radial-gradient(circle at 35% 30%, #667782, #26363e 68%, #10181d); box-shadow: inset 0 0 0 3px #172229, 0 3px 7px #0009; transition: transform 120ms ease, box-shadow 120ms ease; }
+.symbol-ky040__wheel i { position: absolute; top: 2px; width: 4px; height: 10px; border-radius: 3px; background: #f6c96b; }
+.symbol-ky040__wheel b { color: #e7f2f7; font: 8px var(--font-mono); text-shadow: 0 1px 3px #000; }
+.symbol-ky040__wheel.is-pressed { box-shadow: inset 0 0 0 5px #172229, 0 0 10px #f0b94eaa; }
+.symbol-registry--keypad-4x4 .symbol-registry__body { justify-content: flex-start; padding-top: 8px; }
+.symbol-keypad__matrix { position: absolute; z-index: 1; top: 51px; left: 50%; display: grid; grid-template-columns: repeat(4, 14px); gap: 3px; transform: translateX(-50%); }
+.symbol-keypad__matrix i { display: grid; place-items: center; width: 14px; height: 13px; border: 1px solid #5b877d; border-radius: 2px; background: linear-gradient(#264b46, #122d2b); color: #d7eee9; font: 8px var(--font-mono); font-style: normal; }
+.symbol-keypad__matrix i.is-active { border-color: #ffcf70; background: #9d6120; color: #fff6df; box-shadow: 0 0 7px #ffcb5a99; }
+.symbol-registry--relay-module-1ch-active-low .symbol-registry__body { justify-content: flex-start; padding-top: 9px; }
+.symbol-relay__contact { position: absolute; z-index: 1; top: 68px; left: 50%; width: 44px; height: 20px; border-bottom: 2px solid #8da0a7; transform: translateX(-50%); }
+.symbol-relay__contact::before,.symbol-relay__contact::after { position: absolute; bottom: -4px; width: 6px; height: 6px; border-radius: 50%; background: #d9e4e8; content: ""; }
+.symbol-relay__contact::before { left: 1px; }.symbol-relay__contact::after { right: 1px; }
+.symbol-relay__contact i { position: absolute; left: 4px; bottom: -2px; width: 38px; height: 2px; background: #f4bd63; transform: rotate(-18deg); transform-origin: left center; transition: transform 100ms ease; }
+.symbol-relay__contact.is-energized i { transform: rotate(0); background: #42d7bd; }
 .symbol-registry.is-powered .symbol-registry__body { border-color: #42d7bd; }
 .symbol-registry__body b { max-width: 100%; font: 700 10px/1.2 var(--font-mono); color: #eef8ff; overflow-wrap: break-word; word-break: normal; }
 .symbol-registry__body small { max-width: 100%; margin-top: 5px; font: 7px/1.2 var(--font-mono); color: #a9bcc6; overflow-wrap: break-word; word-break: normal; }
-.symbol-registry__pin { position: absolute; transform: translateY(-50%); color: #edf4fa; font: 11px var(--font-mono); white-space: nowrap; }
+.symbol-registry__pin { position: absolute; z-index: 6; transform: translateY(-50%); color: #edf4fa; font: 600 11px var(--font-mono); text-shadow: 0 1px 2px #050a0e, 0 0 4px #050a0e; white-space: nowrap; }
 .symbol-registry__pin.side-left { left: 16px; }
 .symbol-registry__pin.side-right { right: 16px; text-align: right; }
 .symbol-registry__pin em { color: #8cabbc; font-size: 8px; font-style: normal; }
@@ -230,6 +266,21 @@
 .component-arduino-uno .schematic-pin { gap: 4px; color: #f1fffc; font-size: 10px; font-weight: 600; line-height: 1; text-shadow: 0 1px 2px #071015, 0 0 4px #071015; }
 .component-arduino-uno .schematic-pin span { opacity: 1; }
 .component-arduino-uno .schematic-pin i { width: 9px; height: 9px; border: 2px solid #e4f1ee; background: #10191e; }
+.component-arduino-mega-2560 .schematic-pin,
+.component-arduino-nano-classic .schematic-pin,
+.component-esp32-devkitc-v4 .schematic-pin,
+.component-esp8266-nodemcu-v1 .schematic-pin,
+.component-raspberry-pi-pico .schematic-pin { gap: 4px; color: #f1fffc; font-size: 9px; font-weight: 600; line-height: 1; text-shadow: 0 1px 2px #071015, 0 0 4px #071015; }
+.component-arduino-mega-2560 .schematic-pin span,
+.component-arduino-nano-classic .schematic-pin span,
+.component-esp32-devkitc-v4 .schematic-pin span,
+.component-esp8266-nodemcu-v1 .schematic-pin span,
+.component-raspberry-pi-pico .schematic-pin span { opacity: 1; }
+.component-arduino-mega-2560 .schematic-pin i,
+.component-arduino-nano-classic .schematic-pin i,
+.component-esp32-devkitc-v4 .schematic-pin i,
+.component-esp8266-nodemcu-v1 .schematic-pin i,
+.component-raspberry-pi-pico .schematic-pin i { width: 9px; height: 9px; border: 2px solid #e4f1ee; background: #10191e; }
 .component-arduino-uno .schematic-pin.connected i {
   width: 11px;
   height: 11px;
@@ -406,3 +457,120 @@
 .symbol-registry__state strong { font: 600 12px/1.3 var(--font-body, sans-serif); white-space: nowrap; }
 .symbol-registry__state small { color: #b7d8e8; font: 10px/1.4 var(--font-mono, monospace); }
 .symbol-registry__state small:empty { display: none; }
+
+/* Board artwork for the non-Uno profiles. Pin labels remain in the foreground. */
+.schematic-symbol--board { position:absolute; inset:0; }
+.symbol-board__pcb { position:absolute; inset:5px 42px; overflow:hidden; border:2px solid #41968b; border-radius:9px; background:radial-gradient(circle at 50% 12%,#72d7bd22,transparent 40%),linear-gradient(145deg,#126d66,#073f45); box-shadow:inset 0 0 22px #001a1b99,0 7px 16px #0008; }
+.symbol-board__pcb::before { position:absolute; inset:12px 24px; background:radial-gradient(circle,#d7bd72 0 2px,transparent 2.8px) 0 0/16px 16px; opacity:.42; content:""; }
+.symbol-board__pcb::after { position:absolute; inset:0; border:1px solid #c5fff11c; border-radius:inherit; background:linear-gradient(90deg,transparent 48%,#7df0c40d 49%,transparent 51%),linear-gradient(0deg,transparent 48%,#7df0c40d 49%,transparent 51%); content:""; pointer-events:none; }
+.symbol-board__header { position:absolute; z-index:1; top:13px; bottom:13px; width:13px; border:2px solid #11191c; border-radius:3px; background:repeating-linear-gradient(to bottom,#172125 0 7px,#bea85e 7px 9px,#172125 9px 17px); box-shadow:0 0 0 1px #67b4a4; }
+.symbol-board__header--left { left:4px; }.symbol-board__header--right { right:4px; }
+.symbol-board__usb { position:absolute; z-index:2; top:9px; left:50%; width:35px; height:23px; transform:translateX(-50%); border:2px solid #bcc9ca; border-radius:4px; background:linear-gradient(145deg,#8d9b9e,#39494d); box-shadow:inset 0 0 0 4px #637277,0 2px 5px #0008; }
+.symbol-board__usb i { position:absolute; inset:6px 7px; border-radius:2px; background:#131e22; box-shadow:inset 0 0 0 1px #819295; }
+.symbol-board__barrel { position:absolute; z-index:2; left:23%; bottom:15%; width:24px; height:29px; border-radius:5px; background:#172126; box-shadow:inset 0 0 0 3px #56666a; }
+.symbol-board__barrel i { position:absolute; top:6px; left:-5px; width:15px; height:17px; border:3px solid #89999b; border-radius:50%; background:#081015; }
+.symbol-board__chip { position:absolute; z-index:2; display:grid; place-items:center; border:2px solid #425158; border-radius:4px; background:linear-gradient(145deg,#303a3e,#101619 65%); box-shadow:inset 0 0 0 2px #090e10,0 3px 5px #0008; color:#a9b7b8; text-align:center; }
+.symbol-board__chip b { font:700 7px/1.2 var(--font-mono); letter-spacing:.02em; }
+.symbol-board__chip--mega { left:31%; top:39%; width:54%; height:12%; }
+.symbol-board__chip--usb { left:46%; top:24%; width:24px; height:17px; }
+.symbol-board__chip--usb b { font-size:5px; }
+.symbol-board__chip--main { left:26%; top:54%; width:52%; height:15%; }
+.symbol-board__chip--bridge { left:24%; top:31%; width:48%; height:10%; }
+.symbol-board__chip--radio-can { left:15%; right:15%; top:22%; height:20%; border-color:#9da9aa; background:linear-gradient(145deg,#c9d0ce,#758489 50%,#d8ddda); color:#34454b; }
+.symbol-board__chip--radio-can b { font-size:6px; }.symbol-board__chip--radio-can i { position:absolute; right:5px; bottom:4px; left:5px; height:5px; border-top:1px solid #53696c; background:repeating-linear-gradient(90deg,#60797b 0 3px,transparent 3px 7px); }
+.symbol-board__radio-can--8266 { top:28%; height:18%; }
+.symbol-board__pico-mcu { left:27%; top:48%; width:46%; height:15%; }.symbol-board__pico-flash { left:61%; top:38%; width:23%; height:9%; }.symbol-board__pico-flash b { font-size:5px; }
+.symbol-board__icsp { position:absolute; z-index:2; left:61%; top:58%; display:grid; grid-template-columns:repeat(2,5px); gap:3px; padding:4px; border:1px solid #293b3e; background:#101719; }
+.symbol-board__icsp i { width:4px; height:4px; border-radius:50%; background:#d3b866; }
+.symbol-board__crystal { position:absolute; z-index:2; top:44%; left:33%; padding:2px 4px; border:1px solid #829395; border-radius:3px; background:#aebabb; color:#42565a; font:5px var(--font-mono); }
+.symbol-board__reset { position:absolute; z-index:3; top:19%; right:22%; padding:3px 4px; border:2px solid #c7d2d4; border-radius:4px; background:#be4c43; color:#fff0e8; font:5px var(--font-mono); }
+.symbol-board__reset--boot { top:19%; right:auto; left:22%; background:#3b4d52; }
+.symbol-board__reset--bootsel { top:23%; right:18%; background:#364a50; }
+.symbol-board__regulator { position:absolute; z-index:2; top:52%; right:24%; display:grid; place-items:center; width:19px; height:24px; border-radius:3px; background:linear-gradient(90deg,#14191c,#384449); color:#8ee0c5; font:5px var(--font-mono); }
+.symbol-board__antenna { position:absolute; z-index:2; top:5%; left:24%; width:52%; height:12%; border-top:2px solid #d6c992; border-right:2px solid #d6c992; border-radius:0 8px 0 0; }
+.symbol-board__antenna i { position:absolute; right:4px; bottom:-7px; width:45%; height:7px; border-bottom:1px solid #c5b77d; border-left:1px solid #c5b77d; }
+.symbol-board__power-led { position:absolute; z-index:3; top:66%; right:27%; width:7px; height:7px; border-radius:50%; background:#eacb55; box-shadow:0 0 8px #f1d66d88; }
+.symbol-board__trace { position:absolute; z-index:1; border:1px solid #71d2af88; opacity:.7; }
+.symbol-board__trace--one { left:26%; top:48%; width:27%; height:12%; border-right:0; border-bottom:0; }
+.symbol-board__trace--two { right:23%; bottom:22%; width:31%; height:13%; border-left:0; border-top:0; }
+.symbol-board__brand { position:absolute; z-index:3; left:50%; bottom:13%; transform:translateX(-50%); color:#bce3da; font:700 7px var(--font-mono); letter-spacing:.08em; white-space:nowrap; text-shadow:0 1px 2px #000; }
+.symbol-board__silk { position:absolute; z-index:3; right:19%; bottom:3%; left:19%; color:#91bfb5; font:5px var(--font-mono); text-align:center; white-space:nowrap; }
+.schematic-symbol--board-arduino-mega-2560 .symbol-board__pcb { border-color:#398b90; background:linear-gradient(145deg,#087a80,#084d5d 70%,#073947); border-radius:8px 24px 8px 8px; }
+.schematic-symbol--board-arduino-nano-classic .symbol-board__pcb { inset:5px 39px; border-color:#449a87; background:linear-gradient(145deg,#0d8373,#075950); border-radius:7px; }
+.schematic-symbol--board-esp32-devkitc-v4 .symbol-board__pcb { inset:5px 36px; border-color:#44565e; background:linear-gradient(145deg,#29383d,#121f25 72%); border-radius:7px; }
+.schematic-symbol--board-esp8266-nodemcu-v1 .symbol-board__pcb { inset:5px 36px; border-color:#327b91; background:linear-gradient(145deg,#15566a,#102f3a 72%); border-radius:7px; }
+.schematic-symbol--board-raspberry-pi-pico .symbol-board__pcb { inset:5px 39px; border-color:#70a880; background:linear-gradient(145deg,#328650,#145d40 72%); border-radius:10px; }
+.schematic-symbol--board-esp32-devkitc-v4 .symbol-board__header,.schematic-symbol--board-esp8266-nodemcu-v1 .symbol-board__header,.schematic-symbol--board-raspberry-pi-pico .symbol-board__header { background:repeating-linear-gradient(to bottom,#172125 0 7px,#d0bc6b 7px 9px,#172125 9px 17px); }
+
+/* Detailed registered packages replace the empty catalog cards. */
+.symbol-registry--module .symbol-registry__body b,.symbol-registry--module .symbol-registry__body small,.symbol-registry--ic .symbol-registry__body b,.symbol-registry--ic .symbol-registry__body small { visibility:hidden; }
+.symbol-registry--module .symbol-registry__body { border-radius:7px; background:radial-gradient(circle at 10px 10px,#c7d8d255 0 3px,transparent 4px),radial-gradient(circle at calc(100% - 10px) 10px,#c7d8d255 0 3px,transparent 4px),radial-gradient(circle at 10px calc(100% - 10px),#c7d8d255 0 3px,transparent 4px),radial-gradient(circle at calc(100% - 10px) calc(100% - 10px),#c7d8d255 0 3px,transparent 4px),linear-gradient(135deg,#16675e,#0d403d 55%,#153e4b); box-shadow:inset 0 0 20px #061e1d88,0 5px 12px #0007; }
+.symbol-registry--ic .symbol-registry__body { border-radius:3px; background:linear-gradient(90deg,#3f4c53 0 3%,#172128 3% 97%,#3f4c53 97%); box-shadow:inset 0 0 18px #000,0 5px 12px #0008; }
+.symbol-registry.is-powered .symbol-registry__body { box-shadow:inset 0 0 20px #061e1d88,0 0 10px #39d9b155,0 5px 12px #0007; }
+.symbol-part-art { position:absolute; z-index:1; pointer-events:none; }
+.symbol-part-art--module { inset:16px 36px; overflow:hidden; min-width:96px; border:2px solid #4a9a8a; border-radius:6px; background:radial-gradient(circle at 50% 40%,#33af9133,transparent 45%),linear-gradient(145deg,#167467,#0b4848); box-shadow:inset 0 0 15px #042b2c99,0 3px 7px #0008; }
+.symbol-part-art__mount { position:absolute; width:6px; height:6px; border:1px solid #d2ded155; border-radius:50%; background:#173037; }
+.symbol-part-art__mount--one { top:4px; left:4px; }.symbol-part-art__mount--two { top:4px; right:4px; }
+.symbol-part-art__trace { position:absolute; border:1px solid #85d7ad; opacity:.55; }
+.symbol-part-art__trace--one { top:23%; left:0; width:25%; height:27%; border-right:0; border-bottom:0; }.symbol-part-art__trace--two { right:0; bottom:22%; width:27%; height:26%; border-top:0; border-left:0; }
+.symbol-module__core { position:absolute; top:50%; left:50%; display:grid; place-items:center; width:48px; height:36px; transform:translate(-50%,-50%); border:2px solid #53646b; border-radius:4px; background:linear-gradient(145deg,#303b40,#10181c); box-shadow:inset 0 0 0 2px #0a1114,0 3px 5px #0008; }
+.symbol-module__core i { position:absolute; inset:-5px -3px; background:repeating-linear-gradient(90deg,transparent 0 5px,#b7a66a 5px 7px,transparent 7px 11px); opacity:.8; z-index:-1; }
+.symbol-module__core b { color:#aebfc1; font:700 7px var(--font-mono); }
+.symbol-part-art__silk { position:absolute; right:8px; bottom:5px; left:8px; color:#b0d9c9; font:5px var(--font-mono); text-align:center; letter-spacing:.04em; white-space:nowrap; }
+.symbol-part-art--radio { inset:16px 34px; overflow:hidden; min-width:110px; border:2px solid #819e91; border-radius:5px; background:linear-gradient(145deg,#274f47,#102e32); box-shadow:inset 0 0 15px #061a1b,0 4px 9px #0008; }
+.symbol-radio__module { position:absolute; top:18%; left:18%; display:grid; place-content:center; width:64%; height:48%; border:2px solid #929e9d; border-radius:3px; background:linear-gradient(145deg,#bac4c1,#596b6c 55%,#aab4b0); color:#2c3c40; text-align:center; box-shadow:inset 0 0 5px #fff8,0 2px 4px #0008; }
+.symbol-radio__module b { font:700 7px var(--font-mono); }.symbol-radio__module small { margin-top:3px; font:5px var(--font-mono); }
+.symbol-radio__antenna { position:absolute; top:8%; right:7%; width:15%; height:18%; border:1px solid #dfca7e; border-right:0; border-bottom:0; }
+.symbol-radio__antenna.is-meander { top:68%; right:14%; width:68%; height:13%; border:1px solid #d7c87d; border-bottom:0; }
+.symbol-radio__antenna i { position:absolute; right:4px; bottom:-5px; width:45%; height:5px; border-bottom:1px solid #d7c87d; border-left:1px solid #d7c87d; }
+.symbol-part-art--sensor { inset:16px 36px; overflow:hidden; min-width:104px; border:2px solid #5a9c89; border-radius:7px; background:linear-gradient(145deg,#1b7d70,#125047); box-shadow:inset 0 0 14px #072b2d99,0 4px 9px #0008; }
+.symbol-oled__bezel { position:absolute; top:20%; left:16%; width:68%; height:54%; border:5px solid #28363c; border-radius:4px; background:#071219; box-shadow:0 2px 5px #0009,inset 0 0 0 1px #617278; }
+.symbol-oled__bezel::before { position:absolute; inset:5px; background:repeating-linear-gradient(0deg,#66dcca22 0 2px,transparent 2px 5px); content:""; }
+.symbol-oled__bezel i { position:absolute; top:8px; left:9px; z-index:1; width:4px; height:4px; border-radius:50%; background:#48d4c0; box-shadow:0 10px #48d4c088,10px 10px #48d4c055; }
+.symbol-oled__screen { position:absolute; z-index:3; top:33%; left:50%; width:45%; transform:translateX(-50%); color:#8bf7e4; text-shadow:0 0 5px #45e4cd88; }
+.symbol-oled__screen b { display:block; overflow:hidden; font:6px/1.6 var(--font-mono); white-space:pre; }
+.symbol-light__lens { position:absolute; top:24%; left:50%; display:grid; place-items:center; width:36px; height:36px; transform:translateX(-50%); border:3px solid #c0ccbb; border-radius:50%; background:radial-gradient(circle,#f5f2d7 0 20%,#a6bdab 24% 58%,#263d38 61%); box-shadow:0 2px 5px #0008,inset 0 0 5px #fff; }
+.symbol-light__lens i { width:10px; height:10px; border:1px solid #657b72; border-radius:50%; background:#dde3d1; }
+.symbol-light__sensor { position:absolute; z-index:2; top:60px; left:50%; display:grid; place-items:center; min-width:44px; padding:2px 4px; transform:translateX(-50%); border:1px solid #67bda6; border-radius:4px; background:#0c2727; color:#9df1d5; }
+.symbol-light__sensor i { position:absolute; top:-38px; left:50%; width:28px; height:28px; transform:translateX(-50%); border:2px solid #d9e0ca; border-radius:50%; background:radial-gradient(circle,#f5f3da 0 23%,#899b8c 27% 68%,#2a3c38 72%); }
+.symbol-light__sensor b { font:600 7px var(--font-mono); white-space:nowrap; }
+.symbol-soil__neck { position:absolute; top:2px; left:50%; width:15px; height:32px; transform:translateX(-50%); border:2px solid #a7b3a0; border-bottom:0; background:linear-gradient(90deg,#778c83,#d2d3bf,#6d817a); }
+.symbol-soil__blade { position:absolute; top:30px; left:50%; width:39px; height:52px; transform:translateX(-50%); border:2px solid #acb9ae; border-radius:2px 2px 8px 8px; background:linear-gradient(90deg,#476e69,#82b6a4,#37665f); }
+.symbol-soil__blade i { position:absolute; top:5px; bottom:7px; width:4px; border:1px solid #1f504a; border-radius:3px; background:#0b322f; }.symbol-soil__blade i:nth-child(1){left:7px}.symbol-soil__blade i:nth-child(2){left:16px}.symbol-soil__blade i:nth-child(3){right:7px}
+.symbol-soil__probe { position:absolute; z-index:2; top:26px; left:50%; width:60px; height:80px; transform:translateX(-50%); }
+.symbol-soil__probe > i { position:absolute; bottom:0; width:5px; height:46px; border:1px solid #b5c6bb; border-radius:2px 2px 5px 5px; background:linear-gradient(90deg,#6d8e82,#c2d0bd,#557b70); }.symbol-soil__probe > i:nth-child(1){left:10px}.symbol-soil__probe > i:nth-child(2){left:22px}.symbol-soil__probe > i:nth-child(3){left:34px}.symbol-soil__probe > i:nth-child(4){left:46px}.symbol-soil__probe > i:nth-child(5){top:0;left:17px;width:26px;height:23px;border-radius:4px;background:#16262a}
+.symbol-soil__probe b { position:absolute; right:-9px; bottom:4px; padding:2px 3px; border-radius:3px; background:#092522; color:#a7f2d1; font:6px var(--font-mono); }
+.symbol-part-art--sensor-package { inset:5px 42px; display:grid; place-items:center; }
+.symbol-sensor-package__grille { position:relative; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:4px; width:62px; height:76px; border:3px solid #d8d8c8; border-radius:14px 14px 8px 8px; background:linear-gradient(110deg,#f1f0df,#a8b7b5 46%,#d9d8c8); box-shadow:inset 5px 0 7px #fff8,0 4px 8px #0008; }
+.symbol-sensor-package__grille i { width:42px; height:3px; border-radius:2px; background:#7c8d8e; box-shadow:inset 0 1px #4e5d60; }.symbol-sensor-package__grille b { color:#59696a; font:6px var(--font-mono); }
+.symbol-sensor-package__to92 { position:relative; display:grid; place-items:center; width:40px; height:48px; border:2px solid #26353a; border-radius:20px 20px 7px 7px; background:linear-gradient(90deg,#141d20,#293439 55%,#0d1417); color:#9eafb1; box-shadow:0 3px 7px #0008; }
+.symbol-sensor-package__to92::before { position:absolute; right:5px; bottom:-28px; left:5px; height:30px; background:repeating-linear-gradient(90deg,#b7c2bf 0 2px,transparent 2px 13px); content:""; }
+.symbol-sensor-package__to92 b { padding:2px; background:#151d20; font:5px var(--font-mono); white-space:nowrap; }
+.symbol-registry--ic .symbol-registry__body { background:transparent; box-shadow:none; }
+.symbol-part-art--ic { top:50%; left:50%; width:86px; height:68px; transform:translate(-50%,-50%); }
+.symbol-chip__case { position:absolute; z-index:1; inset:6px 8px; display:flex; flex-direction:column; align-items:center; justify-content:center; border:2px solid #66777e; border-radius:4px; background:linear-gradient(145deg,#39464b,#11191d 62%,#2a3438); box-shadow:inset 0 0 0 2px #0c1215,0 4px 8px #000a; color:#d2dedf; text-shadow:0 1px 2px #000; }
+.symbol-chip__case b { max-width:100%; font:700 7px/1.25 var(--font-mono); }.symbol-chip__case small { margin-top:4px; color:#91a5a9; font:5px var(--font-mono); }
+.symbol-chip__notch { position:absolute; top:-2px; left:50%; width:18px; height:8px; transform:translateX(-50%); border:2px solid #66777e; border-top:0; border-radius:0 0 12px 12px; background:#12191d; }
+.symbol-chip__pin-one { position:absolute; top:5px; left:5px; width:4px; height:4px; border-radius:50%; background:#e0c875; }
+.symbol-chip__pins { position:absolute; top:15px; bottom:15px; width:12px; background:repeating-linear-gradient(to bottom,#b8c2c2 0 2px,transparent 2px 7px); }
+.symbol-chip__pins--left { left:0; }.symbol-chip__pins--right { right:0; }
+.symbol-part-art--driver .symbol-chip__case { border-radius:9px; background:linear-gradient(145deg,#272f33,#080d10); }.symbol-part-art--driver .symbol-chip__pins { width:14px; }
+.symbol-part-art--power .symbol-chip__case { inset:0 2px 14px; border:3px solid #879393; border-radius:9px 9px 3px 3px; background:linear-gradient(90deg,#30383a,#151b1d,#323a3b); }
+.symbol-part-art--power .symbol-chip__case::after { position:absolute; right:-5px; bottom:-15px; left:-5px; height:14px; background:repeating-linear-gradient(90deg,#9ca8a7 0 5px,#455155 5px 8px); content:""; }
+.symbol-part-art--power .symbol-chip__pins { display:none; }
+.symbol-part-art--bq24074 .symbol-chip__case,.symbol-part-art--bq27441-g1 .symbol-chip__case { border-color:#aaa878; background:linear-gradient(145deg,#53513c,#27291f 65%,#171913); }
+.symbol-part-art--bq76920 .symbol-chip__case { border-color:#b28d58; background:linear-gradient(145deg,#59452e,#292117 65%,#17140e); }
+.symbol-oled__screen { white-space:normal; }
+.symbol-rtc__display { z-index:3; }
+
+/* DC source, cell, load and switch have recognizable physical form factors. */
+.symbol-power-art { position:absolute; z-index:2; inset:8px 25px; pointer-events:none; }
+.symbol-power-art--supply .symbol-supply__face { position:absolute; top:15px; left:50%; display:flex; flex-direction:column; align-items:center; gap:3px; width:78px; height:53px; transform:translateX(-50%); border:3px solid #8d9c9c; border-radius:6px; background:linear-gradient(145deg,#25363a,#10191d); box-shadow:inset 0 0 8px #000,0 3px 6px #0008; }
+.symbol-supply__face small { margin-top:4px; color:#9fbbbe; font:5px var(--font-mono); }.symbol-supply__face b { color:#84f3d5; font:700 14px var(--font-mono); text-shadow:0 0 7px #52c9a2; }.symbol-supply__face b i { font-size:8px; font-style:normal; }.symbol-supply__face em { color:#e9bc6b; font:6px var(--font-mono); font-style:normal; }
+.symbol-supply__jack { position:absolute; bottom:13px; width:13px; height:13px; border:2px solid #b3c0c0; border-radius:50%; box-shadow:inset 0 0 0 3px #111a1d; }.symbol-supply__jack--red { left:27px; background:#b84742; }.symbol-supply__jack--black { right:27px; background:#161b1d; }
+.symbol-power-art--battery .symbol-battery__can { position:absolute; top:12px; left:50%; width:47px; height:91px; transform:translateX(-50%); border:3px solid #a8b4b5; border-radius:11px 11px 8px 8px; background:linear-gradient(90deg,#536369,#a4b0ae 42%,#586a6e); box-shadow:inset 4px 0 6px #ffffff44,0 4px 8px #0008; color:#223438; text-align:center; }
+.symbol-battery__cap { position:absolute; top:-8px; left:13px; width:16px; height:7px; border:2px solid #aab7b7; border-radius:3px 3px 0 0; background:#657477; }.symbol-battery__can b,.symbol-battery__can small { position:relative; z-index:1; display:block; margin-top:22px; font:700 7px var(--font-mono); }.symbol-battery__can small { margin-top:4px; font-size:6px; }.symbol-battery__charge { position:absolute; bottom:3px; left:3px; height:5px; max-width:calc(100% - 6px); border-radius:3px; background:#3dd7a1; box-shadow:0 0 6px #3dd7a1; }
+.symbol-power-art--load .symbol-load__body { position:absolute; top:32px; left:50%; display:flex; align-items:center; justify-content:space-evenly; width:82px; height:39px; transform:translateX(-50%); border:3px solid #9f785c; border-radius:7px; background:linear-gradient(145deg,#c89a6c,#7e543c); box-shadow:inset 0 0 0 3px #65432f,0 3px 6px #0008; }
+.symbol-load__body i { width:4px; height:29px; background:#392c26; box-shadow:0 1px #e6cf99; }.symbol-load__body b { position:absolute; bottom:-15px; color:#e6c99c; font:6px var(--font-mono); }.symbol-power-art--load small { position:absolute; top:10px; left:50%; transform:translateX(-50%); color:#ffd998; font:7px var(--font-mono); white-space:nowrap; }
+.symbol-power-art--mosfet .symbol-mosfet__case { position:absolute; top:19px; left:50%; display:flex; flex-direction:column; align-items:center; justify-content:center; width:54px; height:46px; transform:translateX(-50%); border:2px solid #849395; border-radius:5px 5px 12px 12px; background:linear-gradient(90deg,#202a2e,#556267 45%,#202a2e); box-shadow:inset 0 0 7px #000,0 4px 7px #0008; color:#c0cecb; }
+.symbol-mosfet__case b { font:700 12px var(--font-mono); }.symbol-mosfet__case small { font:5px var(--font-mono); }.symbol-mosfet__lead { position:absolute; top:63px; width:3px; height:28px; background:linear-gradient(90deg,#929e9d,#d1d6ce,#7b8a8c); }.symbol-mosfet__lead--gate { left:28%; }.symbol-mosfet__lead--drain { left:50%; }.symbol-mosfet__lead--source { left:72%; }.symbol-power-art--mosfet.is-on .symbol-mosfet__case { border-color:#47e0bb; box-shadow:0 0 13px #37d6b077,inset 0 0 7px #000; }

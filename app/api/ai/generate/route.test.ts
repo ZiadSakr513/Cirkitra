@@ -6,6 +6,7 @@ import { maxDuration, POST } from "./route.ts";
 import { COMPONENT_EXAMPLES } from "../../../../lib/circuit/component-examples.ts";
 import { greenhouseExample, greenhousePrompt } from "../../../../tests/fixtures/greenhouse.ts";
 import { ArduinoSimulator } from "../../../../lib/simulator/index.ts";
+import { MultiBoardSimulator } from "../../../../lib/simulator/index.ts";
 
 test("published runnable examples pass the generation endpoint without repair", async context => {
   const originalFetch = globalThis.fetch;
@@ -104,6 +105,93 @@ void loop(){ int reading = digitalRead(2); if (reading == LOW && lastButtonState
   assert.equal(response.status, 200, JSON.stringify(repairIssues));
   assert.equal(calls, 2);
   assert.ok(repairIssues.some(issue => issue.includes("button behavior") && issue.includes("no observable circuit change")));
+});
+
+test("generation checks the integrated KY-040 switch rather than counting its state as the action", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = structuredClone(COMPONENT_EXAMPLES["ky-040"]());
+  const broken = structuredClone(project);
+  broken.code = `bool lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50;
+void setup(){
+  pinMode(4, INPUT_PULLUP);
+  pinMode(13, OUTPUT);
+}
+void loop(){
+  int reading = digitalRead(4);
+  if (reading != lastButtonState) lastDebounceTime = millis();
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (reading == LOW && lastButtonState == HIGH) digitalWrite(13, HIGH);
+  }
+  lastButtonState = reading;
+  delay(10);
+}`;
+  const repaired = structuredClone(project);
+  repaired.code = `int lastButtonState = HIGH;
+bool outputOn = false;
+void setup(){
+  pinMode(4, INPUT_PULLUP);
+  pinMode(13, OUTPUT);
+}
+void loop(){
+  int reading = digitalRead(4);
+  if (reading == LOW && lastButtonState == HIGH) outputOn = !outputOn;
+  lastButtonState = reading;
+  digitalWrite(13, outputOn ? HIGH : LOW);
+  delay(10);
+}`;
+  let calls = 0;
+  let repairIssues: string[] = [];
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    repairIssues = content.validationIssues ?? [];
+    return modelResponse(JSON.stringify({ project: content.validationIssues ? repaired : broken, explanation: "Encoder button controls output", warnings: [], assumptions: [] }));
+  };
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: "Press the KY-040 encoder push switch to toggle the output." }),
+  }));
+  assert.equal(response.status, 200, JSON.stringify(repairIssues));
+  assert.equal(calls, 2);
+  assert.ok(repairIssues.some(issue => issue.includes("button behavior") && issue.includes("no observable circuit change")));
+});
+
+test("a fresh single-board request ignores boards in the previous project", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const previousProject = structuredClone(generatedEnvelope.project);
+  previousProject.components.push({ id: "old-mega", type: "arduino-mega-2560", label: "Old Mega", x: 400, y: 0 });
+  previousProject.programs = { uno: previousProject.code, "old-mega": "void setup(){} void loop(){ delay(10); }" };
+  let multipleBoardRuleSelected = false;
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    multipleBoardRuleSelected = request.systemInstruction.parts[0].text.includes("The user explicitly requested multiple boards.");
+    return modelResponse(JSON.stringify({ project: generatedEnvelope.project, explanation: "Fresh Uno circuit", warnings: [], assumptions: [] }));
+  };
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: "Create a fresh single-board Uno circuit that blinks an LED.", currentProject: previousProject }),
+  }));
+  assert.equal(response.status, 200);
+  assert.equal(multipleBoardRuleSelected, false, "the old multi-board canvas must not change a fresh-generation request into a multi-board request");
+  const body = await response.json();
+  assert.equal(body.project.components.filter((component: { type: string }) => component.type.startsWith("arduino-")).length, 1);
 });
 
 test("greenhouse mux, expander and externally supplied fan respond to live conditions", () => {
@@ -296,6 +384,67 @@ const generatedEnvelope = {
 
 test("allows complex generation to use the five-minute route window", () => {
   assert.equal(maxDuration, 300);
+});
+
+test("explicit multi-board generation validates and runs independent wired UART sketches", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const megaCode = "void setup(){ Serial1.begin(9600); } void loop(){ Serial1.println(\"A\"); delay(100); }";
+  const espCode = "void setup(){ Serial1.begin(9600); } void loop(){ if(Serial1.available()){ int value=Serial1.read(); } delay(10); }";
+  const repairedEspCode = "void setup(){ Serial1.begin(9600); Serial.begin(9600); } void loop(){ if(Serial1.available()){ int value=Serial1.read(); Serial.println(value); } delay(10); }";
+  const project = {
+    schemaVersion: 1, id: "uart-boards", name: "Wired UART controllers", description: "Two controllers exchange a byte.", board: "arduino-mega-2560",
+    components: [
+      { id: "mega", type: "arduino-mega-2560", label: "Mega sender", x: 0, y: 0 },
+      { id: "esp", type: "esp32-devkitc-v4", label: "ESP32 receiver", x: 480, y: 0 },
+    ],
+    connections: [
+      { id: "tx-rx", from: { componentId: "mega", pin: "D18" }, to: { componentId: "esp", pin: "GPIO16" } },
+      { id: "rx-tx", from: { componentId: "esp", pin: "GPIO17" }, to: { componentId: "mega", pin: "D19" } },
+      { id: "shared-ground", from: { componentId: "mega", pin: "GND" }, to: { componentId: "esp", pin: "GND" } },
+    ],
+    code: megaCode,
+    boardPrograms: [{ boardId: "mega", code: megaCode }, { boardId: "esp", code: espCode }],
+  };
+  let requestSchema: { properties?: { project?: { properties?: { boardPrograms?: unknown } } } } | undefined;
+  let calls = 0;
+  let repairIssues: string[] = [];
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    requestSchema = request.generationConfig.responseSchema;
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    repairIssues = content.validationIssues ?? [];
+    const responseProject = content.validationIssues
+      ? { ...project, boardPrograms: [{ boardId: "mega", code: megaCode }, { boardId: "esp", code: repairedEspCode }] }
+      : project;
+    return modelResponse(JSON.stringify({ project: responseProject, explanation: "Two wired controllers run separate sketches.", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompt: "Build a simulation with an Arduino Mega 2560 and ESP32 DevKitC V4 that exchange bytes over wired UART. Print each received byte in the ESP32 Serial Monitor." }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(calls, 2, "generation should repair a receiver sketch that silently discards the received byte");
+  assert.ok(repairIssues.some(issue => issue.includes("never prints or reports it")));
+  assert.ok(requestSchema?.properties?.project?.properties?.boardPrograms);
+  assert.equal(body.project.activeBoardId, "mega");
+  assert.deepEqual(body.project.programs, { mega: megaCode, esp: repairedEspCode });
+
+  const simulator = new MultiBoardSimulator();
+  simulator.attachProject(body.project);
+  simulator.run();
+  simulator.advance(0);
+  for (let step = 0; step < 20; step += 1) simulator.advance(20);
+  assert.ok(simulator.getSnapshot().boardSerial?.esp?.some(entry => entry.text === "65"), "receiver sketch should observe the sender byte through the connected RX/TX pins");
 });
 
 function modelResponse(text: string, finishReason = "STOP") {
@@ -604,7 +753,7 @@ test("returns one friendly error after all recovery attempts fail", async (conte
   assert.equal("details" in body.error, false);
 });
 
-test("terminal provider failures do not trigger recovery calls", async (context) => {
+test("transient Gemini failures are retried and expose the provider's HTTP status", async (context) => {
   const originalFetch = globalThis.fetch;
   const originalKey = process.env.GEMINI_API_KEY;
   let calls = 0;
@@ -616,13 +765,36 @@ test("terminal provider failures do not trigger recovery calls", async (context)
   process.env.GEMINI_API_KEY = "test-secret";
   globalThis.fetch = async () => {
     calls += 1;
-    return Response.json({ error: { message: "rate limited" } }, { status: 429 });
+    return Response.json({ error: { message: "temporarily unavailable" } }, { status: 503 });
   };
 
   const response = await POST(generationRequest());
-  assert.equal(response.status, 429);
-  assert.equal(calls, 1);
-  assert.equal((await response.json()).error.code, "AI_RATE_LIMITED");
+  const body = await response.json();
+  assert.equal(response.status, 503);
+  assert.equal(calls, 1 + 2);
+  assert.equal(body.error.code, "AI_UNAVAILABLE");
+  assert.match(body.error.message, /Gemini returned temporary HTTP 503/);
+});
+
+test("generation succeeds after a transient Gemini 503", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) return Response.json({ error: { message: "temporarily unavailable" } }, { status: 503 });
+    return modelResponse(JSON.stringify(generatedEnvelope));
+  };
+
+  const response = await POST(generationRequest());
+  assert.equal(response.status, 200);
+  assert.equal(calls, 2);
 });
 
 

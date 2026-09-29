@@ -917,6 +917,8 @@ body.resizing-row * {
 }
 .drawer-bar { display: flex; align-items: center; justify-content: space-between; min-width: 0; border-bottom: 1px solid var(--line-soft); background: #0d131b; }
 .bottom-tabs { display: flex; align-self: stretch; min-width: 0; }
+.sketch-board-select { display: flex; align-items: center; gap: 6px; padding: 0 10px; border-left: 1px solid var(--line-soft); border-right: 1px solid var(--line-soft); color: #718093; font: 8px var(--font-mono); white-space: nowrap; }
+.sketch-board-select select { max-width: 150px; border: 1px solid #263442; border-radius: 5px; padding: 5px 7px; background: #101821; color: #d6e0e8; font: 9px var(--font-mono); }
 .bottom-tabs button { position: relative; display: flex; align-items: center; gap: 7px; padding: 0 15px; background: transparent; color: #647281; font-size: 9px; }
 .bottom-tabs button.active { background: #101821; color: #ced8df; }
 .bottom-tabs button.active::after { position: absolute; top: -1px; right: 10px; left: 10px; height: 2px; background: var(--teal); content: ""; }
@@ -1113,7 +1115,7 @@ body.resizing-row * {
   .zoom-controls button { width: 25px; }
   .zoom-controls span { width: 32px; }
   .bottom-drawer.open { height: var(--bottom-drawer-height); }
-  .bottom-tabs button:nth-child(3),
+  .bottom-tabs button:last-child,
   .control-button,
   .drawer-toggle { display: none; }
   .statusbar span:nth-child(2),
@@ -1152,6 +1154,7 @@ body.resizing-row * {
 .device-feedback dl div { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; font-size: 12px; }
 .device-feedback dt { text-transform: capitalize; color: #a8c3d4; }
 .device-feedback dd { margin: 0; font-variant-numeric: tabular-nums; }
+.device-feedback .device-display { margin: 10px 0; padding: 10px; min-height: 72px; white-space: pre-wrap; color: #bfffee; background: #071012; border: 1px solid #315c55; border-radius: 5px; font: 12px/1.45 var(--font-mono, monospace); }
 .device-feedback textarea { width: 100%; padding: 8px; color: #f0f8ff; background: #091219; border: 1px solid #466270; border-radius: 5px; resize: vertical; }
 .device-feedback > button { padding: 8px 12px; border: 1px solid #3bbfa6; border-radius: 5px; background: #15382f; color: #e8fff9; cursor: pointer; }
 .device-feedback > button:disabled { opacity: .45; cursor: default; }

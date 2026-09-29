@@ -1,4 +1,5 @@
 import type { CircuitProject } from "./types.ts";
+import { BOARD_IDS } from "./boards.ts";
 
 /** Portable examples also serve as executable publication fixtures. */
 function example(type: string): CircuitProject {
@@ -199,6 +200,99 @@ function bq27441Example(): CircuitProject {
   p.code = `#include <SparkFunBQ27441.h>\nvoid setup(){ Serial.begin(9600); lipo.begin(); lipo.setCapacity(2000); } void loop(){ Serial.println(lipo.voltage()); Serial.println(lipo.current()); Serial.println(lipo.soc()); delay(1000); }`;
   return p;
 }
+function soilMoistureExample(): CircuitProject {
+  const p = example("soil-moisture-sen0193"), { wire } = wiring(p);
+  p.components[1].properties = { moisture: 35 };
+  wire("device", "VCC", "uno", "3V3"); wire("device", "GND", "uno", "GND"); wire("device", "AOUT", "uno", "A0");
+  p.code = "void setup(){ Serial.begin(9600); } void loop(){ Serial.println(analogRead(A0)); delay(250); }";
+  return p;
+}
+function bh1750Example(): CircuitProject {
+  const p = example("bh1750-sen0097"), { wire } = wiring(p);
+  p.components[1].properties = { lux: 485 };
+  wire("device", "VCC", "uno", "3V3"); wire("device", "GND", "uno", "GND");
+  wire("device", "SDA", "uno", "A4"); wire("device", "SCL", "uno", "A5"); wire("device", "ADD", "uno", "GND");
+  p.code = `#include <Wire.h>\n#include <BH1750.h>\nBH1750 lightMeter;\nvoid setup(){ Serial.begin(9600); Wire.begin(); lightMeter.begin(); }\nvoid loop(){ float lux = lightMeter.readLightLevel(); Serial.println(lux); delay(1000); }`;
+  return p;
+}
+function ssd1306Example(): CircuitProject {
+  const p = example("ssd1306-oled-128x64"), { wire } = wiring(p);
+  wire("device", "VCC", "uno", "3V3"); wire("device", "GND", "uno", "GND");
+  wire("device", "SDA", "uno", "A4"); wire("device", "SCL", "uno", "A5");
+  for (const [pin, y] of [["SDA", -80], ["SCL", 80]] as const) {
+    const id = `pullup-${pin}`;
+    p.components.push({ id, type: "resistor", label: "4.7 kΩ I2C pull-up", x: 260, y, properties: { resistance: 4700 } });
+    wire("device", pin, id, "1"); wire(id, "2", "uno", "3V3");
+  }
+  p.code = `#include <Wire.h>\n#include <Adafruit_SSD1306.h>\nAdafruit_SSD1306 display(128,64,&Wire,-1);\nvoid setup(){ Serial.begin(9600); Wire.begin(); display.begin(SSD1306_SWITCHCAPVCC,0x3c); display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE); display.setCursor(0,0); display.println("Cirkitra ready"); display.println("128x64 OLED"); display.display(); }\nvoid loop(){ delay(250); }`;
+  return p;
+}
+function ws2812bExample(): CircuitProject {
+  const p = example("ws2812b-strip-8"), { wire } = wiring(p);
+  p.components.push({ id: "strip-supply", type: "dc-supply", label: "5 V LED supply", x: 260, y: 220, properties: { voltage: 5, enabled: true } });
+  wire("device", "VDD", "strip-supply", "+"); wire("device", "GND", "uno", "GND"); wire("strip-supply", "-", "uno", "GND"); wire("device", "DIN", "uno", "D6");
+  p.code = `#include <Adafruit_NeoPixel.h>\n#define LED_PIN 6\n#define LED_COUNT 8\nAdafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);\nvoid setup(){ strip.begin(); strip.setBrightness(96); strip.setPixelColor(0, strip.Color(255,0,0)); strip.setPixelColor(1, strip.Color(0,255,0)); strip.setPixelColor(2, strip.Color(0,0,255)); strip.show(); }\nvoid loop(){ delay(250); }`;
+  return p;
+}
+function ky040Example(): CircuitProject {
+  const p = example("ky-040"), { wire } = wiring(p);
+  wire("device", "VCC", "uno", "5V"); wire("device", "GND", "uno", "GND");
+  wire("device", "CLK", "uno", "D2"); wire("device", "DT", "uno", "D3"); wire("device", "SW", "uno", "D4");
+  p.components.find(component => component.id === "device")!.properties = { position: 3, pressed: false };
+  p.code = `#include <Encoder.h>\nEncoder knob(2,3);\nvoid setup(){ Serial.begin(9600); pinMode(2,INPUT); pinMode(3,INPUT); pinMode(4,INPUT_PULLUP); }\nvoid loop(){ Serial.println(knob.read()); Serial.println(digitalRead(4)); delay(50); }`;
+  return p;
+}
+function keypadExample(): CircuitProject {
+  const p = example("keypad-4x4"), { wire } = wiring(p);
+  p.components.find(component => component.id === "device")!.properties = { key: "5" };
+  [9, 8, 7, 6].forEach((pin, index) => wire("device", `R${index + 1}`, "uno", `D${pin}`));
+  [5, 4, 3, 2].forEach((pin, index) => wire("device", `C${index + 1}`, "uno", `D${pin}`));
+  p.code = `#include <Keypad.h>\nconst byte ROWS=4; const byte COLS=4;\nchar keys[ROWS][COLS]={{'1','2','3','A'},{'4','5','6','B'},{'7','8','9','C'},{'*','0','#','D'}};\nbyte rowPins[ROWS]={9,8,7,6}; byte colPins[COLS]={5,4,3,2};\nKeypad keypad=Keypad(makeKeymap(keys),rowPins,colPins,ROWS,COLS);\nvoid setup(){ Serial.begin(9600); }\nvoid loop(){ Serial.println(keypad.getKey()); delay(20); }`;
+  return p;
+}
+function relayExample(): CircuitProject {
+  const p = example("relay-module-1ch-active-low"), { wire } = wiring(p);
+  p.components.push({ id: "resistor", type: "resistor", label: "220 Ω", x: 900, y: 0, properties: { resistance: 220 } }, { id: "led", type: "led", label: "Switched load", x: 1120, y: 0 });
+  wire("device", "VCC", "uno", "5V"); wire("device", "GND", "uno", "GND"); wire("device", "IN", "uno", "D2");
+  wire("uno", "5V", "device", "COM"); wire("device", "NO", "resistor", "1"); wire("resistor", "2", "led", "A"); wire("led", "K", "uno", "GND");
+  p.code = `void setup(){ pinMode(2,OUTPUT); digitalWrite(2,LOW); }\nvoid loop(){ delay(500); digitalWrite(2,HIGH); delay(500); digitalWrite(2,LOW); }`;
+  return p;
+}
+function ds3231Example(): CircuitProject {
+  const p = example("ds3231-rtc"), { wire } = wiring(p);
+  p.components.find(component => component.id === "device")!.properties = { startYear: 2026, startMonth: 8, startDay: 24, startHour: 14, startMinute: 35, startSecond: 57 };
+  wire("device", "VCC", "uno", "3V3"); wire("device", "GND", "uno", "GND");
+  wire("device", "SDA", "uno", "A4"); wire("device", "SCL", "uno", "A5");
+  p.code = `#include <Wire.h>\nvoid setup(){ Serial.begin(9600); Wire.begin(); }\nvoid loop(){ Wire.beginTransmission(0x68); Wire.write(0); Wire.endTransmission(); Wire.requestFrom(0x68,7); Serial.println(Wire.read()); delay(1000); }`;
+  return p;
+}
+function microSdExample(): CircuitProject {
+  const p = example("micro-sd-spi-module"), { wire } = wiring(p);
+  wire("device", "VIN", "uno", "5V"); wire("device", "GND", "uno", "GND");
+  wire("device", "CLK", "uno", "D13"); wire("device", "DO", "uno", "D12"); wire("device", "DI", "uno", "D11"); wire("device", "CS", "uno", "D10"); wire("device", "CD", "uno", "D7");
+  p.code = `#include <SPI.h>\n#include <SD.h>\nconst int chipSelect=10;\nvoid setup(){ Serial.begin(9600); SPI.begin(); SD.begin(chipSelect); File logFile=SD.open("LOG.TXT",FILE_WRITE); logFile.println("Cirkitra SD"); logFile.close(); File saved=SD.open("LOG.TXT",FILE_READ); Serial.println(saved.read()); saved.close(); }\nvoid loop(){ delay(100); }`;
+  return p;
+}
+function mfrc522Example(): CircuitProject {
+  const p = example("mfrc522-rfid-module"), { wire } = wiring(p);
+  const board = p.components.find(component => component.id === "uno")!;
+  board.type = "esp32-devkitc-v4"; board.label = "ESP32 DevKitC V4"; p.board = "esp32-devkitc-v4";
+  p.components.find(component => component.id === "device")!.properties = { tagPresent: true, tagUid: "DEADBEEF" };
+  wire("device", "VCC", "uno", "3V3"); wire("device", "GND", "uno", "GND");
+  wire("device", "NSS", "uno", "GPIO5"); wire("device", "SCK", "uno", "GPIO18"); wire("device", "MOSI", "uno", "GPIO23"); wire("device", "MISO", "uno", "GPIO19"); wire("device", "RST", "uno", "GPIO22");
+  p.code = `#include <SPI.h>\n#include <MFRC522.h>\n#define SS_PIN 5\n#define RST_PIN 22\nMFRC522 reader(SS_PIN,RST_PIN);\nvoid setup(){ Serial.begin(9600); SPI.begin(); reader.PCD_Init(); }\nvoid loop(){ if(reader.PICC_IsNewCardPresent() && reader.PICC_ReadCardSerial()){ Serial.println(reader.uid.uidByte[0]); reader.PICC_HaltA(); } delay(100); }`;
+  return p;
+}
+function a4988Example(): CircuitProject {
+  const p = example("a4988-stepper-driver"), { wire } = wiring(p);
+  p.components.push({ id: "motor", type: "bipolar-stepper-motor", label: "Bipolar Stepper", x: 900, y: 0, properties: { stepsPerRevolution: 200 } }, { id: "motor-supply", type: "dc-supply", label: "12 V motor supply", x: 250, y: 230, properties: { voltage: 12, enabled: true } });
+  wire("device", "VDD", "uno", "5V"); wire("device", "VMOT", "motor-supply", "+");
+  wire("motor-supply", "-", "uno", "GND"); wire("device", "GND_14", "uno", "GND"); wire("device", "GND_15", "uno", "GND");
+  for (const [output, motorPin] of [["1A", "1A"], ["1B", "1B"], ["2A", "2A"], ["2B", "2B"]] as const) wire("device", output, "motor", motorPin);
+  for (const [pin, boardPin] of [["STEP", "D2"], ["DIR", "D3"], ["EN", "D4"], ["RST", "D5"], ["SLP", "D6"]] as const) wire("device", pin, "uno", boardPin);
+  p.code = `void setup(){ pinMode(2,OUTPUT); pinMode(3,OUTPUT); pinMode(4,OUTPUT); pinMode(5,OUTPUT); pinMode(6,OUTPUT); digitalWrite(3,HIGH); digitalWrite(4,LOW); digitalWrite(5,HIGH); digitalWrite(6,HIGH); digitalWrite(2,LOW); }\nvoid loop(){ digitalWrite(2,HIGH); delay(10); digitalWrite(2,LOW); delay(10); }`;
+  return p;
+}
 function bq24074Example(): CircuitProject {
   const p = example("bq24074"), { wire } = wiring(p);
   p.components[1].properties = {};
@@ -248,12 +342,56 @@ function bq76920Example(): CircuitProject {
   p.code = `#include <bq769x0.h>\nbq769x0 monitor(bq76920,0x08); void setup(){ Serial.begin(9600); monitor.begin(2); monitor.enableDischarging(); } void loop(){ monitor.update(); Serial.println(monitor.getBatteryVoltage()); Serial.println(monitor.getCellVoltage(1)); Serial.println(monitor.getBatteryCurrent()); delay(250); }`;
   return p;
 }
+function boardExample(type: string): CircuitProject {
+  const pin = ({
+    "arduino-mega-2560": "D13",
+    "arduino-nano-classic": "D13",
+    "esp32-devkitc-v4": "GPIO4",
+    "esp8266-nodemcu-v1": "D1",
+    "raspberry-pi-pico": "GP15",
+  } as Record<string, string>)[type];
+  const profile = ({
+    "arduino-mega-2560": { id: type, pin, ground: "GND" },
+    "arduino-nano-classic": { id: type, pin, ground: "GND" },
+    "esp32-devkitc-v4": { id: type, pin, ground: "GND" },
+    "esp8266-nodemcu-v1": { id: type, pin, ground: "GND" },
+    "raspberry-pi-pico": { id: type, pin, ground: "GND" },
+  } as Record<string, { id: string; pin: string; ground: string }>)[type];
+  if (!profile) throw new Error(`No example is registered for board ${type}.`);
+  const project: CircuitProject = {
+    schemaVersion: 1, id: `example-${type}`, name: `${type} GPIO demonstration`, description: "A wired, executable board pin example.", board: type as CircuitProject["board"], code: `void setup(){ pinMode(${pin}, OUTPUT); } void loop(){ digitalWrite(${pin}, HIGH); delay(500); digitalWrite(${pin}, LOW); delay(500); }`,
+    components: [
+      { id: "board", type, label: type, x: 0, y: 0 },
+      { id: "resistor", type: "resistor", label: "220 Ω", x: 420, y: 0, properties: { resistance: 220 } },
+      { id: "device", type: "led", label: "GPIO indicator", x: 650, y: 0 },
+    ],
+    connections: [
+      { id: "gpio-to-resistor", from: { componentId: "board", pin }, to: { componentId: "resistor", pin: "1" } },
+      { id: "resistor-to-led", from: { componentId: "resistor", pin: "2" }, to: { componentId: "device", pin: "A" } },
+      { id: "led-to-ground", from: { componentId: "device", pin: "K" }, to: { componentId: "board", pin: profile.ground } },
+    ],
+  };
+  return project;
+}
 export const COMPONENT_EXAMPLES: Readonly<Record<string, () => CircuitProject>> = {
+  ...Object.fromEntries(BOARD_IDS.filter(id => id !== "arduino-uno").map(id => [id, () => boardExample(id)])),
   cd74hc4067: () => muxExample("cd74hc4067"), cd74hc4051: () => muxExample("cd74hc4051"), "74hc138": decoderExample,
   tb6612fng: () => driverExample("tb6612fng"), drv8833: () => driverExample("drv8833"), l298: () => driverExample("l298"),
   bme280: () => i2cSensorExample("bme280"), bmp280: () => i2cSensorExample("bmp280"), "sht31-dis": () => i2cSensorExample("sht31-dis"), ds18b20: oneWireExample,
   dht22: dhtExample, "mpu-6050": imuExample, tca9548a: tcaExample, mcp23017: mcpExample, "74hc595": shiftRegisterExample, rfm95w: loraExample,
   "xbee-s2c-zigbee-th": xbeeExample,
+  "soil-moisture-sen0193": soilMoistureExample,
+  "bh1750-sen0097": bh1750Example,
+  "ssd1306-oled-128x64": ssd1306Example,
+  "ws2812b-strip-8": ws2812bExample,
+  "ky-040": ky040Example,
+  "keypad-4x4": keypadExample,
+  "relay-module-1ch-active-low": relayExample,
+  "ds3231-rtc": ds3231Example,
+  "micro-sd-spi-module": microSdExample,
+  "mfrc522-rfid-module": mfrc522Example,
+  "a4988-stepper-driver": a4988Example,
+  "bipolar-stepper-motor": a4988Example,
   "bq27441-g1": bq27441Example,
   bq24074: bq24074Example, bq76920: bq76920Example,
   "dc-supply": () => powerPrimitiveExample("dc-supply"), "battery-cell": () => powerPrimitiveExample("battery-cell"),

@@ -116,6 +116,16 @@ const pirSensor: ElectricalModel = { evaluate(c) {
   if (r.powered) r.outputs.OUT = Number(c.component.properties?.motion === true);
   return r;
 } };
+const soilMoistureSensor: ElectricalModel = { evaluate(c) {
+  const r = result(c, ["VCC"], ["GND"]);
+  if (r.powered) {
+    const moisture = Math.max(0, Math.min(100, Number(c.component.properties?.moisture ?? 50)));
+    // This is a normalized demonstration curve, not a voltage calibration or
+    // volumetric-water-content estimate for a particular soil/probe.
+    r.outputs.AOUT = Number.isFinite(moisture) ? 1 - moisture / 100 : 0.5;
+  }
+  return r;
+} };
 function gate(operation: (a: boolean, b: boolean) => boolean, unary = false): ElectricalModel {
   return { evaluate(c) {
     const r = result(c, ["VCC"], ["GND"]);
@@ -129,6 +139,7 @@ export const ELECTRICAL_MODELS: Readonly<Record<string, ElectricalModel>> = {
   "mux-4067": mux(16, "I", ["GND"]), "mux-4051": mux(8, "A", ["GND", "VEE"]),
   "decoder-138": decoder, "driver-tb6612": tb6612, "driver-drv8833": drv8833, "driver-l298": l298, l293d,
   "temperature-sensor": analogTemperatureSensor, "pir-sensor": pirSensor,
+  "soil-moisture-sen0193": soilMoistureSensor,
   "logic-and": gate((a, b) => a && b), "logic-or": gate((a, b) => a || b), "logic-xor": gate((a, b) => a !== b),
   "logic-nand": gate((a, b) => !(a && b)), "logic-nor": gate((a, b) => !(a || b)), "logic-not": gate(a => !a, true),
   potentiometer: { evaluate(c) {

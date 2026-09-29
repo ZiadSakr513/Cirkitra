@@ -1,7 +1,7 @@
 import { getComponentDefinition } from "./catalog.ts";
 import type { CircuitComponent, CircuitConnection, CircuitProject, ConnectionEndpoint } from "./types.ts";
+import { boardApiConstants, getBoardProfile, isBoardType, resolveBoardPin } from "./boards.ts";
 
-const UNO_GROUND_PINS = ["GND", "GND2", "GND3"] as const;
 
 function uniqueComponentId(preferred: string, occupied: Set<string>) {
   let id = preferred.replace(/[^A-Za-z0-9_-]/g, "-");
@@ -26,30 +26,33 @@ function replaceEndpoint(
  * Further returns receive their own zero-volt ground terminal beside the load.
  */
 export function normalizeGroundReturns(project: CircuitProject): CircuitProject {
-  const uno = project.components.find((component) => component.type === "arduino-uno");
-  if (!uno) return project;
-
+  const boards = new Map(project.components.filter(component => isBoardType(component.type)).map(board => [board.id, board]));
+  if (boards.size === 0) return project;
   const componentById = new Map(project.components.map((component) => [component.id, component]));
   const occupiedIds = new Set(project.components.map((component) => component.id));
   const additions: CircuitComponent[] = [];
-  let groundReturnIndex = 0;
+  const groundReturnIndexes = new Map<string, number>();
   let changed = false;
 
   const connections = project.connections.map((original) => {
-    const side = original.from.componentId === uno.id && /^GND\d*$/.test(original.from.pin)
-      ? "from"
-      : original.to.componentId === uno.id && /^GND\d*$/.test(original.to.pin)
-        ? "to"
-        : null;
+    const fromBoard = boards.get(original.from.componentId);
+    const toBoard = boards.get(original.to.componentId);
+    const fromGroundPins = fromBoard ? getBoardProfile(fromBoard.type)?.groundPins ?? [] : [];
+    const toGroundPins = toBoard ? getBoardProfile(toBoard.type)?.groundPins ?? [] : [];
+    const side = fromGroundPins.includes(original.from.pin) ? "from" : toGroundPins.includes(original.to.pin) ? "to" : null;
     if (!side) return original;
 
+    const board = side === "from" ? fromBoard! : toBoard!;
+    const boardGroundPins = side === "from" ? fromGroundPins : toGroundPins;
+    const groundReturnIndex = groundReturnIndexes.get(board.id) ?? 0;
+    groundReturnIndexes.set(board.id, groundReturnIndex + 1);
+
     const loadEndpoint = side === "from" ? original.to : original.from;
-    const assignedPin = UNO_GROUND_PINS[groundReturnIndex];
-    groundReturnIndex += 1;
+    const assignedPin = boardGroundPins[groundReturnIndex];
     if (assignedPin) {
       if (original[side].pin === assignedPin) return original;
       changed = true;
-      return replaceEndpoint(original, side, { componentId: uno.id, pin: assignedPin });
+      return replaceEndpoint(original, side, { componentId: board.id, pin: assignedPin });
     }
 
     const load = componentById.get(loadEndpoint.componentId);
@@ -60,8 +63,8 @@ export function normalizeGroundReturns(project: CircuitProject): CircuitProject 
       id: groundId,
       type: "ground",
       label: `GND ${overflowIndex + 1}`,
-      x: (load?.x ?? uno.x) + ((definition?.width ?? 80) - 56) / 2 + (overflowIndex % 3) * 14,
-      y: (load?.y ?? uno.y) + (definition?.height ?? 80) + 34 + Math.floor(overflowIndex / 3) * 72,
+      x: (load?.x ?? board.x) + ((definition?.width ?? 80) - 56) / 2 + (overflowIndex % 3) * 14,
+      y: (load?.y ?? board.y) + (definition?.height ?? 80) + 34 + Math.floor(overflowIndex / 3) * 72,
       rotation: 0,
       properties: { automatic: true },
     });
@@ -78,7 +81,7 @@ export function connectFloatingMotorDriverEnables(
   project: CircuitProject,
   options: { preserveStandbyControl?: boolean } = {},
 ): CircuitProject {
-  const uno = project.components.find((component) => component.type === "arduino-uno");
+  const boards = project.components.filter((component) => isBoardType(component.type));
   const connections = project.connections.map((connection) => ({
     ...connection,
     from: { ...connection.from },
@@ -86,8 +89,9 @@ export function connectFloatingMotorDriverEnables(
   }));
   const usedIds = new Set(connections.map((connection) => connection.id));
   let changed = false;
+  const projectPrograms = boards.map(board => project.programs?.[board.id] ?? (board.type === project.board ? project.code : ""));
   const preserveStandbyControl = options.preserveStandbyControl === true
-    || /\b(?:pinMode|digitalWrite|analogWrite)\s*\([^)]*\b(?:STBY|standby|nSLEEP)\w*\b/i.test(project.code);
+    || projectPrograms.some(source => /\b(?:pinMode|digitalWrite|analogWrite)\s*\([^)]*\b(?:STBY|standby|nSLEEP)\w*\b/i.test(source));
   const connected = (componentId: string, pin: string) => connections.some(({ from, to }) =>
     (from.componentId === componentId && from.pin === pin) || (to.componentId === componentId && to.pin === pin));
   const addConnection = (idBase: string, from: CircuitConnection["from"], to: CircuitConnection["to"]) => {
@@ -99,11 +103,25 @@ export function connectFloatingMotorDriverEnables(
     changed = true;
   };
 
+  const boardForDriver = (driverId: string, controlPins: readonly string[]) => {
+    for (const connection of connections) {
+      const endpoint = [connection.from, connection.to].find(item => item.componentId === driverId && controlPins.includes(item.pin));
+      if (!endpoint) continue;
+      const peer = connection.from === endpoint ? connection.to : connection.from;
+      const board = boards.find(candidate => candidate.id === peer.componentId);
+      if (board) return board;
+    }
+    return boards.find(candidate => candidate.id === project.activeBoardId) ?? boards.find(candidate => candidate.type === project.board) ?? boards[0];
+  };
+
   for (const driver of project.components) {
-    if (driver.type === "l293d" && uno) {
+    const driverBoard = boardForDriver(driver.id, ["EN1", "EN2", "IN1", "IN2", "IN3", "IN4", "A1", "A2", "B1", "B2", "ENA", "ENB", "STBY", "nSLEEP"]);
+    if (driver.type === "l293d" && driverBoard) {
       for (const [enable, outputs] of [["EN1", ["OUT1", "OUT2"]], ["EN2", ["OUT3", "OUT4"]]] as const) {
         if (connected(driver.id, enable) || !outputs.some((pin) => connected(driver.id, pin))) continue;
-        addConnection(`enable-${driver.id}-${enable}`, { componentId: uno.id, pin: "5V" }, { componentId: driver.id, pin: enable });
+        const profile = getBoardProfile(driverBoard.type)!;
+        const rail = profile.rails["5V"] !== undefined ? "5V" : Object.keys(profile.rails)[0];
+        if (rail) addConnection(`enable-${driver.id}-${enable}`, { componentId: driverBoard.id, pin: rail }, { componentId: driver.id, pin: enable });
       }
     }
 
@@ -129,12 +147,14 @@ export function connectFloatingMotorDriverEnables(
       const standbyEndpoint = standbyWire.from.componentId === driver.id && standbyWire.from.pin === "STBY"
         ? standbyWire.to
         : standbyWire.from;
-      if (standbyEndpoint.componentId !== uno?.id) continue;
-      const pinMatch = standbyEndpoint.pin.match(/^(D|A)(\d+)$/);
-      if (!pinMatch) continue;
-      const codePin = Number(pinMatch[2]) + (pinMatch[1] === "A" ? 14 : 0);
-      const codeRefsPin = (pin: string, number: number) => new RegExp(`\\b(?:${pin}|${number})\\b`, "i").test(project.code);
-      if (codeRefsPin(standbyEndpoint.pin, codePin) || (pinMatch[1] === "A" && codeRefsPin(standbyEndpoint.pin, Number(pinMatch[2])))) continue;
+      const standbyBoard = boards.find(candidate => candidate.id === standbyEndpoint.componentId);
+      if (!standbyBoard) continue;
+      const codePin = resolveBoardPin(standbyBoard.type, standbyEndpoint.pin);
+      if (codePin === undefined) continue;
+      const source = project.programs?.[standbyBoard.id] ?? (standbyBoard.type === project.board ? project.code : "");
+      const codeRefsPin = (pin: string, number: number) => new RegExp(`\\b(?:${pin}|${number})\\b`, "i").test(source);
+      const aliases = Object.entries(boardApiConstants(standbyBoard.type)).filter(([, value]) => value === codePin).map(([name]) => name);
+      if (codeRefsPin(standbyEndpoint.pin, codePin) || aliases.some(alias => codeRefsPin(alias, codePin))) continue;
 
       // A TB6612 STBY wire ending at an unused MCU input is physically connected
       // but electrically floating. Replace that endpoint with the known VCC net.

@@ -1,5 +1,6 @@
 import { getComponentDefinition } from "./catalog.ts";
 import type { CircuitProject } from "./types.ts";
+import { getBoardProfile, isBoardType } from "./boards.ts";
 
 /** Check known rail voltages without pretending the normalized solver models volts. */
 export function validatePartWiring(project: CircuitProject) {
@@ -12,8 +13,8 @@ export function validatePartWiring(project: CircuitProject) {
     graph.get(a)!.add(b); graph.get(b)!.add(a);
   }
   const voltages = new Map<string, number>();
-  for (const part of project.components) if (part.type === "arduino-uno") {
-    voltages.set(key(part.id, "5V"), 5); voltages.set(key(part.id, "3V3"), 3.3); voltages.set(key(part.id, "IOREF"), 5);
+  for (const part of project.components) if (isBoardType(part.type)) {
+    Object.entries(getBoardProfile(part.type)!.rails).forEach(([pin, volts]) => voltages.set(key(part.id, pin), volts));
   }
   for (const part of project.components) {
     const definition = getComponentDefinition(part.type);

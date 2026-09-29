@@ -6,14 +6,15 @@ import {
   INTERNAL_COMPONENT_CATALOG,
   type CircuitProject as SharedCircuitProject,
 } from "../../../../lib/circuit/index.ts";
-import { ArduinoSimulator, compileArduinoSketch, solveCircuit } from "../../../../lib/simulator/index.ts";
+import { ArduinoSimulator, MultiBoardSimulator, compileArduinoSketch, solveCircuit } from "../../../../lib/simulator/index.ts";
 
 import { selectGenerationComponents, type GenerationTarget } from "../../../../lib/circuit/discovery.ts";
 import { validatePartWiring } from "../../../../lib/circuit/electrical-metadata.ts";
 import type { ComponentPropertyDefinition } from "../../../../lib/circuit/catalog.ts";
 import { DEVICE_APIS } from "../../../../lib/simulator/device-api.ts";
+import { BOARD_IDS, BOARD_PROFILES, isBoardType } from "../../../../lib/circuit/boards.ts";
 
-type GenerationContext = { target: GenerationTarget; prompt: string; components: ReturnType<typeof selectGenerationComponents> };
+type GenerationContext = { target: GenerationTarget; prompt: string; components: ReturnType<typeof selectGenerationComponents>; multipleBoards: boolean };
 const WIRING_GUIDANCE: Record<string, string> = {
   bme280: "This is the bare BME280 chip, so it has no onboard I2C pull-ups. For I2C: VDD, VDDIO and CSB to 3V3; both GND_1 and GND_7 to ground; SDO to ground for address 0x76; SDI to Uno A4/SDA and SCK to Uno A5/SCL. Add TWO separate 4.7k ohm resistor components: one from the SDI/SDA net to 3V3 and one from the SCK/SCL net to 3V3. Do not use the user's 220 ohm LED resistor as a bus pull-up. Wire these pins; properties are not power connections.",
   l293d: "For one small 5V motor, connect both VSS and VS to Arduino 5V, and connect GND1, GND2, GND3 and GND4 to common ground. Arduino VIN is an input, not a power output: never use VIN to supply VS. Connect motor channel A between OUT1 and OUT2; EN1 must go to a PWM pin or 5V, and IN1/IN2 to digital outputs. Hold unused channel B disabled with EN2, IN3 and IN4 low. For a motor requiring a separate supply, use a supported DC supply with its negative tied to common ground and its positive connected to VS.",
@@ -36,6 +37,8 @@ const MAX_REQUEST_BYTES = 100_000;
 const CHAT_TIMEOUT_MS = 45_000;
 const GENERATION_BUDGET_MS = 285_000;
 const MAX_REPAIR_CONTENT_LENGTH = 30_000;
+const MAX_TRANSIENT_PROVIDER_RETRIES = 2;
+const PROVIDER_RETRY_DELAYS_MS = [250, 750] as const;
 
 /** Allow complex structured generation to use Vercel's five-minute function window. */
 export const maxDuration = 300;
@@ -123,6 +126,14 @@ const OUTPUT_SCHEMA = {
           },
         },
         code: { type: "string" },
+        boardPrograms: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { boardId: { type: "string" }, code: { type: "string" } },
+            required: ["boardId", "code"],
+          },
+        },
       },
       required: [
         "schemaVersion",
@@ -194,7 +205,7 @@ function generationSchema(context: GenerationContext) {
 }
 
 const systemPrompt = (context: GenerationContext) => `You are the circuit-design engine for Cirkitra.
-Generate a complete, electrically sensible Arduino Uno digital circuit and an Arduino C++ sketch from the user's request.
+Generate a complete, electrically sensible circuit and Arduino-style sketch for the supported development board(s) requested. Use the explicitly requested board when provided; otherwise choose Arduino Uno.
 
 The request payload includes mode: "create" or mode: "edit".
 - In create mode, generate a completely fresh circuit containing only parts relevant to the request. Do not retain or infer unrelated parts from any prior design.
@@ -214,21 +225,26 @@ Use the exact registered header and class names above, including Adafruit_MCP23X
 Required wiring details for the retrieved parts:
 ${context.components.map(part => WIRING_GUIDANCE[part.id] ? `${part.id}: ${WIRING_GUIDANCE[part.id]}` : "").filter(Boolean).join("\n")}
 
+SUPPORTED BOARD PROFILES:
+${BOARD_IDS.map(id => JSON.stringify({ id, name: BOARD_PROFILES[id].displayName, mcu: BOARD_PROFILES[id].mcu, logicVoltage: BOARD_PROFILES[id].logicVoltage, adcBits: BOARD_PROFILES[id].analogResolutionBits, pins: BOARD_PROFILES[id].ioPins.filter(pin => !pin.reserved).map(pin => ({ id: pin.id, runtime: pin.runtimePin, signals: pin.signals })), buses: { i2c: BOARD_PROFILES[id].i2c, spi: BOARD_PROFILES[id].spi, uart: BOARD_PROFILES[id].uart } })).join("\n")}
+
 VALIDATION RULES - THESE MUST BE FOLLOWED EXACTLY:
-- Include exactly one arduino-uno component. Every connection MUST reference ONLY component IDs that exist in your components array.
+${context.multipleBoards
+    ? "- The user explicitly requested multiple boards. Include at least two and at most six supported board components. Give every placed board its own independent complete sketch in project.boardPrograms as [{boardId: componentId, code: sketch}, ...]. boardId must be that board component's exact id. Include every board exactly once. project.board must match one placed board and project.code must exactly duplicate that board's boardPrograms sketch. Wire board communication through the stated physical UART or I2C pins; do not invent implicit links."
+    : "- Include exactly one supported board component. Use the named board if the user requested one, or arduino-uno if no board was specified. Never add extra boards unless the user explicitly asks for multiple controllers or board-to-board communication. The project.board value must equal the selected board component's type. Do not include project.boardPrograms."}
 - MAXIMUM 500 CONNECTIONS - You can create complex circuits with many components.
 - Every connection MUST use ONLY the exact pin names listed above for that component type. VERIFY each pin name against the catalog before using it.
-- PIN NAME EXAMPLES: Arduino uses "D0", "D1", "A0", "A1", "5V", "GND" etc. LEDs use "A", "K". Resistors use "1", "2". CHECK THE CATALOG!
+- Copy all board pin names, including rails, exactly from the selected board's catalog entry. LEDs use "A", "K". Resistors use "1", "2". CHECK THE CATALOG!
 - Component IDs must be unique, identifier-safe (letters first, then letters, digits, hyphens, or underscores only).
 - Use only supported parts from the catalog above. Never replace explicitly requested unavailable hardware with a different component.
 - Add current-limiting resistors (220-330 ohms) for ALL LEDs. Drive DC motors through the requested supported motor driver (such as TB6612FNG, DRV8833, L298, or L293D), never directly from Arduino pins. Preserve the user's requested driver.
 - For every used L293D motor channel, connect its EN1/EN2 pin to an Arduino PWM output or 5V. Connect VSS, VS, and ground. A disconnected enable pin leaves that motor stopped even while the sketch is running.
-- GROUND RULES: ALWAYS use Arduino's GND, GND2, and GND3 pins first. ONLY add separate ground components if you need MORE than 3 ground connections. Never create power-to-ground shorts. Prefer Arduino ground pins over ground components!
+- GROUND RULES: Use the selected board's GND pins from its catalog, then add separate Ground components when needed. Never create power-to-ground shorts.
 - Power all logic gates from VCC and GND pins. RGB LEDs and seven-segment displays are common-cathode (connect COM to ground).
 - Arduino CODE RULES - Your code will be compiled and executed:
   * Must include EXACTLY "void setup()" and "void loop()" - these exact function signatures
   * Use these core Arduino functions plus the registered device adapter methods listed above: millis(), delay(), pinMode(), digitalRead(), digitalWrite(), analogRead(), analogWrite(), pulseIn(), map(), constrain(), isnan(), min(), max(), tone(), noTone(), Serial.begin(), Serial.print(), Serial.println()
-  * Uno schematic labels D0 through D13 correspond to integer code pins 0 through 13. In C++ use numeric pins (for example pinMode(6, OUTPUT), digitalWrite(6, HIGH), analogWrite(5, 153)); never write D6 or D5 as code identifiers.
+  * Use the selected board profile's runtime GPIO numbers in pinMode(), digitalRead(), digitalWrite(), analogRead(), and analogWrite(). Use only pins that support the requested signal on that board; do not assume another board's pin numbering or voltage.
   * For Servo: Include <Servo.h>, create Servo object, use .attach(), .write(), .read()
   * For LCD: Include <LiquidCrystal.h>, create LiquidCrystal object, use .begin(), .clear(), .setCursor(), .print(), .println()
   * NO custom helper functions, NO recursion, NO switch statements, NO unbounded while loops
@@ -249,7 +265,7 @@ EXAMPLE CONNECTION (COPY THIS EXACT PATTERN):
 }
 
 COMMON PIN NAME ERRORS TO AVOID:
-- Arduino Uno ground pins are "GND", "GND2", and "GND3". L293D ground pins are "GND1", "GND2", "GND3", and "GND4"; preserve those exact names and wire all four for real hardware.
+- Board ground pin names and counts vary. Copy the exact GND pins from the selected board catalog. L293D ground pins are "GND1", "GND2", "GND3", and "GND4"; preserve those exact names and wire all four for real hardware.
 - ❌ WRONG: "5v", "Vcc" → ✅ CORRECT: "5V", "VCC"
 - ❌ WRONG: "anode", "cathode" → ✅ CORRECT: "A", "K"
 - ❌ WRONG: "SIG1", "OUT1" → ✅ CORRECT: "SIG", "OUT"
@@ -258,7 +274,7 @@ COMMON PIN NAME ERRORS TO AVOID:
 - Return ONLY valid JSON matching the schema exactly, with no Markdown fences or prose.
 
 The top-level JSON object must have exactly these fields:
-- project: { schemaVersion: 1, id, name, description, board: "arduino-uno", components, connections, code }
+- project: { schemaVersion: 1, id, name, description, board: supported board type ID, components, connections, code${context.multipleBoards ? ", boardPrograms: [{ boardId: placed board component ID, code: that board's sketch }]" : ""} }
 - explanation: a concise string
 - assumptions: an array of strings
 - warnings: an array of strings
@@ -314,15 +330,37 @@ type GeneratedEnvelope = {
     id: string;
     name: string;
     description: string;
-    board: "arduino-uno";
+    board: SharedCircuitProject["board"];
     components: CircuitComponent[];
     connections: CircuitConnection[];
     code: string;
+    programs?: Record<string, string>;
+    activeBoardId?: string;
   };
   explanation: string;
   assumptions: string[];
   warnings: string[];
 };
+
+function namedBoardTypes(prompt: string): string[] {
+  const normalized = prompt.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const aliases: Record<string, string[]> = {
+    "arduino-uno": ["arduino uno", "uno rev3"],
+    "arduino-mega-2560": ["arduino mega 2560", "mega 2560", "mega2560"],
+    "arduino-nano-classic": ["classic arduino nano", "classic nano", "arduino nano", "nano atmega328p"],
+    "esp32-devkitc-v4": ["esp32 devkitc v4", "esp32 devkitc", "esp32 wroom 32e", "esp32"],
+    "esp8266-nodemcu-v1": ["esp8266 nodemcu v1", "esp8266 nodemcu", "nodemcu esp8266", "esp8266"],
+    "raspberry-pi-pico": ["raspberry pi pico", "rp2040 pico", "pico board"],
+  };
+  return BOARD_IDS.filter(id => (aliases[id] ?? [id.replace(/-/g, " ")]).some(alias => ` ${normalized} `.includes(` ${alias} `)));
+}
+
+function explicitlyRequestsMultipleBoards(prompt: string): boolean {
+  const named = namedBoardTypes(prompt);
+  return named.length > 1
+    || /\b(?:multiple|two|three|four|2|3|4)\s+(?:microcontrollers?|controllers?|development\s+boards?|boards?)\b/i.test(prompt)
+    || /\bboard[\s-]?to[\s-]?board\b|\bbetween\s+(?:the\s+)?boards\b|\bboards?\s+(?:communicate|communicating|exchange\s+data)\b/i.test(prompt);
+}
 
 type ValidationResult =
   | { ok: true; value: GeneratedEnvelope }
@@ -482,10 +520,14 @@ function sanitizeProperties(
   return Object.keys(result).length ? result : undefined;
 }
 
+function simulatorForProject(project: SharedCircuitProject, code: string) {
+  return project.programs ? new MultiBoardSimulator(code) : new ArduinoSimulator(code);
+}
+
 function simulateButtonScenario(project: SharedCircuitProject, code: string, buttonId: string | undefined): ReturnType<ArduinoSimulator["getSnapshot"]>[] {
   const scenario = structuredClone(project);
   for (const component of scenario.components) {
-    if (component.type === "push-button") {
+    if (component.type === "push-button" || component.type === "ky-040") {
       component.properties = { ...component.properties, pressed: component.id === buttonId };
     }
     if (component.properties && typeof component.properties.temperature === "number") {
@@ -494,7 +536,7 @@ function simulateButtonScenario(project: SharedCircuitProject, code: string, but
       component.properties.temperature = 26;
     }
   }
-  const simulator = new ArduinoSimulator(code);
+  const simulator = simulatorForProject(scenario, code);
   simulator.attachProject(scenario);
   simulator.run();
   const frames = [simulator.getSnapshot()];
@@ -509,7 +551,7 @@ function hasObservableButtonEffect(project: SharedCircuitProject, released: Retu
     serial: snapshot.serial.map(entry => entry.text),
     devices: Object.fromEntries(Object.entries(snapshot.componentStates).filter(([id]) => {
       const type = project.components.find(component => component.id === id)?.type;
-      return type !== "push-button" && type !== "arduino-uno";
+      return type !== "push-button" && type !== "ky-040" && !isBoardType(type ?? "");
     })),
   });
   return released.some((frame, index) => JSON.stringify(visibleState(frame)) !== JSON.stringify(visibleState(pressed[index])));
@@ -529,9 +571,10 @@ function validateGeneratedEnvelope(value: unknown, context: GenerationContext): 
   if (rawProject.schemaVersion !== 1) {
     issues.push("project.schemaVersion must be 1");
   }
-  if (rawProject.board !== "arduino-uno") {
-    issues.push("project.board must be arduino-uno");
-  }
+  const boardType = typeof rawProject.board === "string" && isBoardType(rawProject.board)
+    ? rawProject.board as SharedCircuitProject["board"]
+    : undefined;
+  if (!boardType) issues.push(`project.board must be one of the supported board IDs: ${BOARD_IDS.join(", ")}`);
 
   const rawComponents = rawProject.components;
   const components: CircuitComponent[] = [];
@@ -593,11 +636,33 @@ function validateGeneratedEnvelope(value: unknown, context: GenerationContext): 
     }
   }
 
-  const boardCount = components.filter(
-    (component) => component.type === "arduino-uno",
-  ).length;
-  if (boardCount !== 1) {
-    issues.push("project.components must contain exactly one arduino-uno");
+  const boardComponents = components.filter(component => isBoardType(component.type));
+  if (context.multipleBoards) {
+    if (boardComponents.length < 2 || boardComponents.length > BOARD_IDS.length) issues.push(`project.components must contain between 2 and ${BOARD_IDS.length} supported boards because this request explicitly asks for multiple controllers.`);
+  } else if (boardComponents.length !== 1) {
+    issues.push("project.components must contain exactly one supported board unless the request explicitly asks for multiple controllers or board-to-board communication.");
+  }
+  if (boardType && !boardComponents.some(component => component.type === boardType)) issues.push("project.board must match the type of its board component");
+
+  const boardPrograms: Record<string, string> = {};
+  if (context.multipleBoards) {
+    const rawBoardPrograms = rawProject.boardPrograms;
+    if (!Array.isArray(rawBoardPrograms)) {
+      issues.push("project.boardPrograms must provide an independent sketch for every placed board when multiple boards are requested.");
+    } else {
+      for (const [index, rawProgram] of rawBoardPrograms.entries()) {
+        if (!isRecord(rawProgram)) { issues.push(`project.boardPrograms[${index}] must be an object.`); continue; }
+        const boardId = identifier(rawProgram.boardId, `project.boardPrograms[${index}].boardId`, issues);
+        const sketch = requiredString(rawProgram.code, `project.boardPrograms[${index}].code`, issues, 30_000);
+        if (!boardComponents.some(component => component.id === boardId)) issues.push(`project.boardPrograms[${index}].boardId must identify a placed board component.`);
+        if (Object.hasOwn(boardPrograms, boardId)) issues.push(`project.boardPrograms contains duplicate code for board ${boardId}.`);
+        else if (boardId) boardPrograms[boardId] = sketch;
+      }
+      for (const board of boardComponents) if (!Object.hasOwn(boardPrograms, board.id)) issues.push(`project.boardPrograms is missing a sketch for ${board.label} (${board.id}).`);
+      for (const boardId of Object.keys(boardPrograms)) if (!boardComponents.some(component => component.id === boardId)) delete boardPrograms[boardId];
+    }
+  } else if (rawProject.boardPrograms !== undefined) {
+    issues.push("project.boardPrograms is only accepted when the request explicitly asks for multiple boards.");
   }
 
   const rawConnections = rawProject.connections;
@@ -669,12 +734,19 @@ function validateGeneratedEnvelope(value: unknown, context: GenerationContext): 
   if (code && !/\bvoid\s+loop\s*\(/.test(code)) {
     issues.push("project.code must define void loop()");
   }
-  if (code) {
-    const compilation = compileArduinoSketch(code);
-    compilation.diagnostics
-      .filter((diagnostic) => diagnostic.severity === "error")
-      .slice(0, 12)
-      .forEach((diagnostic) => issues.push(`project.code simulator ${diagnostic.code}${diagnostic.line ? ` at line ${diagnostic.line}` : ""}: ${diagnostic.message}`));
+  const activeBoard = boardComponents.find(component => component.type === boardType);
+  if (context.multipleBoards && activeBoard && Object.hasOwn(boardPrograms, activeBoard.id) && boardPrograms[activeBoard.id] !== code) {
+    issues.push("project.code must exactly match the boardPrograms sketch for the placed board whose type equals project.board.");
+  }
+  const sketches = context.multipleBoards
+    ? boardComponents.flatMap(board => boardPrograms[board.id] ? [{ board, code: boardPrograms[board.id] }] : [])
+    : activeBoard ? [{ board: activeBoard, code }] : [];
+  for (const sketch of sketches) {
+    if (!/\bvoid\s+setup\s*\(/.test(sketch.code)) issues.push(`project.boardPrograms.${sketch.board.id} must define void setup().`);
+    if (!/\bvoid\s+loop\s*\(/.test(sketch.code)) issues.push(`project.boardPrograms.${sketch.board.id} must define void loop().`);
+    const compilation = compileArduinoSketch(sketch.code, sketch.board.type);
+    compilation.diagnostics.filter(diagnostic => diagnostic.severity === "error").slice(0, 12)
+      .forEach(diagnostic => issues.push(`${context.multipleBoards ? `project.boardPrograms.${sketch.board.id}` : "project.code"} simulator ${diagnostic.code}${diagnostic.line ? ` at line ${diagnostic.line}` : ""}: ${diagnostic.message}`));
   }
 
   const envelope: GeneratedEnvelope = {
@@ -688,10 +760,11 @@ function validateGeneratedEnvelope(value: unknown, context: GenerationContext): 
         issues,
         500,
       ),
-      board: "arduino-uno",
+      board: boardType ?? "arduino-uno",
       components,
       connections,
-      code,
+      code: activeBoard && context.multipleBoards ? (boardPrograms[activeBoard.id] ?? code) : code,
+      ...(context.multipleBoards && Object.keys(boardPrograms).length ? { programs: boardPrograms, ...(activeBoard ? { activeBoardId: activeBoard.id } : {}) } : {}),
     },
     explanation: requiredString(value.explanation, "explanation", issues, 2_000),
     assumptions: stringArray(value.assumptions, "assumptions", issues),
@@ -710,7 +783,7 @@ function validateGeneratedEnvelope(value: unknown, context: GenerationContext): 
   }
   if (!issues.length && code) {
     const normalizedProject = normalizeGroundReturns(envelope.project as unknown as SharedCircuitProject);
-    const simulator = new ArduinoSimulator(code);
+    const simulator = simulatorForProject(normalizedProject, code);
     simulator.attachProject(normalizedProject);
     simulator.run();
     simulator.advance(0);
@@ -737,18 +810,27 @@ function validateGeneratedEnvelope(value: unknown, context: GenerationContext): 
         issues.push(`project.circuit: ${driver.label} needs the supplies and ground connections listed in its component definition before its motors can run.`);
       }
     });
-    const buttonActionRequested = /\bbutton\b.{0,80}\b(?:switch|toggle|select|change|cycle|adjust)\b|\b(?:switch|toggle|select|change|cycle|adjust)\b.{0,80}\bbutton\b/i.test(context.prompt);
+    const buttonActionRequested = /\bbutton\b.{0,80}\b(?:switch|toggle|select|change|cycle|adjust)\b|\b(?:switch|toggle|select|change|cycle|adjust)\b.{0,80}\bbutton\b|\b(?:push|encoder|rotary)\b.{0,40}\b(?:switch|sw)\b.{0,80}\b(?:toggle|switch|select|change|cycle|adjust)\b|\b(?:press|pressing|pressed)\b.{0,50}\b(?:SW|push switch|encoder switch)\b/i.test(context.prompt);
     if (buttonActionRequested && !issues.length) {
-      const buttons = normalizedProject.components.filter(component => component.type === "push-button");
+      const buttons = normalizedProject.components.filter(component => component.type === "push-button" || component.type === "ky-040");
       const released = simulateButtonScenario(normalizedProject, code, undefined);
       for (const button of buttons) {
         const pressed = simulateButtonScenario(normalizedProject, code, button.id);
         if (!hasObservableButtonEffect(normalizedProject, released, pressed)) {
-          issues.push(`project.code button behavior: pressing ${button.label} produces no observable circuit change. Wire it to a digital input using INPUT_PULLUP with its other terminal at GND, detect the active-low HIGH-to-LOW press edge once, and ensure the requested action changes an output or displayed/serial value.`);
+          issues.push(`project.code button behavior: pressing ${button.label} produces no observable circuit change. For a KY-040 use its SW pin as an active-low input with INPUT_PULLUP; for a separate push button wire one terminal to a digital input and the other to GND. Detect the debounced HIGH-to-LOW press edge once using separate sampled and stable button states. Do not overwrite the previous stable state before the debounce interval has completed. Ensure the requested action changes an output or displayed/serial value.`);
           break;
         }
       }
-      if (!buttons.length) issues.push("project.circuit button behavior: the request uses a button but the circuit contains no push-button component.");
+      if (!buttons.length) issues.push("project.circuit button behavior: the request uses a button but the circuit contains neither a push-button nor a KY-040 encoder.");
+    }
+
+    const receivedDataMustBePrinted = /\b(?:print|report|log|display|show|output)\b.{0,64}\b(?:received|incoming|uart|serial|byte|message|data)\b|\b(?:received|incoming)\b.{0,64}\b(?:print|report|log|display|show|serial)\b/i.test(context.prompt);
+    if (receivedDataMustBePrinted && context.multipleBoards && !issues.length) {
+      const receiver = Object.entries(boardPrograms).find(([, sketch]) => /\bSerial\d*\.available\s*\(/.test(sketch) && /\bSerial\d*\.read\s*\(/.test(sketch));
+      if (receiver && !/\bSerial\d*\.(?:print|println)\s*\(/.test(receiver[1])) {
+        const board = normalizedProject.components.find(component => component.id === receiver[0]);
+        issues.push(`project.boardPrograms[${receiver[0]}] UART behavior: ${board?.label ?? receiver[0]} reads incoming serial data but never prints or reports it. Print the received value with Serial.print/println so the requested data is observable in that board's Serial output.`);
+      }
     }
     const failSafeRequested = /\b(?:unpowered|unavailable|disconnected|missing|unreadable|sensor failure)\b/i.test(context.prompt) && /\b(?:fan|motor)\b/i.test(context.prompt);
     const sensorDataPins: Record<string, string[]> = {
@@ -765,7 +847,7 @@ function validateGeneratedEnvelope(value: unknown, context: GenerationContext): 
         if (!dataWire) continue;
         const faultedProject = structuredClone(normalizedProject);
         faultedProject.connections = faultedProject.connections.filter(connection => connection.id !== dataWire.id);
-        const faultSimulator = new ArduinoSimulator(code);
+        const faultSimulator = simulatorForProject(faultedProject, code);
         faultSimulator.attachProject(faultedProject);
         faultSimulator.run();
         faultSimulator.advance(10_000);
@@ -832,14 +914,14 @@ function upstreamErrorResponse(status: number, payload: unknown) {
     return errorResponse(
       429,
       "AI_RATE_LIMITED",
-      "The circuit generator is temporarily rate limited. Try again shortly.",
+      `Gemini returned HTTP ${status} (rate limited). Try again shortly.`,
     );
   }
   if (status >= 500) {
     return errorResponse(
       503,
       "AI_UNAVAILABLE",
-      "The AI service is temporarily unavailable. Try again shortly.",
+      `Gemini returned temporary HTTP ${status}. Try again shortly.`,
     );
   }
   return errorResponse(
@@ -869,6 +951,21 @@ function logRecoveryFailure(stage: "initial" | "repair" | "regenerate" | "repair
     stage,
     issueCodes: [...new Set(issues.map(validationIssueCode))].slice(0, 20),
   })}`);
+}
+
+function providerRetryDelay(response: Response, retryIndex: number): number {
+  const retryAfter = response.headers.get("retry-after");
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1_000, 30_000);
+    const date = Date.parse(retryAfter);
+    if (Number.isFinite(date)) return Math.min(Math.max(0, date - Date.now()), 30_000);
+  }
+  return PROVIDER_RETRY_DELAYS_MS[retryIndex] ?? PROVIDER_RETRY_DELAYS_MS.at(-1)!;
+}
+
+function isTransientProviderFailure(status: number): boolean {
+  return status === 429 || status >= 500;
 }
 
 /** Convert schematic-style Uno labels in generated C++ to valid Arduino pin numbers. */
@@ -921,7 +1018,7 @@ function autoCorrectPinNames(content: string): { corrected: string; changes: num
     if (!isRecord(value) || !isRecord(value.project) || !Array.isArray(value.project.components) || !Array.isArray(value.project.connections)) return { corrected: content, changes };
     const types = new Map(value.project.components.filter(isRecord).map(part => [part.id, String(part.type)]));
     const validIds = new Set(value.project.components.filter(isRecord).map(part => String(part.id)));
-    const board = value.project.components.find(part => isRecord(part) && part.type === "arduino-uno" && typeof part.id === "string");
+    const board = value.project.components.find(part => isRecord(part) && typeof part.type === "string" && isBoardType(part.type) && typeof part.id === "string");
     const aliases: Record<string, string> = { GROUND: "GND", ANODE: "A", CATHODE: "K", POSITIVE: "+", NEGATIVE: "-", SIGNAL: "SIG", TRIGGER: "TRIG", PIN1: "1", PIN2: "2" };
     for (const wire of value.project.connections.filter(isRecord)) {
       for (const endpoint of [wire.from, wire.to]) {
@@ -970,9 +1067,8 @@ async function generateAttempt(options: {
   );
   let geminiResponse: Response;
   try {
-    geminiResponse = await fetch(
-      `${GEMINI_API_BASE_URL}/${encodeURIComponent(options.model)}:generateContent`,
-      {
+    const requestUrl = `${GEMINI_API_BASE_URL}/${encodeURIComponent(options.model)}:generateContent`;
+    const requestInit: RequestInit = {
         method: "POST",
         headers: {
           "x-goog-api-key": options.apiKey,
@@ -988,8 +1084,15 @@ async function generateAttempt(options: {
           },
         }),
         signal: controller.signal,
-      },
-    );
+      };
+    for (let retryIndex = 0; ; retryIndex++) {
+      geminiResponse = await fetch(requestUrl, requestInit);
+      if (!isTransientProviderFailure(geminiResponse.status) || retryIndex >= MAX_TRANSIENT_PROVIDER_RETRIES) break;
+      const delayMs = providerRetryDelay(geminiResponse, retryIndex);
+      if (Date.now() + delayMs >= options.deadline) break;
+      console.warn(`[ai-generation-provider-retry] ${JSON.stringify({ status: geminiResponse.status, retry: retryIndex + 1, delayMs })}`);
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
   } catch (error) {
     return {
       kind: "terminal",
@@ -1073,7 +1176,7 @@ async function generateAttempt(options: {
   }
 
   if (isRecord(parsed) && isRecord(parsed.project) && typeof parsed.project.code === "string") {
-    parsed.project.code = normalizeUnoDigitalPinNames(parsed.project.code);
+    if (parsed.project.board === "arduino-uno") parsed.project.code = normalizeUnoDigitalPinNames(parsed.project.code);
   }
 
   const validated = validateGeneratedEnvelope(parsed, options.context);
@@ -1232,7 +1335,16 @@ export async function POST(request: Request) {
     : undefined;
   const currentTypes = isRecord(currentProject) && Array.isArray(currentProject.components)
     ? currentProject.components.filter(isRecord).map(part => String(part.type)) : [];
-  const context: GenerationContext = { target, prompt, components: selectGenerationComponents(prompt, target, currentTypes) };
+  const currentBoardTypes = currentTypes.filter(isBoardType);
+  const requestedBoardTypes = namedBoardTypes(prompt);
+  const multipleBoards = explicitlyRequestsMultipleBoards(prompt) || (mode === "edit" && currentBoardTypes.length > 1);
+  const boardTypes = multipleBoards
+    ? [...new Set([...currentBoardTypes, ...requestedBoardTypes, ...(currentBoardTypes.length || requestedBoardTypes.length ? [] : BOARD_IDS)])]
+    : [requestedBoardTypes[0] ?? "arduino-uno"];
+  const selectedComponents = selectGenerationComponents(prompt, target, currentTypes)
+    .filter(part => !isBoardType(part.id));
+  for (const id of boardTypes) if (REGISTRY[id]) selectedComponents.push(REGISTRY[id]);
+  const context: GenerationContext = { target, prompt, components: selectedComponents, multipleBoards };
   if (target === "simulation") {
     const unavailable = Object.values(INTERNAL_COMPONENT_CATALOG).filter(part => !REGISTRY[part.id] && ((prompt.toLowerCase().includes(part.id) || part.metadata?.interfaces.some(name => ["LoRa", "Zigbee"].includes(name) && prompt.toLowerCase().includes(name.toLowerCase())) || part.metadata?.aliases.some(name => /[0-9]/.test(name) && prompt.toLowerCase().includes(name.toLowerCase()))) || currentTypes.includes(part.id)));
     if (unavailable.length) return errorResponse(422, "COMPONENT_UNAVAILABLE", `${unavailable.map(part => part.displayName).join(", ")} does not have an accepted simulation model yet and is unavailable.`);

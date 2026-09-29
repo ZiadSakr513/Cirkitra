@@ -11,8 +11,16 @@ import { OneWireRuntime, sensorRom } from "./one-wire.ts";
 import { PowerRuntime, type PowerResult } from "./power.ts";
 import type { MotorSupplyLoad } from "./motor-loads.ts";
 import { STATEFUL_MODEL_TYPES } from "./stateful-models.ts";
+import { getBoardProfile } from "../circuit/boards.ts";
 
 export type DeviceValue = number | string | boolean | number[] | { [key: string]: DeviceValue };
+export interface UartTransmission { port: number; baud: number; data: readonly number[] }
+export interface I2cPeerEndpoint {
+  address(): number | undefined;
+  receive(data: readonly number[]): boolean;
+  request(length: number): readonly number[];
+}
+interface UdpSocketState { localPort: number; remoteAddress: string; remotePort: number; tx: number[]; rx: number[] }
 export interface DeviceMemory {
   registers: Uint8Array; pointer: number; initialized: boolean; sleeping: boolean;
   readyAt: number; sampleAt: number; resolution: number; heater: boolean;
@@ -20,14 +28,21 @@ export interface DeviceMemory {
   tx: number[]; rx: number[]; packets: NonNullable<SimulatedComponentState["packets"]>[number][];
   frequency: number; spreading: number; bandwidth: number; coding: number; sync: number; crc: boolean;
   receiving: boolean; lastInterrupt: number; captured: number; previousInputs: number;
+  displayBuffer: string[]; displayText: string[]; cursorColumn: number; cursorRow: number; textSize: number; displayOn: boolean;
+  pixelBuffer: Array<{ r: number; g: number; b: number }>; pixels: Array<{ r: number; g: number; b: number }>; brightness: number;
+  rtcEpochSeconds?: number; rtcSetAtMs?: number;
+  stepCount: number; stepIntervalMs: number; lastStepAt: number;
 }
+interface SdFileHandle { componentId: string; path: string; position: number; mode: number; open: boolean }
 export const STATEFUL_PARTS = STATEFUL_MODEL_TYPES;
 const numeric = (c: CircuitComponent, property: string, fallback: number) => Number(c.properties?.[property] ?? fallback);
 const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
+const fromBcd = (value: number) => ((value >> 4) & 0x0f) * 10 + (value & 0x0f);
+const toBcd = (value: number) => ((Math.floor(value / 10) << 4) | (value % 10)) & 0xff;
 const bytes = (value: DeviceValue): number[] => Array.isArray(value) ? value.map(v => v & 255) : typeof value === "string" ? [...new TextEncoder().encode(value)] : [Number(value) & 255];
 function memory(): DeviceMemory {
   const registers = new Uint8Array(256); registers[0] = 255; registers[1] = 255;
-  return { registers, pointer: 0, initialized: false, sleeping: false, readyAt: 0, sampleAt: -Infinity, resolution: 12, heater: false, shift: 0, latch: 0, clock: false, latchClock: false, tx: [], rx: [], packets: [], frequency: 915000000, spreading: 7, bandwidth: 125000, coding: 5, sync: 0x12, crc: false, receiving: false, lastInterrupt: 255, captured: 0, previousInputs: 0 };
+  return { registers, pointer: 0, initialized: false, sleeping: false, readyAt: 0, sampleAt: -Infinity, resolution: 12, heater: false, shift: 0, latch: 0, clock: false, latchClock: false, tx: [], rx: [], packets: [], frequency: 915000000, spreading: 7, bandwidth: 125000, coding: 5, sync: 0x12, crc: false, receiving: false, lastInterrupt: 255, captured: 0, previousInputs: 0, displayBuffer: Array(8).fill(""), displayText: Array(8).fill(""), cursorColumn: 0, cursorRow: 0, textSize: 1, displayOn: false, pixelBuffer: Array.from({ length: 8 }, () => ({ r: 0, g: 0, b: 0 })), pixels: Array.from({ length: 8 }, () => ({ r: 0, g: 0, b: 0 })), brightness: 255, stepCount: 0, stepIntervalMs: 0, lastStepAt: -1 };
 }
 
 /** One instance per running project. All mutation happens on the simulator clock. */
@@ -54,9 +69,25 @@ export class DeviceRuntime {
   private wireAddress = 0;
   private wireTx: number[] = [];
   private wireRx: number[] = [];
+  private wireMasterTransmitting = false;
+  private wirePeripheralAddress?: number;
+  private wirePeripheralTx: number[] = [];
+  private wirePeripheralRx: number[] = [];
+  private wireOnReceive = false;
+  private wireOnRequest = false;
+  private i2cPeers: readonly I2cPeerEndpoint[] = [];
   private spiAddress: number | undefined;
   private spiRead = false;
   private spiSelected: string | undefined;
+  private uartRx = new Map<number, number[]>();
+  private uartTx: UartTransmission[] = [];
+  private wifiConnected = false;
+  private udpSockets = new Map<string, UdpSocketState>();
+  private udpPackets: NonNullable<SimulatedComponentState["packets"]>[number][] = [];
+  private sdCards = new Map<string, Map<string, number[]>>();
+  private sdMounted?: string;
+  private sdHandles = new Map<string, SdFileHandle>();
+  private pendingSdFile?: SdFileHandle;
   private radioPins = [10, 9, 2];
   private previousShift = new Map<string, number>();
   private oneWire = new OneWireRuntime();
@@ -72,56 +103,276 @@ export class DeviceRuntime {
   states: Record<string, SimulatedComponentState> = {};
   drives: Array<NonNullable<SimulatorSnapshot["deviceDrives"]>[number]> = [];
   bridges: Array<NonNullable<SimulatorSnapshot["deviceBridges"]>[number]> = [];
-  constructor(private project: CircuitProject, private source: string) { this.reset(); }
-  configure(project: CircuitProject) { this.project = project; }
+  constructor(private project: CircuitProject, private source: string, private boardId: string = project.board, private boardComponentId?: string) {
+    this.boardComponentId ??= project.components.find(component => component.type === boardId)?.id;
+    this.reset();
+  }
+  configure(project: CircuitProject, boardId: string = this.boardId, boardComponentId?: string) {
+    this.project = project;
+    this.boardId = boardId;
+    this.boardComponentId = boardComponentId ?? project.components.find(component => component.type === boardId)?.id;
+  }
+  boundComponentIds(): readonly string[] { return [...new Set(this.bindings.values())]; }
   reset(source = this.source) {
-    this.source = source; this.instances = deviceInstances(source); this.bindings.clear(); this.constructors.clear(); this.memory.clear(); this.values.clear();
+    this.source = source; this.instances = deviceInstances(source, this.boardId); this.bindings.clear(); this.constructors.clear(); this.memory.clear(); this.values.clear();
     this.states = {}; this.drives = []; this.bridges = []; this.time = 0; this.diagnostics.length = 0;
     this.power.reset(); this.powerControls = {}; this.charging = {}; this.protectionSince.clear(); this.protectionLatched.clear(); this.chargerElapsed.clear(); this.chargerLastTick.clear(); this.chargerModes.clear(); this.chargerEnabled.clear(); this.pendingDelayMs = 0;
-    this.wireTx = []; this.wireRx = []; this.spiAddress = undefined; this.spiSelected = undefined; this.radioPins = [10, 9, 2]; this.oneWire.reset(); this.shtSensors.clear(); this.radios.clear(); this.zigbees.clear(); this.responseDecoders.clear(); this.gauges.clear();
+    this.wireTx = []; this.wireRx = []; this.wireMasterTransmitting = false; this.wirePeripheralAddress = undefined; this.wirePeripheralTx = []; this.wirePeripheralRx = []; this.wireOnReceive = false; this.wireOnRequest = false; this.spiAddress = undefined; this.spiSelected = undefined; this.uartRx.clear(); this.uartTx = []; this.wifiConnected = false; this.udpSockets.clear(); this.udpPackets = []; this.radioPins = [10, 9, 2]; this.oneWire.reset(); this.shtSensors.clear(); this.radios.clear(); this.zigbees.clear(); this.responseDecoders.clear(); this.gauges.clear(); this.sdMounted = undefined; this.sdHandles.clear(); this.pendingSdFile = undefined;
     for (const c of this.project.components) if (STATEFUL_PARTS.includes(c.type)) { const m = memory(); if (c.type !== "mcp23017") m.registers.fill(0); this.memory.set(c.id, m); }
-    for (const match of source.matchAll(/\b(?:byte|uint8_t)\s+([A-Za-z_]\w*)\s*\[\s*(\d*)\s*\]\s*(?:=\s*\{([^}]*)\})?\s*;/g)) this.values.set(match[1], match[3] ? splitDeviceArguments(match[3]).map(Number) : Array(Number(match[2] || 8)).fill(0));
+    for (const match of source.matchAll(/\b(?:const\s+)?(byte|uint8_t|char)\s+([A-Za-z_]\w*)\s*((?:\[[^\]]*\]\s*)+)\s*=\s*([^;]+);/g)) {
+      const [, type, name, , initializer] = match;
+      if (type === "char") {
+        this.values.set(name, [...initializer.matchAll(/'(?:\\.|[^'\\])'/g)].map(([character]) => character.slice(1, -1).charCodeAt(0)));
+      } else {
+        const contents = initializer.slice(initializer.indexOf("{") + 1, initializer.lastIndexOf("}"));
+        const entries = splitDeviceArguments(contents).map(item => Number(item.trim()));
+        this.values.set(name, entries.every(Number.isFinite) ? entries : []);
+      }
+    }
     for (const match of source.matchAll(/\bDeviceAddress\s+([A-Za-z_]\w*)\s*(?:=\s*\{([^}]*)\})?\s*;/g)) this.values.set(match[1], match[2] ? splitDeviceArguments(match[2]).map(Number) : Array(8).fill(0));
   }
   private error(code: string, message: string) {
     if (!this.diagnostics.some(d => d.code === code && d.message === message)) this.diagnostics.push({ severity: "error", code, message });
   }
   private m(c: CircuitComponent) { let state = this.memory.get(c.id); if (!state) { state = memory(); this.memory.set(c.id, state); } return state; }
+  bindOpenedFile(name: string): boolean {
+    if (!this.pendingSdFile) { this.values.set(name, 0); return false; }
+    this.sdHandles.set(name, this.pendingSdFile); this.pendingSdFile = undefined; this.values.set(name, 1); return true;
+  }
+  private sdCall(method: string, args: DeviceValue[], name: string): DeviceValue {
+    const filename = String(args[0] ?? "").replaceAll("\\", "/").replace(/^\/+/, "");
+    const clean = filename.split("/").filter(part => part && part !== "." && part !== "..").join("/");
+    const cardFor = (cardId: string) => { let files = this.sdCards.get(cardId); if (!files) { files = new Map(); this.sdCards.set(cardId, files); } return files; };
+    if (method === "begin") {
+      const cs = Math.trunc(Number(args[0])); const profile = getBoardProfile(this.boardId);
+      const pin = profile?.ioPins.find(item => item.runtimePin === cs && !item.reserved && (item.signals ?? ["digital"]).includes("digital"));
+      const cards = this.project.components.filter(c => c.type === "micro-sd-spi-module" && this.powered(c)
+        && this.wiring.spi(c, cs, { mosi: "DI", miso: "DO", sck: "CLK", cs: "CS" }) && this.wiring.boardConnected(c.id, "CS", cs));
+      if (!pin || cards.length !== 1) {
+        this.sdMounted = undefined;
+        this.error(cards.length > 1 ? "SD_SPI_CONFLICT" : "SD_NOT_CONNECTED", `${name}.begin(${cs}): connect one powered microSD breakout's CLK/DO/DI to this board's SPI bus and CS to a supported digital pin.`);
+        return 0;
+      }
+      const card = cards[0];
+      if (card.properties?.cardPresent === false) { this.error("SD_CARD_MISSING", `${name}.begin(): no microSD card is inserted.`); return 0; }
+      this.sdMounted = card.id; this.m(card).initialized = true; this.m(card).registers[0] = cs & 0xff; cardFor(card.id); this.pendingSdFile = undefined; return 1;
+    }
+    const cardId = this.sdMounted;
+    const mountedCard = this.project.components.find(c => c.id === cardId);
+    const mountedCs = mountedCard ? this.m(mountedCard).registers[0] : -1;
+    if (!cardId || !mountedCard || !this.powered(mountedCard) || mountedCard.properties?.cardPresent === false
+      || !this.wiring.spi(mountedCard, mountedCs, { mosi: "DI", miso: "DO", sck: "CLK", cs: "CS" })) {
+      this.sdMounted = undefined;
+      this.error("SD_NOT_MOUNTED", `${name}.${method}(): call SD.begin(cs) with a powered, connected card first.`); return method === "exists" || method === "remove" || method === "open" ? 0 : NaN;
+    }
+    const files = cardFor(cardId);
+    if (method === "exists") return Number(files.has(clean));
+    if (method === "remove") return Number(files.delete(clean));
+    if (method === "open") {
+      if (!clean) { this.pendingSdFile = undefined; return 0; }
+      const mode = Number(args[1] ?? 0);
+      if (mode !== 0 && mode !== 1) { this.error("SD_MODE_UNSUPPORTED", "SD.open supports FILE_READ and FILE_WRITE only."); this.pendingSdFile = undefined; return 0; }
+      if (mode === 0 && !files.has(clean)) { this.pendingSdFile = undefined; return 0; }
+      if (mode === 1 && !files.has(clean)) files.set(clean, []);
+      const contents = files.get(clean)!;
+      this.pendingSdFile = { componentId: cardId, path: clean, position: mode === 1 ? contents.length : 0, mode, open: true };
+      return 1;
+    }
+    this.error("DEVICE_METHOD_UNIMPLEMENTED", `${name}.${method}() is outside the registered SD.h subset.`); return NaN;
+  }
+  private sdFileCall(name: string, method: string, args: DeviceValue[]): DeviceValue {
+    const handle = this.sdHandles.get(name);
+    if (!handle?.open) { this.error("SD_FILE_NOT_OPEN", `${name}.${method}(): open a file successfully before using its File handle.`); return method === "read" || method === "peek" ? -1 : 0; }
+    const files = this.sdCards.get(handle.componentId); const contents = files?.get(handle.path);
+    if (!contents) { this.error("SD_FILE_REMOVED", `${name}: the open file was removed from the virtual card.`); return -1; }
+    const card = this.project.components.find(c => c.id === handle.componentId);
+    if (!card || !this.powered(card) || card.properties?.cardPresent === false || this.sdMounted !== handle.componentId) {
+      this.error("SD_CARD_UNAVAILABLE", `${name}: card power, insertion, or SPI connection was lost while the file was open.`); return -1;
+    }
+    if (method === "close") { handle.open = false; return 0; }
+    if (method === "flush") return 0;
+    if (method === "available") return Math.max(0, contents.length - handle.position);
+    if (method === "position") return handle.position;
+    if (method === "size") return contents.length;
+    if (method === "seek") { handle.position = clamp(Math.trunc(Number(args[0])), 0, 8_388_608); return 1; }
+    if (method === "peek") return contents[handle.position] ?? -1;
+    if (method === "read") return contents[handle.position++] ?? -1;
+    if (method === "write" || method === "print" || method === "println") {
+      if (handle.mode !== 1) { this.error("SD_FILE_READ_ONLY", `${name}: write to a file opened with FILE_WRITE.`); return 0; }
+      let data: number[];
+      if (method === "println") data = args.length ? bytes(`${String(args[0])}\r\n`) : bytes("\r\n");
+      else if (method === "print") data = args.length ? bytes(String(args[0])) : [];
+      else data = bytes(args[0]).slice(0, args[1] === undefined ? undefined : Math.max(0, Math.trunc(Number(args[1]))));
+      const card = this.project.components.find(c => c.id === handle.componentId);
+      const limit = Math.max(1, Number(card?.properties?.capacityMiB ?? 32)) * 1024 * 1024;
+      const cardSize = [...(files?.values() ?? [])].reduce((sum, file) => sum + file.length, 0);
+      const overwritten = Math.min(data.length, Math.max(0, contents.length - handle.position));
+      const accepted = Math.max(0, Math.min(data.length, limit - cardSize + overwritten));
+      if (accepted < data.length) this.error("SD_CARD_FULL", "The simulated SD card capacity has been reached; remaining bytes were not written.");
+      contents.splice(handle.position, accepted, ...data.slice(0, accepted)); handle.position += accepted; return accepted;
+    }
+    this.error("DEVICE_METHOD_UNIMPLEMENTED", `${name}.${method}() is outside the registered File subset.`); return NaN;
+  }
+  private mfrc522Call(name: string, method: string, args: DeviceValue[], evaluate: (text: string) => DeviceValue): DeviceValue {
+    const logicVoltage = getBoardProfile(this.boardId)?.logicVoltage ?? 5;
+    if (logicVoltage > 3.6) {
+      this.error("RFID_LOGIC_LEVEL", `${name}: the MFRC522 module uses 3.3 V logic. ${this.boardId} outputs ${logicVoltage} V; add a supported level shifter or use a 3.3 V board.`);
+      return 0;
+    }
+    const initialize = method === "PCD_Init";
+    const c = this.resolve(name, args, evaluate, initialize);
+    if (!c) {
+      this.error("RFID_NOT_CONNECTED", `${name}.${method}(): connect 3.3 V, ground, SPI NSS/SCK/MOSI/MISO, and the configured reset pin to supported ${this.boardId} pins.`);
+      return 0;
+    }
+    const m = this.m(c);
+    if (method === "PCD_Init") { m.initialized = true; this.values.set(name, {}); return 1; }
+    if (method === "PCD_Reset") { m.initialized = false; this.values.set(name, {}); return 0; }
+    if (!m.initialized) { this.error("DEVICE_NOT_INITIALIZED", `${name}: call PCD_Init() before polling for a tag.`); return 0; }
+    const uid = String(c.properties?.tagUid ?? "DEADBEEF").replace(/[^\da-f]/gi, "").toUpperCase();
+    const bytes = uid.match(/.{2}/g)?.map(value => Number.parseInt(value, 16)) ?? [];
+    const present = c.properties?.tagPresent === true && [4, 7, 10].includes(bytes.length);
+    if (method === "PICC_IsNewCardPresent") return Number(present);
+    if (method === "PICC_ReadCardSerial") {
+      if (!present) return 0;
+      this.values.set(name, { uid: { size: bytes.length, uidByte: bytes, sak: 8 } });
+      this.m(c).captured = bytes.length;
+      return 1;
+    }
+    if (method === "PICC_HaltA") return 0;
+    this.error("DEVICE_METHOD_UNIMPLEMENTED", `${name}.${method}() is outside the supported MFRC522 UID-reading subset.`);
+    return 0;
+  }
   private high(c: CircuitComponent, pin: string) { return (this.wiring.voltage(c.id, pin) ?? 0) >= 2; }
   private address(c: CircuitComponent): number {
     const bit = (pin: string) => this.high(c, pin) ? 1 : 0;
     if (c.type === "bme280" || c.type === "bmp280") return 0x76 + bit("SDO");
     if (c.type === "sht31-dis") return 0x44 + bit("ADDR");
     if (c.type === "mpu-6050") return 0x68 + bit("AD0");
+    if (c.type === "bh1750-sen0097") return this.high(c, "ADD") ? 0x5c : 0x23;
+    if (c.type === "ssd1306-oled-128x64") return 0x3c;
     if (c.type === "mcp23017" || c.type === "tca9548a") return (c.type === "mcp23017" ? 0x20 : 0x70) + bit("A0") + 2 * bit("A1") + 4 * bit("A2");
+    if (c.type === "ds3231-rtc") return 0x68;
     return c.type === "bq27441-g1" ? 0x55 : 0x08;
   }
+  private configureBh1750(c: CircuitComponent, command: number): boolean {
+    const m = this.m(c);
+    if (command === 0x00) { m.sleeping = true; m.initialized = false; return true; }
+    if (command === 0x01) { m.sleeping = false; return true; }
+    if (command === 0x07) {
+      if (m.sleeping) return false;
+      m.readyAt = this.time;
+      return true;
+    }
+    if (![0x10, 0x11, 0x13, 0x20, 0x21, 0x23].includes(command)) {
+      this.error("BH1750_COMMAND", `BH1750 received unsupported command 0x${command.toString(16)}. Use a documented power, reset, or measurement-mode command.`);
+      return false;
+    }
+    m.sleeping = false;
+    m.initialized = true;
+    m.registers[0] = command;
+    m.readyAt = this.time + ([0x13, 0x23].includes(command) ? 16 : 120);
+    return true;
+  }
   private powered(c: CircuitComponent) { return this.wiring.powered(c); }
+  private rtcDate(c: CircuitComponent, m: DeviceMemory): Date {
+    if (m.rtcEpochSeconds !== undefined && m.rtcSetAtMs !== undefined) {
+      return new Date(m.rtcEpochSeconds * 1000 + Math.max(0, this.time - m.rtcSetAtMs));
+    }
+    return new Date(Date.UTC(
+      clamp(Math.trunc(numeric(c, "startYear", 2026)), 2000, 2199),
+      clamp(Math.trunc(numeric(c, "startMonth", 1)), 1, 12) - 1,
+      clamp(Math.trunc(numeric(c, "startDay", 1)), 1, 31),
+      clamp(Math.trunc(numeric(c, "startHour", 12)), 0, 23),
+      clamp(Math.trunc(numeric(c, "startMinute", 0)), 0, 59),
+      clamp(Math.trunc(numeric(c, "startSecond", 0)), 0, 59),
+    ) + Math.max(0, this.time));
+  }
+  private rtcRegister(c: CircuitComponent, m: DeviceMemory, register: number): number {
+    const date = this.rtcDate(c, m);
+    switch (register) {
+      case 0: return toBcd(date.getUTCSeconds());
+      case 1: return toBcd(date.getUTCMinutes());
+      case 2: return toBcd(date.getUTCHours());
+      case 3: return toBcd(date.getUTCDay() + 1);
+      case 4: return toBcd(date.getUTCDate());
+      case 5: return toBcd((date.getUTCMonth() + 1) | (date.getUTCFullYear() >= 2100 ? 0x80 : 0));
+      case 6: return toBcd(date.getUTCFullYear() % 100);
+      case 0x0e: return m.registers[0x0e];
+      case 0x0f: return m.registers[0x0f];
+      default: return m.registers[register & 0xff];
+    }
+  }
+  private setRtcRegister(c: CircuitComponent, m: DeviceMemory, register: number, value: number) {
+    if (register >= 0x0e) { m.registers[register & 0xff] = value & 0xff; return; }
+    if (register > 6) return;
+    const date = this.rtcDate(c, m);
+    const values = [date.getUTCSeconds(), date.getUTCMinutes(), date.getUTCHours(), date.getUTCDay() + 1, date.getUTCDate(), date.getUTCMonth() + 1, date.getUTCFullYear()];
+    const raw = value & 0xff;
+    const decoded = register === 2 && (raw & 0x40)
+      ? (fromBcd(raw & 0x1f) % 12) + (raw & 0x20 ? 12 : 0)
+      : fromBcd(raw & (register === 0 ? 0x7f : register === 2 ? 0x3f : register === 5 ? 0x1f : 0xff));
+    const maximum = [59, 59, 23, 7, 31, 12, 99][register];
+    if (!Number.isInteger(decoded) || decoded < (register === 3 || register === 4 || register === 5 ? 1 : 0) || decoded > maximum) {
+      this.error("RTC_INVALID_DATETIME", `DS3231 register 0x${register.toString(16)} received an invalid BCD time/date value.`);
+      return;
+    }
+    values[register] = decoded;
+    const month = register === 5 ? decoded : values[5];
+    const hasCenturyBit = register === 5 ? Boolean(raw & 0x80) : date.getUTCFullYear() >= 2100;
+    const year = register === 6 ? 2000 + decoded + (hasCenturyBit ? 100 : 0) : register === 5 ? 2000 + (date.getUTCFullYear() % 100) + (hasCenturyBit ? 100 : 0) : values[6];
+    const day = values[4];
+    const normalizedMonth = month & 0x7f;
+    const candidate = new Date(Date.UTC(year, normalizedMonth - 1, day, values[2], values[1], values[0]));
+    if (candidate.getUTCFullYear() !== year || candidate.getUTCMonth() !== normalizedMonth - 1 || candidate.getUTCDate() !== day) {
+      this.error("RTC_INVALID_DATETIME", "DS3231 date register writes describe a day that does not exist in the selected month.");
+      return;
+    }
+    m.rtcEpochSeconds = Math.floor(candidate.getTime() / 1000);
+    m.rtcSetAtMs = this.time;
+  }
   private busPresent(c: CircuitComponent) {
     if (!this.powered(c)) return false;
     if (["mcp23017", "tca9548a"].includes(c.type) && !this.high(c, "RESET")) return false;
     if (c.type === "sht31-dis" && (!this.high(c, "nRESET") || this.wiring.voltage(c.id, "ADDR") === undefined)) return false;
+    if (c.type === "bh1750-sen0097") return this.wiring.i2c(c, "SDA", "SCL", false);
+    if (c.type === "ssd1306-oled-128x64") return this.wiring.i2c(c);
     if (["bme280", "bmp280"].includes(c.type)) return this.high(c, "CSB") && this.wiring.i2c(c, "SDI", "SCK");
+    if (c.type === "ds3231-rtc") return this.wiring.i2c(c, "SDA", "SCL", false);
     return this.wiring.i2c(c);
   }
   private byAddress(address: number): CircuitComponent | undefined {
-    const candidates = this.project.components.filter(c => ["bme280", "bmp280", "sht31-dis", "mpu-6050", "mcp23017", "tca9548a", "bq27441-g1", "bq76920"].includes(c.type) && this.address(c) === address && this.busPresent(c));
+    const candidates = this.project.components.filter(c => ["bme280", "bmp280", "sht31-dis", "mpu-6050", "mcp23017", "tca9548a", "bq27441-g1", "bq76920", "bh1750-sen0097", "ssd1306-oled-128x64", "ds3231-rtc"].includes(c.type) && this.address(c) === address && this.busPresent(c));
     if (candidates.length > 1) { this.error("I2C_ADDRESS_CONFLICT", `Multiple connected devices respond at 0x${address.toString(16)}. Change address straps or isolate a mux channel.`); return undefined; }
     return candidates[0];
   }
-  tick(timeMs: number, pins: readonly UnoPinState[], motorLoads: readonly MotorSupplyLoad[] = []) {
+  tick(timeMs: number, pins: readonly UnoPinState[], motorLoads: readonly MotorSupplyLoad[] = [], boardPins?: SimulatorSnapshot["boardPins"]) {
     this.time = timeMs;
     // A switch's own upstream connection is checked before publishing downstream bridges.
     this.powerResult = this.power.solve(this.project, timeMs, this.powerControls, this.charging, motorLoads);
     for (const diagnostic of this.powerResult.diagnostics) this.error(diagnostic.code, diagnostic.message);
-    this.wiring = new DeviceWiring(this.project, pins, [], this.powerResult.voltage);
+    this.wiring = new DeviceWiring(this.project, pins, [], this.powerResult.voltage, boardPins, this.boardComponentId, this.boardId);
     this.bridges = [];
     for (const c of this.project.components.filter(c => c.type === "tca9548a")) {
       const m = this.m(c);
       if (!this.powered(c) || !this.high(c, "RESET")) m.registers[0] = 0;
       else for (let ch = 0; ch < 8; ch++) if (m.registers[0] & (1 << ch)) this.bridges.push({ componentId: c.id, from: "SDA", to: `SD${ch}` }, { componentId: c.id, from: "SCL", to: `SC${ch}` });
     }
-    this.wiring = new DeviceWiring(this.project, pins, this.bridges, this.powerResult.voltage);
+    for (const c of this.project.components.filter(component => component.type === "keypad-4x4")) {
+      const key = String(c.properties?.key ?? "").slice(0, 1);
+      const map = this.values.get(`component:${c.id}.keymap`);
+      const keymap = Array.isArray(map) ? map : [..."123A456B789C*0#D"].map(character => character.charCodeAt(0));
+      const index = key ? keymap.indexOf(key.charCodeAt(0)) : -1;
+      if (index >= 0) this.bridges.push({ componentId: c.id, from: `R${Math.floor(index / 4) + 1}`, to: `C${index % 4 + 1}` });
+    }
+    for (const c of this.project.components.filter(component => component.type === "relay-module-1ch-active-low")) {
+      const inputVoltage = this.wiring.voltage(c.id, "IN");
+      if (!this.powered(c) || inputVoltage === undefined) continue;
+      this.bridges.push(inputVoltage < 0.8
+        ? { componentId: c.id, from: "COM", to: "NO" }
+        : { componentId: c.id, from: "COM", to: "NC" });
+    }
+    this.wiring = new DeviceWiring(this.project, pins, this.bridges, this.powerResult.voltage, boardPins, this.boardComponentId, this.boardId);
     this.oneWire.tick(this.project, this.wiring, timeMs);
     if (this.spiSelected) {
       const selected = this.project.components.find(c => c.id === this.spiSelected);
@@ -147,11 +398,93 @@ export class DeviceRuntime {
         else { model.tick(timeMs, numeric(c, "temperature", 25), numeric(c, "humidity", 50)); this.drive(c, "ALERT", Number(!!(model.status & 0x8000))); }
         m.readyAt = model.readyAt; m.heater = model.heater;
       }
+      if (c.type === "bh1750-sen0097") readings.lux = clamp(numeric(c, "lux", 500), 0, 65535);
+      if (c.type === "ky-040") {
+        const position = Math.trunc(numeric(c, "position", 0));
+        const phase = ((position % 4) + 4) % 4;
+        const clk = [0, 1, 1, 0][phase];
+        const dt = [0, 0, 1, 1][phase];
+        const pressed = c.properties?.pressed === true;
+        const boardProfile = getBoardProfile(this.boardId);
+        const connected = (pin: string) => boardProfile?.ioPins.some(candidate => candidate.runtimePin !== undefined && !candidate.reserved && (candidate.signals ?? ["digital"]).includes("digital") && this.wiring.boardConnected(c.id, pin, candidate.runtimePin)) ?? false;
+        if (powered && connected("CLK")) this.drive(c, "CLK", clk);
+        if (powered && connected("DT")) this.drive(c, "DT", dt);
+        if (powered && connected("SW")) this.drive(c, "SW", Number(!pressed));
+        Object.assign(readings, { position, phase, buttonPressed: Number(pressed), clk, dt });
+      }
+      if (c.type === "keypad-4x4") {
+        const key = String(c.properties?.key ?? "").slice(0, 1);
+        const map = this.values.get(`component:${c.id}.keymap`);
+        const keymap = Array.isArray(map) ? map : [..."123A456B789C*0#D"].map(character => character.charCodeAt(0));
+        const index = key ? keymap.indexOf(key.charCodeAt(0)) : -1;
+        if (key && index >= 0) Object.assign(readings, { keyCode: key.charCodeAt(0), row: Math.floor(index / 4) + 1, column: index % 4 + 1, pressed: 1 });
+        else Object.assign(readings, { pressed: 0 });
+      }
+      if (c.type === "relay-module-1ch-active-low") {
+        const inputVoltage = this.wiring.voltage(c.id, "IN");
+        const energized = powered && inputVoltage !== undefined && inputVoltage < 0.8;
+        Object.assign(readings, { energized: Number(energized), inputVoltage: inputVoltage ?? -1 });
+      }
+      if (c.type === "ds3231-rtc") {
+        const date = this.rtcDate(c, m);
+        Object.assign(readings, {
+          year: date.getUTCFullYear(), month: date.getUTCMonth() + 1, day: date.getUTCDate(),
+          hour: date.getUTCHours(), minute: date.getUTCMinutes(), second: date.getUTCSeconds(),
+        });
+      }
+      if (c.type === "micro-sd-spi-module") {
+        const files = this.sdCards.get(c.id) ?? new Map<string, number[]>();
+        readings.cardPresent = Number(c.properties?.cardPresent !== false);
+        readings.files = files.size;
+        readings.storedBytes = [...files.values()].reduce((total, file) => total + file.length, 0);
+        readings.capacityMiB = numeric(c, "capacityMiB", 32);
+        this.drive(c, "CD", Number(c.properties?.cardPresent !== false));
+      }
+      if (c.type === "mfrc522-rfid-module") {
+        const uid = String(c.properties?.tagUid ?? "DEADBEEF").replace(/[^\da-f]/gi, "").toUpperCase();
+        const validUid = [8, 14, 20].includes(uid.length) && /^[\da-f]+$/i.test(uid);
+        readings.tagPresent = Number(c.properties?.tagPresent === true && validUid);
+        readings.uidLength = validUid ? uid.length / 2 : 0;
+        if (validUid) readings.uidFirstByte = Number.parseInt(uid.slice(0, 2), 16);
+      }
+      if (c.type === "ssd1306-oled-128x64") Object.assign(readings, { width: 128, height: 64, lines: 8 });
+      if (c.type === "ws2812b-strip-8") Object.assign(readings, { pixelCount: 8, litPixels: m.pixels.filter(pixel => pixel.r || pixel.g || pixel.b).length });
       if (c.type === "74hc595") this.shiftRegister(c, m, powered);
       if (c.type === "mcp23017") this.expander(c, m, powered);
       if (c.type === "mpu-6050" && powered && !m.sleeping && (m.registers[0x38] & 1)) this.drive(c, "INT", this.time >= m.readyAt ? 1 : 0);
-      this.states[c.id] = { type: c.type, powered, readings: powered && !m.sleeping ? readings : {}, status: !powered ? "Unpowered" : m.sleeping ? "Sleeping" : m.readyAt > timeMs ? "Measuring" : m.initialized ? "Ready" : "Powered", packets: m.packets.map(p => ({ ...p })) };
+      const readyForReading = c.type !== "bh1750-sen0097" || (m.initialized && timeMs >= m.readyAt);
+      const display = c.type === "ssd1306-oled-128x64";
+      const pixelStrip = c.type === "ws2812b-strip-8";
+      const pixelPin = pixelStrip ? Number(this.values.get(`component:${c.id}.dataPin`) ?? -1) : -1;
+      const dataConnected = pixelStrip && pixelPin >= 0 && this.wiring.boardConnected(c.id, "DIN", pixelPin);
+      const encoder = c.type === "ky-040";
+      const encoderPinsPresent = encoder && ["CLK", "DT"].every(pin => this.wiring.wired(c.id, pin));
+      const keypad = c.type === "keypad-4x4";
+      const keypadWired = keypad && [...Array(4)].every((_, index) => this.wiring.wired(c.id, `R${index + 1}`) && this.wiring.wired(c.id, `C${index + 1}`));
+      const statePowered = keypad ? Boolean(keypadWired) : powered;
+      const keyName = keypad ? String(c.properties?.key ?? "").slice(0, 1) : "";
+      const relay = c.type === "relay-module-1ch-active-low";
+      const relayInput = relay ? this.wiring.voltage(c.id, "IN") : undefined;
+      const rtc = c.type === "ds3231-rtc";
+      const sd = c.type === "micro-sd-spi-module";
+      const cardPresent = c.properties?.cardPresent !== false;
+      const sdConnected = sd && this.wiring.spi(c, Number(m.registers[0]), { mosi: "DI", miso: "DO", sck: "CLK", cs: "CS" });
+      const rfid = c.type === "mfrc522-rfid-module";
+      const tagUid = String(c.properties?.tagUid ?? "DEADBEEF").replace(/[^\da-f]/gi, "").toUpperCase();
+      const tagPresent = c.properties?.tagPresent === true && [8, 14, 20].includes(tagUid.length);
+      const rfidSsp = Number(m.registers[0x30]);
+      const rfidReset = Number(m.registers[0x31]);
+      const rfidConnected = rfid && Number.isFinite(rfidSsp) && Number.isFinite(rfidReset) && rfidSsp !== rfidReset
+        && this.wiring.spi(c, rfidSsp, { mosi: "MOSI", miso: "MISO", sck: "SCK", cs: "NSS" })
+        && this.wiring.boardConnected(c.id, "RST", rfidReset)
+        && (this.wiring.voltage(c.id, "RST") === undefined || this.wiring.voltage(c.id, "RST")! >= 2);
+      const rfidStatus = !rfidConnected ? "SPI disconnected" : tagPresent
+        ? m.initialized ? `Tag ${tagUid}` : "Tag present · initialize reader"
+        : "Ready · no tag";
+      const rtcConnected = rtc && this.busPresent(c);
+      this.states[c.id] = { type: c.type, powered: statePowered, readings: statePowered && powered && !m.sleeping && readyForReading && (!rtc || rtcConnected) && (!sd || cardPresent && sdConnected) && (!rfid || rfidConnected) ? readings : {}, status: !powered ? "Unpowered" : rtc ? rtcConnected ? "Running" : "I2C disconnected" : sd ? !cardPresent ? "No card" : !sdConnected ? "SPI disconnected" : this.sdMounted === c.id ? "Mounted" : "Ready" : rfid ? rfidStatus : encoder ? !encoderPinsPresent ? "Connect CLK and DT" : `Position ${numeric(c, "position", 0)}` : keypad ? !keypadWired ? "Wire all row and column pins" : keyName ? `Key ${keyName} pressed` : "Ready" : relay ? relayInput === undefined ? "Control floating" : relayInput < 0.8 ? "Energized · COM–NO" : "Released · COM–NC" : m.sleeping ? "Sleeping" : m.readyAt > timeMs ? "Measuring" : c.type === "bh1750-sen0097" && !m.initialized ? "Standby" : display ? !m.initialized ? "Standby" : m.displayOn ? "Displaying" : "Ready" : pixelStrip ? !m.initialized ? "Ready" : !dataConnected ? "Data disconnected" : m.pixels.some(pixel => pixel.r || pixel.g || pixel.b) ? "Displaying" : "Ready" : m.initialized ? "Ready" : "Powered", packets: m.packets.map(p => ({ ...p })), ...(display ? { display: powered && m.initialized && m.displayOn ? [...m.displayText] : [] } : {}), ...(pixelStrip ? { pixels: powered && m.initialized && dataConnected ? m.pixels.map(pixel => ({ ...pixel })) : m.pixels.map(() => ({ r: 0, g: 0, b: 0 })) } : {}) };
     }
+    this.stepperDrivers();
     for (const c of this.project.components.filter(c => c.type === "rfm95w")) {
       const model = this.lora(c), powered = this.powered(c);
       if (!powered || this.wiring.voltage(c.id, "RESET") === 0) model.reset();
@@ -173,6 +506,15 @@ export class DeviceRuntime {
       const negative = this.powerResult.voltage(c.id, "-");
       if (this.powerResult.states[c.id]?.powered && negative !== undefined && Math.abs(negative) < 1e-6 && positive !== undefined && positive > 0) this.drive(c, "+", 1);
     }
+    if (this.boardComponentId && this.boardId.startsWith("esp")) {
+      const board = this.project.components.find(component => component.id === this.boardComponentId);
+      if (board) this.states[board.id] = {
+        type: board.type, powered: true,
+        status: !this.wifiConnected ? "Wi-Fi disconnected" : this.virtualUdpPeerMatches() ? "Wi-Fi connected · UDP peer ready" : "Wi-Fi connected · UDP peer unavailable",
+        readings: { wifiConnected: Number(this.wifiConnected), udpPeerEnabled: Number(board.properties?.udpPeerEnabled !== false) },
+        packets: this.udpPackets.slice(-50),
+      };
+    }
   }
   private drive(c: CircuitComponent, pin: string, value: number, weak = false) { this.drives.push({ componentId: c.id, pin, value, weak }); }
   private shiftRegister(c: CircuitComponent, m: DeviceMemory, powered: boolean) {
@@ -188,6 +530,71 @@ export class DeviceRuntime {
     m.clock = clock; m.latchClock = latch;
     this.drive(c, "Q7S", (m.shift >> 7) & 1);
     if (this.wiring.voltage(c.id, "OE") === 0) for (let i = 0; i < 8; i++) this.drive(c, `Q${i}`, (m.latch >> i) & 1);
+  }
+  private stepperDrivers() {
+    const drivers = this.project.components.filter(component => component.type === "a4988-stepper-driver");
+    const motors = this.project.components.filter(component => component.type === "bipolar-stepper-motor");
+    const motorWires = (driver: CircuitComponent, motor: CircuitComponent) => ["1A", "1B", "2A", "2B"].every(pin => this.wiring.connected(driver.id, pin, motor.id, pin));
+    for (const driver of drivers) {
+      const m = this.m(driver), powered = this.powered(driver);
+      const controls = ["STEP", "DIR", "EN", "RST", "SLP"];
+      const connected = (pin: string) => getBoardProfile(this.boardId)?.ioPins.some(candidate => candidate.runtimePin !== undefined && !candidate.reserved
+        && (candidate.signals ?? ["digital"]).includes("digital") && this.wiring.boardConnected(driver.id, pin, candidate.runtimePin)) ?? false;
+      const controlsConnected = controls.every(connected);
+      const completeMotors = motors.filter(motor => motorWires(driver, motor));
+      const motorHasExclusiveDriver = completeMotors.length === 1
+        && drivers.filter(candidate => motorWires(candidate, completeMotors[0])).length === 1;
+      const stepVoltage = this.wiring.voltage(driver.id, "STEP");
+      const dirVoltage = this.wiring.voltage(driver.id, "DIR");
+      const enableVoltage = this.wiring.voltage(driver.id, "EN");
+      const resetVoltage = this.wiring.voltage(driver.id, "RST");
+      const sleepVoltage = this.wiring.voltage(driver.id, "SLP");
+      if (!controlsConnected) this.error("A4988_CONTROL_DISCONNECTED", `${driver.label}: wire STEP, DIR, EN, RST, and SLP to supported digital pins on ${this.boardId}.`);
+      if (motors.length && completeMotors.length !== 1) this.error("A4988_MOTOR_WIRING", `${driver.label}: connect its four outputs 1A/1B/2A/2B to exactly one bipolar stepper motor with matching coil labels.`);
+      if (!powered && controlsConnected) this.error("A4988_SUPPLY", `${driver.label}: supply VDD (3–5.5 V), VMOT (8–35 V), and both ground pins before stepping.`);
+      const high = (voltage: number | undefined) => voltage !== undefined && voltage >= 2;
+      const awake = high(resetVoltage) && high(sleepVoltage);
+      const enabled = powered && controlsConnected && awake && enableVoltage !== undefined && enableVoltage < 0.8 && completeMotors.length === 1 && motorHasExclusiveDriver;
+      const stepHigh = high(stepVoltage);
+      let microstep = 1;
+      const selectors = ["MS1", "MS2", "MS3"].map(pin => high(this.wiring.voltage(driver.id, pin)));
+      const selectorBits = Number(selectors[0]) * 4 + Number(selectors[1]) * 2 + Number(selectors[2]);
+      microstep = ({ 0: 1, 4: 2, 2: 4, 6: 8, 7: 16 } as Record<number, number>)[selectorBits] ?? 1;
+      const rising = stepHigh && !m.clock;
+      if (rising && enabled && dirVoltage !== undefined) {
+        const direction = high(dirVoltage) ? 1 : -1;
+        const motor = completeMotors[0];
+        this.m(motor).stepCount += direction;
+        m.stepCount += direction;
+        if (m.lastStepAt >= 0) m.stepIntervalMs = Math.max(1, this.time - m.lastStepAt);
+        m.lastStepAt = this.time;
+        m.registers[0x20] = microstep;
+        m.registers[0x21] = direction > 0 ? 1 : 0;
+      }
+      m.clock = stepHigh;
+      const recent = m.lastStepAt >= 0 && this.time - m.lastStepAt <= Math.max(100, m.stepIntervalMs * 3);
+      const rpm = recent && m.stepIntervalMs > 0 ? 60000 / m.stepIntervalMs / Math.max(1, numeric(completeMotors[0] ?? driver, "stepsPerRevolution", 200) * microstep) : 0;
+      const driverStatus = !powered ? "Unpowered" : !controlsConnected ? "Connect STEP/DIR/EN/RST/SLP" : !awake ? resetVoltage !== undefined && resetVoltage < 2 ? "Reset" : "Sleeping" : enableVoltage !== undefined && enableVoltage >= 0.8 ? "Disabled" : completeMotors.length !== 1 ? "Connect one bipolar stepper" : !motorHasExclusiveDriver ? "Driver output conflict" : recent ? `Running · ${rpm.toFixed(1)} RPM` : "Stopped";
+      if (completeMotors.length === 1 && !motorHasExclusiveDriver) this.error("A4988_OUTPUT_CONTENTION", `${driver.label}: another stepper driver is connected to the same motor coils; connect each driver to its own motor.`);
+      this.states[driver.id] = { type: driver.type, powered, status: driverStatus, readings: { steps: m.stepCount, microstep, stepIntervalMs: m.stepIntervalMs, rpm, enabled: Number(enabled) } };
+    }
+    for (const motor of motors) {
+      const driver = drivers.find(candidate => motorWires(candidate, motor));
+      const m = this.m(motor);
+      const driverState = driver ? this.states[driver.id] : undefined;
+      const driverMemory = driver ? this.m(driver) : undefined;
+      const powered = Boolean(driverState?.powered);
+      if (!driver) {
+        this.states[motor.id] = { type: motor.type, powered: false, status: "Connect all four coil wires", readings: { steps: m.stepCount, angleDegrees: 0, rpm: 0 } };
+        continue;
+      }
+      const microstep = Number(driverState?.readings?.microstep ?? 1);
+      const stepsPerRevolution = Math.max(1, numeric(motor, "stepsPerRevolution", 200) * microstep);
+      const angle = ((m.stepCount / stepsPerRevolution * 360) % 360 + 360) % 360;
+      const direction = m.stepCount === 0 ? "stopped" : Number(driverMemory?.registers[0x21]) ? "forward" : "reverse";
+      const rpm = Number(driverState?.readings?.rpm ?? 0);
+      this.states[motor.id] = { type: motor.type, powered, status: !powered ? "Unpowered" : rpm > 0 ? `${direction === "forward" ? "Forward" : "Reverse"} · ${rpm.toFixed(1)} RPM` : "Stopped", direction, speed: rpm > 0 ? Math.min(1, rpm / 300) : 0, readings: { steps: m.stepCount, angleDegrees: Number(angle.toFixed(2)), rpm, microstep } };
+    }
   }
   private expander(c: CircuitComponent, m: DeviceMemory, powered: boolean) {
     if (!powered || !this.high(c, "RESET")) { m.registers.fill(0); m.registers[0] = 255; m.registers[1] = 255; m.lastInterrupt = 255; return; }
@@ -224,6 +631,7 @@ export class DeviceRuntime {
 
   private readRegister(c: CircuitComponent, register: number): number {
     const m = this.m(c); const v = (property: string, fallback: number) => numeric(c, property, fallback);
+    if (c.type === "ds3231-rtc") return this.rtcRegister(c, m, register);
     if (c.type === "bq27441-g1") return this.gauge(c).read(register);
     if (c.type === "tca9548a") return m.registers[0];
     if (["bme280", "bmp280"].includes(c.type)) {
@@ -247,6 +655,7 @@ export class DeviceRuntime {
     return result;
   }
   private writeRegister(c: CircuitComponent, register: number, value: number) {
+    if (c.type === "ds3231-rtc") { this.setRtcRegister(c, this.m(c), register, value); return; }
     if (c.type === "bq27441-g1") { this.gauge(c).write(register, value); return; }
     if (c.type === "rfm95w") { this.lora(c).write(register, value, c, this.time); return; }
     const m = this.m(c); m.registers[register & 255] = value & 255;
@@ -255,9 +664,28 @@ export class DeviceRuntime {
     if (["bme280", "bmp280"].includes(c.type) && register === 0xf4) { m.sleeping = !(value & 3); m.readyAt = this.time + 10; }
     if (c.type === "mcp23017" && (register === 0x12 || register === 0x13)) m.registers[register + 2] = value & 255;
   }
+  setI2cPeers(peers: readonly I2cPeerEndpoint[]) { this.i2cPeers = peers; }
+  getI2cPeripheralAddress() { return this.wirePeripheralAddress; }
+  isI2cRequestHandlerRegistered() { return this.wireOnRequest; }
+  isI2cReceiveHandlerRegistered() { return this.wireOnReceive; }
+  reportI2cError(code: string, message: string) { this.error(code, message); }
+  receiveI2c(data: readonly number[]) { this.wirePeripheralRx.push(...data); this.wirePeripheralRx = this.wirePeripheralRx.slice(-4096); return this.wirePeripheralAddress !== undefined; }
+  beginI2cRequest() { this.wirePeripheralTx = []; }
+  endI2cRequest() { const data = this.wirePeripheralTx; this.wirePeripheralTx = []; return data; }
   private constructorArgs(name: string, evaluate: (text: string) => DeviceValue): DeviceValue[] {
     let args = this.constructors.get(name);
-    if (!args) { args = this.instances.get(name)?.args.map(evaluate) ?? []; this.constructors.set(name, args); }
+    if (!args) {
+      const instance = this.instances.get(name);
+      args = instance?.args.map(text => {
+        if (instance.api.type === "Keypad") {
+          const keymap = /^makeKeymap\s*\(\s*([A-Za-z_]\w*)\s*\)$/.exec(text);
+          if (keymap) return this.values.get(keymap[1]) ?? [];
+          if (this.values.has(text.trim())) return this.values.get(text.trim())!;
+        }
+        return evaluate(text);
+      }) ?? [];
+      this.constructors.set(name, args);
+    }
     return args;
   }
   private resolve(name: string, args: DeviceValue[], evaluate: (text: string) => DeviceValue, initialize = false): CircuitComponent | undefined {
@@ -266,35 +694,179 @@ export class DeviceRuntime {
     if (["dht22", "ds18b20"].includes(type)) {
       let dataPin = Number(ctor[0]);
       if (instance.api.type === "DallasTemperature") dataPin = Number(this.constructorArgs(String(ctor[0]).replace(/^&/, ""), evaluate)[0]);
-      const candidates = this.project.components.filter(c => c.type === type && this.wiring.boardConnected(c.id, type === "dht22" ? "DATA" : "DQ", `D${dataPin}`) && this.wiring.pullup(c.id, type === "dht22" ? "DATA" : "DQ") && this.powered(c));
+      const candidates = this.project.components.filter(c => c.type === type && this.wiring.boardConnected(c.id, type === "dht22" ? "DATA" : "DQ", dataPin) && this.wiring.pullup(c.id, type === "dht22" ? "DATA" : "DQ") && this.powered(c));
       const c = candidates[type === "ds18b20" ? Number(args[0] ?? 0) : 0];
       if (c && initialize) { this.m(c).initialized = true; this.bindings.set(name, c.id); }
       return c;
     }
+    if (type === "ws2812b-strip-8") {
+      const dataPin = Number(ctor[1] ?? -1);
+      const profile = getBoardProfile(this.boardId);
+      const pinSupported = profile?.ioPins.some(pin => pin.runtimePin === dataPin && !pin.reserved && (pin.signals ?? ["digital"]).includes("digital")) ?? false;
+      const strips = this.project.components.filter(component => component.type === type && this.powered(component) && this.wiring.boardConnected(component.id, "DIN", dataPin));
+      const c = strips.length === 1 && pinSupported ? strips[0] : undefined;
+      if (!c && initialize) this.error("NEOPIXEL_NOT_CONNECTED", `${name}.begin(): connect one powered WS2812B DIN to a supported digital output on ${this.boardId}; the configured pin must match the sketch.`);
+      if (c && initialize) {
+        const vdd = this.wiring.voltage(c.id, "VDD") ?? 5;
+        const requiredHigh = 0.7 * vdd;
+        const boardVoltage = profile?.logicVoltage ?? 0;
+        if (boardVoltage + 1e-6 < requiredHigh) {
+          this.error("NEOPIXEL_LOGIC_LEVEL", `${name}.begin(): ${this.boardId} provides ${boardVoltage}V logic, below the WS2812B ${requiredHigh.toFixed(2)}V DIN high threshold at ${vdd}V strip supply. Use a compatible supply or level shifter.`);
+          return undefined;
+        }
+        this.values.set(`component:${c.id}.dataPin`, dataPin);
+        this.bindings.set(name, c.id);
+      }
+      return c;
+    }
+    if (type === "ky-040") {
+      const clockPin = Number(ctor[0] ?? -1), dataPin = Number(ctor[1] ?? -1);
+      const profile = getBoardProfile(this.boardId);
+      const supported = (pin: number) => profile?.ioPins.some(candidate => candidate.runtimePin === pin && !candidate.reserved && (candidate.signals ?? ["digital"]).includes("digital")) ?? false;
+      const c = this.project.components.find(component => component.type === type && this.powered(component)
+        && this.wiring.boardConnected(component.id, "CLK", clockPin) && this.wiring.boardConnected(component.id, "DT", dataPin));
+      if (!c || clockPin === dataPin || !supported(clockPin) || !supported(dataPin)) {
+        this.error("ENCODER_NOT_CONNECTED", `${name}: connect a powered KY-040 CLK and DT to two distinct supported digital inputs on ${this.boardId}; check 5V and ground.`);
+        return undefined;
+      }
+      this.bindings.set(name, c.id);
+      return c;
+    }
+    if (type === "keypad-4x4") {
+      const [rawKeymap, rawRows, rawColumns, rowCount, columnCount] = ctor;
+      const keymap = Array.isArray(rawKeymap) ? rawKeymap : [];
+      const rows = Array.isArray(rawRows) ? rawRows.map(Number) : [];
+      const columns = Array.isArray(rawColumns) ? rawColumns.map(Number) : [];
+      const profile = getBoardProfile(this.boardId);
+      const supported = (pin: number) => profile?.ioPins.some(candidate => candidate.runtimePin === pin && !candidate.reserved && (candidate.signals ?? ["digital"]).includes("digital")) ?? false;
+      const c = this.project.components.find(component => component.type === type && Number(rowCount) === 4 && Number(columnCount) === 4
+        && keymap.length >= 16 && rows.length === 4 && columns.length === 4
+        && rows.every((pin, index) => supported(pin) && this.wiring.boardConnected(component.id, `R${index + 1}`, pin))
+        && columns.every((pin, index) => supported(pin) && this.wiring.boardConnected(component.id, `C${index + 1}`, pin)));
+      if (!c) {
+        this.error("KEYPAD_NOT_CONNECTED", `${name}: connect all four keypad rows and columns to distinct supported digital pins on ${this.boardId}; use a 4×4 keymap and pin arrays.`);
+        return undefined;
+      }
+      this.values.set(`component:${c.id}.keymap`, keymap.slice(0, 16));
+      this.values.set(`component:${c.id}.rowPins`, rows);
+      this.values.set(`component:${c.id}.columnPins`, columns);
+      this.bindings.set(name, c.id);
+      return c;
+    }
+    if (type === "mfrc522-rfid-module") {
+      const [ssPin, resetPin] = ctor.map(Number);
+      const profile = getBoardProfile(this.boardId);
+      const supports = (pin: number) => profile?.ioPins.some(candidate => candidate.runtimePin === pin && !candidate.reserved && (candidate.signals ?? ["digital"]).includes("digital")) ?? false;
+      const c = this.project.components.find(component => component.type === type && this.powered(component)
+        && supports(ssPin) && supports(resetPin) && ssPin !== resetPin
+        && this.wiring.spi(component, ssPin, { mosi: "MOSI", miso: "MISO", sck: "SCK", cs: "NSS" })
+        && this.wiring.boardConnected(component.id, "RST", resetPin)
+        && (this.wiring.voltage(component.id, "RST") === undefined || this.wiring.voltage(component.id, "RST")! >= 2));
+      if (c && initialize) {
+        this.bindings.set(name, c.id);
+        const memory = this.m(c);
+        memory.registers[0x30] = ssPin;
+        memory.registers[0x31] = resetPin;
+      }
+      return c;
+    }
     if (type === "rfm95w") {
-      const c = this.project.components.find(c => c.type === type && this.powered(c) && this.wiring.spi(c, this.radioPins[0]) && this.wiring.boardConnected(c.id, "RESET", `D${this.radioPins[1]}`) && this.wiring.boardConnected(c.id, "DIO0", `D${this.radioPins[2]}`));
+      const c = this.project.components.find(c => c.type === type && this.powered(c) && this.wiring.spi(c, this.radioPins[0]) && this.wiring.boardConnected(c.id, "RESET", this.radioPins[1]) && this.wiring.boardConnected(c.id, "DIO0", this.radioPins[2]));
       if (c && initialize) this.bindings.set(name, c.id); return c;
     }
     if (type === "xbee-s2c-zigbee-th") {
       const serialName = String(this.values.get(`${name}.serial`) ?? "Serial"); const serialArgs = this.constructorArgs(serialName, evaluate);
       const rx = Number(serialArgs[0] ?? 0), tx = Number(serialArgs[1] ?? 1);
-      return this.project.components.find(c => c.type === type && this.powered(c) && this.wiring.boardConnected(c.id, "DOUT", `D${rx}`) && this.wiring.boardConnected(c.id, "DIN", `D${tx}`) && this.high(c, "RESET") && !this.high(c, "DIO8"));
+      return this.project.components.find(c => c.type === type && this.powered(c) && this.wiring.boardConnected(c.id, "DOUT", rx) && this.wiring.boardConnected(c.id, "DIN", tx) && this.high(c, "RESET") && !this.high(c, "DIO8"));
     }
     if (["bme280", "bmp280"].includes(type) && ctor.length) {
       const c = this.project.components.find(c => c.type === type && this.powered(c) && this.wiring.spi(c, Number(ctor[0]), { mosi: "SDI", miso: "SDO", sck: "SCK", cs: "CSB" }));
       if (c && initialize) this.bindings.set(name, c.id); return c;
     }
-    const defaults: Record<string, number> = { bme280: 0x77, bmp280: 0x77, "sht31-dis": 0x44, "mpu-6050": 0x68, mcp23017: 0x20, tca9548a: Number(ctor[0] ?? 0x70), "bq27441-g1": 0x55, bq76920: Number(ctor[1] ?? 0x08) };
+    const defaults: Record<string, number> = { bme280: 0x77, bmp280: 0x77, "sht31-dis": 0x44, "mpu-6050": 0x68, mcp23017: 0x20, tca9548a: Number(ctor[0] ?? 0x70), "bq27441-g1": 0x55, bq76920: Number(ctor[1] ?? 0x08), "bh1750-sen0097": Number(ctor[0] ?? 0x23), "ssd1306-oled-128x64": 0x3c };
     const bound = this.project.components.find(c => c.id === this.bindings.get(name));
-    const address = initialize ? Number(type === "bq76920" ? defaults[type] : args[0] ?? defaults[type]) : bound ? Number(this.values.get(`${name}.address`) ?? defaults[type]) : defaults[type];
+    const address = ["bh1750-sen0097", "ssd1306-oled-128x64"].includes(type)
+      ? initialize ? Number(args[1] ?? defaults[type]) : Number(this.values.get(`${name}.address`) ?? defaults[type])
+      : initialize ? Number(type === "bq76920" ? defaults[type] : args[0] ?? defaults[type]) : bound ? Number(this.values.get(`${name}.address`) ?? defaults[type]) : defaults[type];
     const c = this.byAddress(address);
     if (c?.type !== type) return undefined;
     if (initialize) { this.bindings.set(name, c.id); this.values.set(`${name}.address`, address); }
     return c;
   }
   invoke(name: string, method: string, args: DeviceValue[], evaluate: (text: string) => DeviceValue): DeviceValue {
+    if (this.instances.get(name)?.api.type === "SDClass") return this.sdCall(method, args, name);
+    if (this.instances.get(name)?.api.type === "File") return this.sdFileCall(name, method, args);
+    if (this.instances.get(name)?.api.type === "MFRC522") return this.mfrc522Call(name, method, args, evaluate);
     if (name === "Wire") return this.wire(method, args);
     if (name === "SPI") return this.spi(method, args);
+    if (this.instances.get(name)?.api.type === "HardwareSerial") return this.hardwareSerial(name, method, args);
+    if (this.instances.get(name)?.api.header === "Encoder.h") {
+      const c = this.resolve(name, args, evaluate);
+      if (!c) return method === "write" ? 0 : NaN;
+      const position = Math.trunc(numeric(c, "position", 0));
+      const offsetKey = `${name}.offset`;
+      const offset = Number(this.values.get(offsetKey) ?? 0);
+      if (method === "read") return position - offset;
+      if (method === "write") { this.values.set(offsetKey, position - Math.trunc(Number(args[0]))); return 0; }
+      if (method === "readAndReset") { const result = position - offset; this.values.set(offsetKey, position); return result; }
+      this.error("DEVICE_METHOD_UNIMPLEMENTED", `${name}.${method}() is outside the supported Encoder.h adapter.`);
+      return NaN;
+    }
+    if (this.instances.get(name)?.api.header === "Keypad.h") {
+      const c = this.resolve(name, args, evaluate);
+      if (!c) return method === "getKey" || method === "getState" ? 0 : 0;
+      const selected = String(c.properties?.key ?? "").slice(0, 1);
+      const current = selected ? selected.charCodeAt(0) : 0;
+      const keymap = this.values.get(`component:${c.id}.keymap`);
+      const exists = Array.isArray(keymap) && keymap.includes(current);
+      if (method === "isPressed") return Number(exists && current === Number(args[0]));
+      if (method === "getState") return exists ? 1 : 0;
+      if (method === "getKey") {
+        const last = Number(this.values.get(`${name}.lastKey`) ?? 0);
+        this.values.set(`${name}.lastKey`, exists ? current : 0);
+        return exists && current !== last ? current : 0;
+      }
+      this.error("DEVICE_METHOD_UNIMPLEMENTED", `${name}.${method}() is outside the supported Keypad.h adapter.`);
+      return 0;
+    }
+    if (this.instances.get(name)?.api.type === "Adafruit_NeoPixel") {
+      if (method === "Color") {
+        const [r, g, b] = args.map(value => clamp(Number(value), 0, 255));
+        return ((r << 16) | (g << 8) | b) >>> 0;
+      }
+      const initialized = method === "begin";
+      const c = this.resolve(name, args, evaluate, initialized);
+      if (!c) {
+        if (!initialized) this.error("NEOPIXEL_NOT_CONNECTED", `${name}.${method}(): no powered, correctly wired WS2812B strip responds on its configured digital pin.`);
+        return method === "numPixels" ? 0 : method === "getPixelColor" ? 0 : 0;
+      }
+      const m = this.m(c);
+      if (method === "begin") { m.initialized = true; return 1; }
+      if (!m.initialized) { this.error("DEVICE_NOT_INITIALIZED", `${name}: call begin() before ${method}().`); return 0; }
+      if (method === "numPixels") return m.pixelBuffer.length;
+      if (method === "setBrightness") { m.brightness = clamp(Number(args[0]), 0, 255); return 0; }
+      if (method === "clear") { m.pixelBuffer = m.pixelBuffer.map(() => ({ r: 0, g: 0, b: 0 })); return 0; }
+      if (method === "getPixelColor") {
+        const pixel = m.pixelBuffer[Math.trunc(Number(args[0]))];
+        return pixel ? ((pixel.r << 16) | (pixel.g << 8) | pixel.b) >>> 0 : 0;
+      }
+      if (method === "setPixelColor") {
+        const index = Math.trunc(Number(args[0]));
+        if (index < 0 || index >= m.pixelBuffer.length) { this.error("NEOPIXEL_INDEX", `${name}.setPixelColor(): pixel index ${index} is outside 0..${m.pixelBuffer.length - 1}.`); return 0; }
+        const [r, g, b] = args.length === 4
+          ? args.slice(1).map(value => clamp(Number(value), 0, 255))
+          : [Number(args[1]) >> 16 & 255, Number(args[1]) >> 8 & 255, Number(args[1]) & 255];
+        m.pixelBuffer[index] = { r, g, b };
+        return 0;
+      }
+      if (method === "show") {
+        const scale = m.brightness / 255;
+        m.pixels = m.pixelBuffer.map(pixel => ({ r: Math.round(pixel.r * scale), g: Math.round(pixel.g * scale), b: Math.round(pixel.b * scale) }));
+        return 0;
+      }
+    }
+    if (name === "WiFi") return this.wifi(method, args);
+    if (this.instances.get(name)?.api.type === "WiFiUDP") return this.udp(name, method, args);
     if (name === "LoRa" && method === "setPins") { this.radioPins = [Number(args[0]), Number(args[1] ?? 9), Number(args[2] ?? 2)]; return 0; }
     if (method === "setSerial") { this.values.set(`${name}.serial`, String(args[0])); return 0; }
     const instance = this.instances.get(name);
@@ -309,6 +881,68 @@ export class DeviceRuntime {
     }
     const m = this.m(c);
     if (c.type === "xbee-s2c-zigbee-th") return this.xbeeCall(c, name, method, args, evaluate);
+    if (c.type === "bh1750-sen0097") {
+      if (initialize) {
+        const ok = this.configureBh1750(c, Number(args[0] ?? 0x10));
+        if (ok && m.initialized) this.pendingDelayMs = Math.max(this.pendingDelayMs, m.readyAt - this.time);
+        return Number(ok);
+      }
+      if (method === "configure") return Number(this.configureBh1750(c, Number(args[0])));
+      if (method === "setMTreg") {
+        const mtreg = Number(args[0]);
+        if (!Number.isInteger(mtreg) || mtreg < 31 || mtreg > 254) { this.error("BH1750_MTREG", "BH1750 MTreg must be an integer from 31 through 254."); return 0; }
+        m.registers[1] = mtreg;
+        return 1;
+      }
+      if (method === "measurementReady") {
+        const remaining = Math.max(0, m.readyAt - this.time);
+        if (args[0] && remaining) this.pendingDelayMs = Math.max(this.pendingDelayMs, remaining);
+        return Number(!m.sleeping && m.initialized && remaining === 0);
+      }
+      if (method === "readLightLevel") {
+        if (!m.initialized) { this.error("DEVICE_NOT_INITIALIZED", `${name}: call begin() before readLightLevel().`); return -2; }
+        const mode = m.registers[0];
+        if (m.sleeping && [0x20, 0x21, 0x23].includes(mode)) this.configureBh1750(c, mode);
+        this.pendingDelayMs = Math.max(this.pendingDelayMs, Math.max(0, m.readyAt - this.time));
+        const maxLux = [0x11, 0x21].includes(mode) ? 27306.25 : 54612.5;
+        const precision = [0x13, 0x23].includes(mode) ? 4 : [0x11, 0x21].includes(mode) ? 0.5 : 1;
+        const measured = Math.min(clamp(numeric(c, "lux", 500), 0, 65535), maxLux);
+        if ([0x20, 0x21, 0x23].includes(mode)) m.sleeping = true;
+        return Math.round(measured / precision) * precision;
+      }
+    }
+    if (c.type === "ssd1306-oled-128x64") {
+      if (initialize) {
+        m.initialized = true; m.displayOn = false; m.cursorColumn = 0; m.cursorRow = 0;
+        m.displayBuffer = Array(8).fill(""); m.displayText = Array(8).fill("");
+        return 1;
+      }
+      const blank = () => { m.displayBuffer = Array(8).fill(""); m.cursorColumn = 0; m.cursorRow = 0; };
+      if (method === "clearDisplay") { blank(); return 0; }
+      if (method === "setCursor") {
+        const size = Math.max(1, m.textSize);
+        m.cursorColumn = clamp(Math.floor(Number(args[0]) / (6 * size)), 0, 20);
+        m.cursorRow = clamp(Math.floor(Number(args[1]) / (8 * size)), 0, 7);
+        return 0;
+      }
+      if (method === "setTextSize") { m.textSize = clamp(Math.trunc(Number(args[0])), 1, 4); return 0; }
+      if (method === "setTextColor") return 0;
+      if (method === "print" || method === "println") {
+        let text = String(args[0] ?? "");
+        if (typeof args[0] === "number" && args[1] !== undefined) {
+          const base = Number(args[1]); if ([2, 8, 10, 16].includes(base)) text = Math.trunc(Number(args[0])).toString(base).toUpperCase();
+        }
+        const columns = Math.max(1, Math.floor(21 / m.textSize));
+        for (const char of text) {
+          if (char === "\n" || m.cursorColumn >= columns) { m.cursorColumn = 0; m.cursorRow = Math.min(7, m.cursorRow + 1); if (char === "\n") continue; }
+          const line = [...(m.displayBuffer[m.cursorRow] ?? "").padEnd(columns, " ")];
+          line[m.cursorColumn] = char; m.displayBuffer[m.cursorRow] = line.join("").slice(0, columns); m.cursorColumn++;
+        }
+        if (method === "println") { m.cursorColumn = 0; m.cursorRow = Math.min(7, m.cursorRow + 1); }
+        return text.length;
+      }
+      if (method === "display") { m.displayText = [...m.displayBuffer]; m.displayOn = true; return 0; }
+    }
     if (initialize) {
       if (c.type === "rfm95w" && !this.lora(c).begin(Number(args[0]), c, this.time)) return 0;
       if (this.states[c.id]?.fault) return c.type === "bq76920" ? 1 : 0;
@@ -379,34 +1013,81 @@ export class DeviceRuntime {
     this.error("DEVICE_METHOD_UNIMPLEMENTED", `${name}.${method} is not implemented.`); return NaN;
   }
   private wire(method: string, args: DeviceValue[]): DeviceValue {
-    if (method === "begin") return 0;
-    if (method === "beginTransmission") { this.wireAddress = Number(args[0]); this.wireTx = []; return 0; }
-    if (method === "write") { const data = bytes(args[0]).slice(0, args[1] === undefined ? undefined : Math.max(0, Math.trunc(Number(args[1])))); this.wireTx.push(...data); return data.length; }
+    if (method === "begin") { this.wirePeripheralAddress = Number(args[0] ?? 0) || undefined; this.wirePeripheralTx = []; this.wirePeripheralRx = []; return 0; }
+    if (method === "onReceive") { this.wireOnReceive = true; return 0; }
+    if (method === "onRequest") { this.wireOnRequest = true; return 0; }
+    if (method === "beginTransmission") { this.wireAddress = Number(args[0]); this.wireTx = []; this.wireMasterTransmitting = true; return 0; }
+    if (method === "write") {
+      const data = bytes(args[0]).slice(0, args[1] === undefined ? undefined : Math.max(0, Math.trunc(Number(args[1]))));
+      if (this.wirePeripheralAddress !== undefined && !this.wireMasterTransmitting) this.wirePeripheralTx.push(...data);
+      else this.wireTx.push(...data);
+      return data.length;
+    }
     if (method === "endTransmission") {
-      const c = this.byAddress(this.wireAddress); if (!c) return 2;
+      const c = this.byAddress(this.wireAddress);
+      const peers = this.i2cPeers.filter(peer => peer.address() === this.wireAddress);
+      this.wireMasterTransmitting = false;
+      if (c && peers.length) { this.error("I2C_ADDRESS_CONFLICT", `Multiple wired I2C devices respond at 0x${this.wireAddress.toString(16)}.`); this.wireTx = []; return 2; }
+      if (!c) {
+        if (peers.length !== 1) {
+          this.wireTx = [];
+          if (peers.length > 1) this.error("I2C_ADDRESS_CONFLICT", `Multiple wired I2C peripherals respond at 0x${this.wireAddress.toString(16)}.`);
+          else if (!this.i2cPeers.some(peer => peer.address() === undefined)) this.error("I2C_DEVICE_NOT_CONNECTED", `No wired I2C device responds at 0x${this.wireAddress.toString(16)}.`);
+          return 2;
+        }
+        const accepted = peers[0].receive(this.wireTx);
+        this.wireTx = [];
+        if (!accepted) { this.error("I2C_PEER_UNAVAILABLE", `No running peripheral board responds at I2C address 0x${this.wireAddress.toString(16)}.`); return 2; }
+        return 0;
+      }
       const m = this.m(c);
-      if (c.type === "sht31-dis") return this.wireTx.length ? this.sht(c).write(this.wireTx, this.time) : 0;
+      if (c.type === "sht31-dis") { const result = this.wireTx.length ? this.sht(c).write(this.wireTx, this.time) : 0; this.wireTx = []; return result; }
+      if (c.type === "bh1750-sen0097") { const result = this.wireTx.length ? Number(this.configureBh1750(c, this.wireTx[0]) ? 0 : 3) : 0; this.wireTx = []; return result; }
       if (this.wireTx.length) {
         if (c.type === "tca9548a") this.writeRegister(c, 0, this.wireTx[0]);
         else { m.pointer = this.wireTx[0]; this.wireTx.slice(1).forEach((v, i) => this.writeRegister(c, m.pointer + i, v)); }
       }
+      this.wireTx = [];
       return 0;
     }
     if (method === "requestFrom") {
-      const c = this.byAddress(Number(args[0])); this.wireRx = [];
-      if (!c) return 0;
+      const address = Number(args[0]);
+      const c = this.byAddress(address); this.wireRx = [];
+      const peers = this.i2cPeers.filter(peer => peer.address() === address);
+      if (peers.length) {
+        if (c || peers.length !== 1) { this.error("I2C_ADDRESS_CONFLICT", `Multiple wired I2C devices respond at 0x${address.toString(16)}.`); return 0; }
+        this.wireRx = [...peers[0].request(clamp(Number(args[1]), 0, 256))].slice(0, clamp(Number(args[1]), 0, 256));
+        return this.wireRx.length;
+      }
+      if (!c) {
+        if (!this.i2cPeers.some(peer => peer.address() === undefined)) this.error("I2C_DEVICE_NOT_CONNECTED", `No wired I2C device responds at 0x${address.toString(16)}.`);
+        return 0;
+      }
       const m = this.m(c);
       if (c.type === "sht31-dis") { this.wireRx = this.sht(c).read(clamp(Number(args[1]), 0, 256), this.time); return this.wireRx.length; }
+      if (c.type === "bh1750-sen0097") {
+        const mode = m.registers[0];
+        if (m.initialized && !m.sleeping && this.time >= m.readyAt) {
+          const maxLux = [0x11, 0x21].includes(mode) ? 27306.25 : 54612.5;
+          const precision = [0x13, 0x23].includes(mode) ? 4 : [0x11, 0x21].includes(mode) ? 0.5 : 1;
+          const lux = Math.round(Math.min(clamp(numeric(c, "lux", 500), 0, 65535), maxLux) / precision) * precision;
+          const raw = clamp(Math.round(lux * 1.2), 0, 65535);
+          this.wireRx = [(raw >> 8) & 255, raw & 255].slice(0, clamp(Number(args[1]), 0, 2));
+          if ([0x20, 0x21, 0x23].includes(mode)) m.sleeping = true;
+          else m.readyAt = this.time + ([0x13].includes(mode) ? 16 : 120);
+        }
+        return this.wireRx.length;
+      }
       this.wireRx = Array.from({ length: clamp(Number(args[1]), 0, 256) }, () => this.readRegister(c, m.pointer++)); return this.wireRx.length;
     }
-    if (method === "available") return this.wireRx.length;
-    if (method === "read") return this.wireRx.shift() ?? -1;
+    if (method === "available") return this.wirePeripheralAddress !== undefined && !this.wireMasterTransmitting ? this.wirePeripheralRx.length : this.wireRx.length;
+    if (method === "read") return (this.wirePeripheralAddress !== undefined && !this.wireMasterTransmitting ? this.wirePeripheralRx : this.wireRx).shift() ?? -1;
     return 0;
   }
   private spi(method: string, args: DeviceValue[]): DeviceValue {
     if (method === "beginTransaction" || method === "endTransaction") { this.spiAddress = undefined; return 0; }
     if (method !== "transfer") return 0;
-    const selected = this.project.components.filter(c => ["rfm95w", "bme280", "bmp280"].includes(c.type) && this.powered(c) && this.wiring.voltage(c.id, c.type === "rfm95w" ? "NSS" : "CSB") === 0 && this.wiring.boardConnected(c.id, c.type === "rfm95w" ? "MOSI" : "SDI", "D11") && this.wiring.boardConnected(c.id, c.type === "rfm95w" ? "MISO" : "SDO", "D12") && this.wiring.boardConnected(c.id, "SCK", "D13"));
+    const selected = this.project.components.filter(c => ["rfm95w", "bme280", "bmp280"].includes(c.type) && this.powered(c) && this.wiring.voltage(c.id, c.type === "rfm95w" ? "NSS" : "CSB") === 0 && this.wiring.spi(c, undefined, c.type === "rfm95w" ? { mosi: "MOSI", miso: "MISO", sck: "SCK", cs: "NSS" } : { mosi: "SDI", miso: "SDO", sck: "SCK", cs: "CSB" }));
     if (selected.length !== 1) { this.spiAddress = undefined; this.spiSelected = undefined; this.error("SPI_SELECTION", "SPI transfer needs exactly one powered, wired device selected."); return 255; }
     const c = selected[0]; const value = Number(args[0]);
     if (this.spiSelected !== c.id) this.spiAddress = undefined;
@@ -487,13 +1168,94 @@ export class DeviceRuntime {
   private serial(name: string, method: string, args: DeviceValue[], evaluate: (text: string) => DeviceValue): DeviceValue {
     if (method === "begin") { this.values.set(`${name}.baud`, Number(args[0])); return 0; }
     const pins = this.constructorArgs(name, evaluate);
-    const c = this.project.components.find(c => c.type === "xbee-s2c-zigbee-th" && this.powered(c) && this.wiring.boardConnected(c.id, "DOUT", `D${Number(pins[0] ?? 0)}`) && this.wiring.boardConnected(c.id, "DIN", `D${Number(pins[1] ?? 1)}`) && this.high(c, "RESET") && !this.high(c, "DIO8"));
+    const c = this.project.components.find(c => c.type === "xbee-s2c-zigbee-th" && this.powered(c) && this.wiring.boardConnected(c.id, "DOUT", Number(pins[0] ?? 0)) && this.wiring.boardConnected(c.id, "DIN", Number(pins[1] ?? 1)) && this.high(c, "RESET") && !this.high(c, "DIO8"));
     if (!c) return method === "available" ? 0 : -1;
     const model = this.xbee(c), connected = Number(this.values.get(`${name}.baud`)) === numeric(c, "baudRate", 9600);
     if (method === "available") return model.available(connected);
     if (method === "read") return model.read(connected);
     if (["write", "print", "println"].includes(method)) return model.write(bytes(method === "write" ? args[0] : String(args[0]) + (method === "println" ? "\n" : "")), c, this.time, connected);
     this.error("DEVICE_METHOD_UNIMPLEMENTED", `${name}.${method} is not implemented.`); return NaN;
+  }
+  private hardwareSerial(name: string, method: string, args: DeviceValue[]): DeviceValue {
+    const port = Number(name.match(/\d+$/)?.[0] ?? 0);
+    const available = getBoardProfile(this.boardId)?.uart.length ?? 1;
+    if (port <= 0 || port >= available) {
+      this.error("UART_PORT_UNAVAILABLE", `${name} is not available on the selected board profile.`);
+      return method === "available" ? 0 : -1;
+    }
+    if (method === "begin") { this.values.set(`${name}.baud`, Number(args[0])); return 0; }
+    if (method === "flush") return 0;
+    const rx = this.uartRx.get(port) ?? [];
+    if (method === "available") return rx.length;
+    if (method === "read") return rx.shift() ?? -1;
+    if (["write", "print", "println"].includes(method)) {
+      const baud = Number(this.values.get(`${name}.baud`) ?? 0);
+      if (!baud) { this.error("UART_NOT_INITIALIZED", `${name}: call begin(baud) before transmitting.`); return 0; }
+      const data = method === "write"
+        ? bytes(args[0]).slice(0, args[1] === undefined ? undefined : Math.max(0, Math.trunc(Number(args[1]))))
+        : [...new TextEncoder().encode(String(args[0] ?? "") + (method === "println" ? "\n" : ""))];
+      this.uartTx.push({ port, baud, data });
+      return data.length;
+    }
+    this.error("DEVICE_METHOD_UNIMPLEMENTED", `${name}.${method} is not implemented.`);
+    return NaN;
+  }
+  private boardProperties() { return this.project.components.find(component => component.id === this.boardComponentId)?.properties ?? {}; }
+  private virtualUdpPeerMatches() {
+    const properties = this.boardProperties();
+    return properties.udpPeerEnabled !== false
+      && String(properties.peerSsid ?? "") === String(properties.networkSsid ?? "")
+      && String(properties.peerPassword ?? "") === String(properties.networkPassword ?? "")
+      && String(properties.peerAddress ?? "").length > 0
+      && Number(properties.peerPort ?? 0) > 0;
+  }
+  private wifi(method: string, args: DeviceValue[]): DeviceValue {
+    if (method === "mode") return 1;
+    if (method === "begin") {
+      const properties = this.boardProperties();
+      this.wifiConnected = String(args[0] ?? "") === String(properties.networkSsid ?? "")
+        && String(args[1] ?? "") === String(properties.networkPassword ?? "");
+      if (!this.wifiConnected) this.error("WIFI_CONNECT_FAILED", `${this.boardId}: Wi-Fi credentials do not match this board's configured virtual network.`);
+      return this.wifiConnected ? 3 : 6;
+    }
+    if (method === "status") return this.wifiConnected ? 3 : 6;
+    if (method === "disconnect") { this.wifiConnected = false; return 1; }
+    this.error("DEVICE_METHOD_UNIMPLEMENTED", `WiFi.${method} is outside the virtual Wi-Fi subset.`);
+    return NaN;
+  }
+  private udp(name: string, method: string, args: DeviceValue[]): DeviceValue {
+    let socket = this.udpSockets.get(name);
+    if (!socket) { socket = { localPort: 0, remoteAddress: "", remotePort: 0, tx: [], rx: [] }; this.udpSockets.set(name, socket); }
+    if (method === "begin") { socket.localPort = this.wifiConnected ? Number(args[0]) : 0; return Number(socket.localPort > 0); }
+    if (method === "beginPacket") { socket.remoteAddress = String(args[0]); socket.remotePort = Number(args[1]); socket.tx = []; return Number(this.wifiConnected && socket.localPort > 0); }
+    if (method === "write" || method === "print" || method === "println") {
+      const content = method === "write" ? bytes(args[0]).slice(0, args[1] === undefined ? undefined : Math.max(0, Math.trunc(Number(args[1])))) : bytes(String(args[0] ?? "") + (method === "println" ? "\r\n" : ""));
+      socket.tx.push(...content); return content.length;
+    }
+    if (method === "endPacket") {
+      const delivered = this.wifiConnected && socket.localPort > 0 && this.virtualUdpPeerMatches()
+        && socket.remoteAddress === String(this.boardProperties().peerAddress) && socket.remotePort === Number(this.boardProperties().peerPort);
+      const payload = new TextDecoder().decode(new Uint8Array(socket.tx));
+      this.udpPackets.push({ timeMs: this.time, direction: "tx", payload, status: delivered ? "Delivered to virtual UDP peer" : "Not delivered: peer, port, or Wi-Fi settings do not match" });
+      if (!delivered) this.error("UDP_PEER_UNAVAILABLE", `${name}: no matching configured virtual UDP peer is reachable at ${socket.remoteAddress}:${socket.remotePort}.`);
+      socket.tx = []; return Number(delivered);
+    }
+    if (method === "parsePacket") return socket.rx.length;
+    if (method === "available") return socket.rx.length;
+    if (method === "read") return socket.rx.shift() ?? -1;
+    if (method === "remotePort") return socket.remotePort;
+    if (method === "stop") { socket.localPort = 0; socket.rx = []; return 0; }
+    this.error("DEVICE_METHOD_UNIMPLEMENTED", `${name}.${method} is outside the virtual UDP subset.`);
+    return NaN;
+  }
+  drainUartTransmissions(): UartTransmission[] { const result = this.uartTx; this.uartTx = []; return result; }
+  enqueueUart(port: number, baud: number, data: readonly number[]): boolean {
+    const name = `Serial${port}`;
+    if (Number(this.values.get(`${name}.baud`) ?? 0) !== baud) return false;
+    const queue = this.uartRx.get(port) ?? [];
+    queue.push(...data);
+    this.uartRx.set(port, queue.slice(-4096));
+    return true;
   }
   private xbeeObject(name: string, method: string, args: DeviceValue[], evaluate: (text: string) => DeviceValue): DeviceValue {
     const type = this.instances.get(name)?.api.type;
@@ -749,6 +1511,13 @@ export class DeviceRuntime {
     this.error("DEVICE_METHOD_UNIMPLEMENTED", `${c.label}.${method} is not implemented.`); return NaN;
   }
   injectPacket(id: string, payload: string): boolean {
+    if (id === this.boardComponentId && this.wifiConnected && this.virtualUdpPeerMatches()) {
+      const sockets = [...this.udpSockets.values()].filter(socket => socket.localPort > 0);
+      if (!sockets.length) return false;
+      for (const socket of sockets) socket.rx.push(...bytes(payload));
+      this.udpPackets.push({ timeMs: this.time, direction: "rx", payload, status: "Received from virtual UDP peer" });
+      return true;
+    }
     const c = this.project.components.find(c => c.id === id); if (!c || !this.wiring) return false;
     if (c.type === "rfm95w") { const host = !!this.resolve("LoRa", [], text => Number(text)); return this.lora(c).inject(bytes(payload), c, this.time, host); }
     if (c.type === "xbee-s2c-zigbee-th") {

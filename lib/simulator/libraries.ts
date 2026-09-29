@@ -7,20 +7,25 @@ export const SIMULATED_LIBRARIES: Readonly<Record<string, { className?: string; 
   "Servo.h": { className: "Servo", methods: ["attach", "write", "read"] },
   "LiquidCrystal.h": { className: "LiquidCrystal", methods: ["begin", "clear", "setCursor", "print", "println"] },
 };
-const coreCalls = new Set(["setup", "loop", "if", "for", "while", "switch", "pinMode", "digitalWrite", "analogWrite", "digitalRead", "analogRead", "millis", "delay", "pulseIn", "map", "constrain", "min", "max", "tone", "noTone", "shiftOut", "SPISettings", "isnan", "sizeof"]);
+const coreCalls = new Set(["setup", "loop", "if", "for", "while", "switch", "pinMode", "digitalWrite", "analogWrite", "digitalRead", "analogRead", "millis", "delay", "pulseIn", "map", "constrain", "min", "max", "tone", "noTone", "shiftOut", "SPISettings", "isnan", "sizeof", "makeKeymap"]);
 
 /** Input is comment-masked source, retaining newlines for actionable diagnostics. */
-export function validateLibraryCalls(source: string): SimulatorDiagnostic[] {
+export function validateLibraryCalls(source: string, boardId?: string): SimulatorDiagnostic[] {
   source = source.replace(/\b([A-Za-z_]\w*)\.getResponse\(\)/g, "$1__response");
   const diagnostics: SimulatorDiagnostic[] = [];
   const lineAt = (index: number) => source.slice(0, index).split("\n").length;
+  const supportedApis = DEVICE_APIS.filter(api => !boardId || !api.boards || api.boards.includes(boardId));
   for (const match of source.matchAll(/^\s*#\s*include\s*[<"]([^>"\r\n]+)[>"]/gm)) {
-    if (!Object.hasOwn(SIMULATED_LIBRARIES, match[1]) && !DEVICE_APIS.some(api => api.header === match[1]) && !["Adafruit_Sensor.h"].includes(match[1])) diagnostics.push({ severity: "error", code: "UNSUPPORTED_LIBRARY", line: lineAt(match.index!), message: `${match[1]} has no browser simulation adapter. Use a registered simulation library.` });
+    if (!Object.hasOwn(SIMULATED_LIBRARIES, match[1]) && !supportedApis.some(api => api.header === match[1]) && !["Adafruit_Sensor.h"].includes(match[1])) {
+      const platformApi = DEVICE_APIS.find(api => api.header === match[1]);
+      const supportedBoards = [...new Set(DEVICE_APIS.filter(api => api.header === match[1]).flatMap(api => api.boards ?? []))];
+      diagnostics.push({ severity: "error", code: platformApi && boardId ? "DEVICE_API_BOARD_UNSUPPORTED" : "UNSUPPORTED_LIBRARY", line: lineAt(match.index!), message: platformApi && boardId ? `${match[1]} is not available on ${boardId}${supportedBoards.length ? `; supported board profiles: ${supportedBoards.join(", ")}` : ""}.` : `${match[1]} has no browser simulation adapter. Use a registered simulation library.` });
+    }
   }
   const instances = new Map<string, readonly string[]>([["Serial", ["begin", "print", "println"]]]);
-  const deviceObjects = deviceInstances(source);
-  const constructors = new Set<string>(DEVICE_APIS.map(api => api.type));
-  for (const [name, instance] of deviceInstances(source)) { instances.set(name, Object.keys(instance.api.methods)); constructors.add(name); }
+  const deviceObjects = deviceInstances(source, boardId);
+  const constructors = new Set<string>(supportedApis.map(api => api.type));
+  for (const [name, instance] of deviceInstances(source, boardId)) { instances.set(name, Object.keys(instance.api.methods)); constructors.add(name); }
   for (const library of Object.values(SIMULATED_LIBRARIES)) {
     if (!library.className) continue;
     constructors.add(library.className);
@@ -29,10 +34,11 @@ export function validateLibraryCalls(source: string): SimulatorDiagnostic[] {
   }
   // Strings and preprocessor lines are data, not executable calls.
   const executable = source.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|^\s*#.*$/gm, text => text.replace(/[^\n]/g, " "));
+  const registeredCallbacks = new Set([...executable.matchAll(/\bWire\s*\.\s*on(?:Receive|Request)\s*\(\s*([A-Za-z_]\w*)\s*\)/g)].map(match => match[1]));
   const seen = new Set<string>();
   for (const match of executable.matchAll(/\b([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(/g)) {
     const [, name, method] = match;
-    const supported = method ? instances.get(name)?.includes(method) : coreCalls.has(name) || constructors.has(name);
+    const supported = method ? instances.get(name)?.includes(method) : coreCalls.has(name) || constructors.has(name) || registeredCallbacks.has(name);
     const label = method ? `${name}.${method}` : name;
     const signature = method && deviceObjects.get(name)?.api.methods[method];
     if (signature) {

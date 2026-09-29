@@ -7,9 +7,9 @@ import { createDefaultBlinkProject } from "./default-project.ts";
 import { componentSize, pinPosition } from "../schematic/geometry.ts";
 import { discoverLibraryCandidates, selectGenerationComponents } from "./discovery.ts";
 
-test("20 verified entries retain distinct pins, documented variants, and reusable layouts", () => {
-  assert.equal(Object.keys(EXPANDED_COMPONENTS).length, 20);
-  assert.equal(Object.values(EXPANDED_COMPONENTS).filter(p => simulationCapability(p) === "simulated").length, 20);
+test("expanded entries retain distinct pins, documented variants, and reusable layouts", () => {
+  assert.equal(Object.keys(EXPANDED_COMPONENTS).length, 32);
+  assert.equal(Object.values(EXPANDED_COMPONENTS).filter(p => simulationCapability(p) === "simulated").length, 32);
   for (const part of Object.values(EXPANDED_COMPONENTS)) {
     assert.ok(part.metadata?.manufacturer && part.metadata.variant && part.metadata.documentation.length);
     assert.equal(new Set(part.pins.map(p => p.id)).size, part.pins.length);

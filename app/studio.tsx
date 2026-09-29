@@ -19,6 +19,11 @@ import {
   connectFloatingMotorDriverEnables,
   createDefaultBlinkProject,
   createDefaultProperties,
+  activateBoardProgram,
+  getActiveBoard,
+  isBoardType,
+  resolveBoardPin,
+  updateActiveBoardProgram,
   getComponentDefinition,
   normalizeGroundReturns,
   removeComponentFromProject,
@@ -29,16 +34,15 @@ import {
   type ConnectionEndpoint,
 } from "../lib/circuit";
 import {
-  ArduinoSimulator,
+  MultiBoardSimulator,
   isBuzzerActive,
   isUninitializedMotorControlWarning,
   isLedCircuitPowered,
   resolveBuzzerCircuitBindings,
-  resolveComponentBoardPins,
+  resolveComponentBoardPinEndpoints,
   resolveComponentIoPins,
   resolveLedCircuitBindings,
   solveCircuit,
-  parseUnoPinLabel,
   type SimulatorSnapshot,
 } from "../lib/simulator";
 import {
@@ -184,7 +188,7 @@ function resizePanel(
 
 const CATEGORY_LABELS: Record<string, string> = {
   all: "All",
-  motors: "Motors", drivers: "Drivers", wireless: "Wireless", multiplexers: "Mux / Expansion", power: "Power",
+  motors: "Motors", drivers: "Drivers", wireless: "Wireless", multiplexers: "Mux / Expansion", power: "Power", storage: "Storage",
   boards: "Boards",
   passives: "Passives",
   inputs: "Input",
@@ -221,15 +225,14 @@ const PART_GLYPHS: Record<string, string> = {
 };
 
 let uidCounter = 0;
-let isFirstRender = true;
 
 function uid(prefix: string) {
-  // Use deterministic counter-based IDs for SSR and initial client render
-  // After hydration, use timestamp-based IDs for uniqueness
-  if (typeof window === 'undefined' || isFirstRender) {
-    return `${prefix}-${uidCounter++}`;
-  }
-  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+  // These IDs are created by user actions, never during render, so use unique
+  // values even across Fast Refresh/module reloads while chat state is retained.
+  const randomId = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}-${uidCounter++}`;
+  return `${prefix}-${randomId}`;
 }
 
 function deepClone(project: CircuitProject): CircuitProject {
@@ -297,7 +300,7 @@ export function CircuitStudio() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const ultrasonicEchoPinsRef = useRef<Set<string>>(new Set());
-  const [simulator] = useState(() => new ArduinoSimulator(initialProject.code));
+  const [simulator] = useState(() => new MultiBoardSimulator(initialProject.code));
   const [snapshot, setSnapshot] = useState<SimulatorSnapshot>(() => simulator.getSnapshot());
 
   useEffect(() => {
@@ -403,7 +406,6 @@ export function CircuitStudio() {
     }
     queueMicrotask(() => {
       setHydrated(true);
-      isFirstRender = false; // Allow timestamp-based IDs after hydration
     });
   }, []);
 
@@ -646,7 +648,9 @@ export function CircuitStudio() {
   const selectedId = selectedIds.length === 1 ? selectedIds[0] : null;
   const selected = project.components.find((component) => component.id === selectedId) ?? null;
   const selectedDefinition = selected ? getComponentDefinition(selected.type) : undefined;
-  const arduinoCount = project.components.filter((component) => component.type === "arduino-uno").length;
+  const boards = project.components.filter((component) => isBoardType(component.type));
+  const activeBoard = getActiveBoard(project);
+  const activeBoardName = activeBoard ? getComponentDefinition(activeBoard.type)?.displayName ?? activeBoard.type : "No board";
   const ledCircuitBindings = useMemo(
     () => resolveLedCircuitBindings(project),
     [project],
@@ -657,9 +661,10 @@ export function CircuitStudio() {
   );
   
   const circuitMessages = useMemo<CompileMessage[]>(() => {
-    const diagnostics = solveCircuit(project, snapshot).diagnostics
+    const diagnostics = [...solveCircuit(project, snapshot).diagnostics, ...snapshot.diagnostics]
       .filter(item => !isUninitializedMotorControlWarning(project, snapshot, item));
-    return diagnostics.map((item) => ({ 
+    const uniqueDiagnostics = [...new Map(diagnostics.map(item => [`${item.code}:${item.line ?? 0}:${item.message}`, item])).values()];
+    return uniqueDiagnostics.map((item) => ({
       severity: item.severity, 
       message: item.message 
     }));
@@ -726,7 +731,14 @@ export function CircuitStudio() {
       y: centerY - size.height / 2 + ((project.components.length * 23) % 70),
       properties: createDefaultProperties(type),
     };
-    commitProject({ ...project, components: [...project.components, component] });
+    const nextProject = { ...project, components: [...project.components, component] };
+    if (isBoardType(type)) {
+      const selectedProject = activateBoardProgram(nextProject, component.id);
+      simulator.attachProject(nextProject);
+      simulator.selectBoard(component.id);
+      simulator.load(selectedProject.code);
+      commitProject(selectedProject);
+    } else commitProject(nextProject);
     setSelectedIds([component.id]);
     setSideTab("inspector");
     announce(`${definition.displayName} added`);
@@ -903,6 +915,15 @@ export function CircuitStudio() {
     });
   };
 
+  const switchSketchBoard = (boardComponentId: string) => {
+    const nextProject = activateBoardProgram(project, boardComponentId);
+    const keepBuildReady = buildState === "ready";
+    simulator.selectBoard(boardComponentId);
+    commitProject(nextProject);
+    setCompileMessages([]);
+    setBuildState(keepBuildReady && simulator.getCompiledSketch().valid ? "ready" : "idle");
+  };
+
   const build = async (autoRun = false) => {
     setBuildState("building");
     setCompileMessages([]);
@@ -1019,7 +1040,7 @@ export function CircuitStudio() {
       fitComponentsInCanvas(nextProject.components);
       setPendingPin(null);
       const firstGeneratedPart = nextProject.components.find(
-        (component) => component.type !== "arduino-uno",
+        (component) => !isBoardType(component.type),
       );
       setSelectedIds(firstGeneratedPart ? [firstGeneratedPart.id] : []);
       setChat((items) => [...items, { id: uid("assistant"), role: "assistant", text: explanation, meta }]);
@@ -1260,7 +1281,7 @@ export function CircuitStudio() {
                   snapshot,
                 );
                 const servoState = component.type === "servo"
-                  ? snapshot.servos.find((servo) => resolveComponentBoardPins(project, component.id, "SIG").some((pin) => parseUnoPinLabel(pin) === servo.pin))
+                  ? snapshot.servos.find((servo) => resolveComponentBoardPinEndpoints(project, component.id, "SIG").some((pin) => pin.boardId === (servo.boardId ?? project.board) && pin.componentId === (servo.boardComponentId ?? activeBoard?.id) && resolveBoardPin(pin.boardId, pin.pin) === servo.pin))
                   : undefined;
                 const lcdState = component.type === "lcd-16x2" ? snapshot.lcds[0] : undefined;
                 const electricalState = snapshot.componentStates[component.id];
@@ -1295,7 +1316,7 @@ export function CircuitStudio() {
                     onDoubleClick={() => { setSelectedIds([component.id]); setSideTab("inspector"); }}
                   >
                     <div className="symbol-caption"><strong>{component.label}</strong><small>{component.type === "arduino-uno" ? "ARDUINO UNO R3" : definition?.displayName}</small></div>
-                    <SchematicSymbol type={component.type} properties={symbolProperties} powered={isPowered || component.type === "arduino-uno"} simulationStatus={snapshot.status} playbackSpeed={snapshot.speed} zoom={zoom} />
+                    <SchematicSymbol type={component.type} properties={symbolProperties} powered={isPowered || isBoardType(component.type)} simulationStatus={snapshot.status} playbackSpeed={snapshot.speed} zoom={zoom} />
                     {definition?.pins.map((pin) => {
                         const localPoint = pinPosition({ ...component, x: 0, y: 0, rotation: 0 }, pin.id, definition);
                         if (!localPoint) return null;
@@ -1306,7 +1327,7 @@ export function CircuitStudio() {
                         );
                         const highlightedWire = connectedWires.find((connection) => connection.id === highlightedWireId);
                         const displayWire = highlightedWire ?? connectedWires[0];
-                        return <button key={pin.id} className={`schematic-pin side-${pin.side} ${active ? "active" : ""} ${displayWire ? "connected" : ""} ${highlightedWire ? "wire-highlighted" : ""}`} style={{ left: localPoint.x, top: localPoint.y, "--pin-wire-color": displayWire?.color ?? "#47b86b" } as React.CSSProperties} aria-label={pin.number ? `${pin.label}, pin ${pin.number}` : pin.label} title={`${pin.number ? `Pin ${pin.number} · ` : ""}${pin.label}${displayWire ? " · connected" : ""} · click to wire`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); connectPin({ componentId: component.id, pin: pin.id }); }}><i />{!definition.symbol && <span>{pin.label}</span>}</button>;
+                        return <button key={pin.id} className={`schematic-pin side-${pin.side} ${active ? "active" : ""} ${displayWire ? "connected" : ""} ${highlightedWire ? "wire-highlighted" : ""}`} style={{ left: localPoint.x, top: localPoint.y, "--pin-wire-color": displayWire?.color ?? "#47b86b" } as React.CSSProperties} aria-label={pin.number ? `${pin.label}, pin ${pin.number}` : pin.label} title={`${pin.number ? `Pin ${pin.number} · ` : ""}${pin.label}${displayWire ? " · connected" : ""} · click to wire`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); connectPin({ componentId: component.id, pin: pin.id }); }}><i />{(!definition.symbol || isBoardType(component.type)) && <span>{pin.label}</span>}</button>;
                       })}
                   </article>
                 );
@@ -1494,6 +1515,7 @@ export function CircuitStudio() {
         <div className="drawer-bar">
           <div className="bottom-tabs">
             <button className={bottomTab === "code" ? "active" : ""} onClick={() => { setBottomTab("code"); setBottomOpen(true); }}>Sketch.ino <span className="language-dot">C++</span></button>
+            {boards.length > 0 && <label className="sketch-board-select"><span>Board</span><select aria-label="Board sketch" value={activeBoard?.id ?? ""} onChange={event => switchSketchBoard(event.target.value)}>{boards.map(board => <option key={board.id} value={board.id}>{board.label}</option>)}</select></label>}
             <button className={bottomTab === "serial" ? "active" : ""} onClick={() => { setBottomTab("serial"); setBottomOpen(true); }}>Serial monitor <i>{snapshot.serial.length}</i></button>
             <button className={bottomTab === "problems" ? "active" : ""} onClick={() => { setBottomTab("problems"); setBottomOpen(true); }}>Problems <i className={problemMessages.some((message) => message.severity === "error") ? "error" : ""}>{problemMessages.length}</i></button>
           </div>
@@ -1509,15 +1531,15 @@ export function CircuitStudio() {
 
         {bottomOpen && (
           <div className="drawer-content">
-            {bottomTab === "code" && <div className="code-editor"><pre aria-hidden="true">{project.code.split("\n").map((_, index) => <span key={index}>{index + 1}</span>)}</pre><textarea spellCheck={false} aria-label="Arduino code" value={project.code} onChange={(event) => { setProject((current) => ({ ...current, code: event.target.value })); setBuildState("idle"); }} onBlur={() => commitProject(projectRef.current)} /></div>}
-            {bottomTab === "serial" && <div className="serial-console"><header><span>9600 baud</span><button onClick={() => simulator.clearSerial()}>Clear output</button></header><div>{snapshot.serial.length ? snapshot.serial.map((entry) => <p key={entry.id}><time>{(entry.timestampMs / 1000).toFixed(2)}s</time><span>{entry.text}{entry.newline ? "" : "_"}</span></p>) : <div className="console-empty">Run the simulation to see Serial output here.<small>Serial.begin(9600) detected automatically</small></div>}</div></div>}
+            {bottomTab === "code" && <div className="code-editor"><pre aria-hidden="true">{project.code.split("\n").map((_, index) => <span key={index}>{index + 1}</span>)}</pre><textarea spellCheck={false} aria-label={`${activeBoardName} sketch`} value={project.code} onChange={(event) => { setProject((current) => updateActiveBoardProgram(current, event.target.value)); setBuildState("idle"); }} onBlur={() => commitProject(projectRef.current)} /></div>}
+            {bottomTab === "serial" && <div className="serial-console"><header><span>{activeBoardName} · Serial output</span><button onClick={() => simulator.clearSerial()}>Clear output</button></header><div>{snapshot.serial.length ? snapshot.serial.map((entry) => <p key={entry.id}><time>{(entry.timestampMs / 1000).toFixed(2)}s</time><span>{entry.text}{entry.newline ? "" : "_"}</span></p>) : <div className="console-empty">Run the selected board to see its Serial output here.<small>Choose another board to inspect its sketch and output.</small></div>}</div></div>}
             {bottomTab === "problems" && <div className="problems-list">{hasEnableRepair && <button className="motor-enable-repair" onClick={() => { commitProject(enableRepair); announce(missingEnableCount > 0 ? `Repaired ${missingEnableCount} motor driver enable ${missingEnableCount === 1 ? "pin" : "pins"}` : "Repaired floating motor driver standby wiring"); }}><span>↗</span><strong>{missingEnableCount > 0 ? `Connect ${missingEnableCount} disconnected motor driver enable or standby ${missingEnableCount === 1 ? "pin" : "pins"}` : "Fix floating motor driver standby wiring"}</strong><small>Fix wiring</small></button>}{problemMessages.length ? problemMessages.map((message, index) => <button key={index} onClick={() => setBottomTab("code")}><span className={message.severity}>{message.severity === "error" ? "×" : "!"}</span><strong>{message.message}</strong><small>{message.line ? `Sketch.ino:${message.line}` : "Circuit"}</small></button>) : <div className="console-empty"><span className="success-check">✓</span>No build problems detected.<small>The supported simulation subset is ready.</small></div>}</div>}
           </div>
         )}
       </section>
 
       <footer className="statusbar">
-        <span><i className={arduinoCount === 1 ? "status-ok" : "status-warning"}></i>{arduinoCount === 0 ? "No Arduino board" : arduinoCount === 1 ? "Arduino Uno" : `${arduinoCount} Arduino Uno boards`}</span><span>Digital simulator</span><span>{project.components.length} components</span><span>{project.connections.length} nets</span><span className="status-spacer"></span><span>Schema v{project.schemaVersion}</span><span>Local project</span>
+        <span><i className={boards.length ? "status-ok" : "status-warning"}></i>{boards.length === 0 ? "No board" : boards.length === 1 ? activeBoardName : `${boards.length} boards · ${activeBoardName} active`}</span><span>Digital simulator</span><span>{project.components.length} components</span><span>{project.connections.length} nets</span><span className="status-spacer"></span><span>Schema v{project.schemaVersion}</span><span>Local project</span>
       </footer>
       {toast && <div className="toast" role="status"><span>✓</span>{toast}</div>}
     </main>

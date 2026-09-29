@@ -5,6 +5,7 @@ import type {
 } from "./types.ts";
 import { POWER_COMPONENTS } from "./power-parts.ts";
 import { EXPANDED_COMPONENTS } from "./parts.ts";
+import { BOARD_COMPONENTS } from "./boards.ts";
 
 export type ComponentCategory =
   | "boards"
@@ -15,7 +16,7 @@ export type ComponentCategory =
   | "motors"
   | "logic"
   | "sensors"
-  | "drivers" | "wireless" | "multiplexers" | "power";
+  | "drivers" | "wireless" | "multiplexers" | "power" | "storage";
 
 export type PinDirection =
   | "input"
@@ -1050,6 +1051,7 @@ const LEGACY_SYMBOL_SIZES: Readonly<Record<string, { width: number; height: numb
 
 export const INTERNAL_COMPONENT_CATALOG: Readonly<Record<string, ComponentDefinition>> = Object.freeze({
   ...Object.fromEntries(Object.entries(LEGACY_COMPONENTS).map(([id, definition]) => [id, { ...definition, ...LEGACY_SYMBOL_SIZES[id] }])),
+  ...BOARD_COMPONENTS,
   ...EXPANDED_COMPONENTS,
   ...POWER_COMPONENTS,
 });
@@ -1088,7 +1090,7 @@ export const COMPONENT_CATEGORIES = Object.freeze([
   "logic",
   "sensors",
   "drivers",
-  "wireless", "multiplexers", "power",
+  "wireless", "multiplexers", "power", "storage",
 ] satisfies ComponentCategory[]);
 
 export function isSupportedComponentType(

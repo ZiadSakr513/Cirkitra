@@ -4,6 +4,7 @@ import type {
   CircuitProject,
   ConnectionEndpoint,
 } from "./types.ts";
+import { isBoardType } from "./boards.ts";
 
 export type CircuitDiagnosticSeverity = "error" | "warning";
 
@@ -116,13 +117,13 @@ export function diagnoseCircuit(
   });
 
   const boards = project.components.filter(
-    (component) => component.type === "arduino-uno",
+    (component) => isBoardType(component.type),
   );
   if (boards.length === 0) {
     diagnostics.push({
       code: "missing-board",
       severity: "warning",
-      message: "The project has no Arduino Uno component on the schematic.",
+      message: "The project has no supported microcontroller board on the schematic.",
       path: "$.components",
     });
   } else if (boards.length > 1) {
@@ -130,7 +131,7 @@ export function diagnoseCircuit(
     diagnostics.push({
       code: "multiple-boards",
       severity: "warning",
-      message: "Schema v1 simulates one Arduino Uno at a time.",
+      message: "All placed boards are eligible to run a controller program.",
       path:
         duplicateBoardIndex === undefined
           ? "$.components"

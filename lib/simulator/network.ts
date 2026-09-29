@@ -2,6 +2,7 @@ import { getComponentDefinition } from "../circuit/catalog.ts";
 import type { CircuitProject } from "../circuit/types.ts";
 import type { SimulatorSnapshot } from "./types.ts";
 import { ELECTRICAL_MODELS, type ModelResult, type PinReading } from "./models.ts";
+import { getBoardProfile, isBoardType } from "../circuit/boards.ts";
 
 class Nets {
   private parent = new Map<string, string>();
@@ -31,10 +32,14 @@ export function solveNetwork(project: CircuitProject, snapshot: SimulatorSnapsho
     if (c.type === "push-button" && ((c.properties?.pressed === true) !== (c.properties?.normallyClosed === true))) join("1", "2");
     if (c.type === "toggle-switch") join("COM", c.properties?.position === true ? "NO" : "NC");
     if (c.type === "ground") base.push([key(c.id, "GND"), 0]);
-    if (c.type === "arduino-uno") {
-      ["GND", "GND2", "GND3"].forEach(pin => base.push([key(c.id, pin), 0]));
-      ["5V", "3V3", "IOREF"].forEach(pin => base.push([key(c.id, pin), 1]));
-      snapshot.pins.forEach(pin => { if (pin.mode === "OUTPUT") base.push([key(c.id, pin.label), pin.pwmValue / 255]); });
+    if (isBoardType(c.type)) {
+      const profile = getBoardProfile(c.type)!;
+      profile.groundPins.forEach(pin => base.push([key(c.id, pin), 0]));
+      Object.keys(profile.rails).forEach(pin => base.push([key(c.id, pin), 1]));
+      const boards = project.components.filter(item => item.type === c.type);
+      const state = snapshot.boardPins?.[c.id]
+        ?? (c.type === project.board && c.id === boards[0]?.id ? snapshot.pins : undefined);
+      state?.forEach(pin => { if (pin.mode === "OUTPUT") base.push([key(c.id, pin.label), pin.pwmValue / 255]); });
     }
   }
   const wired = new Set(project.connections.flatMap(w => [key(w.from.componentId, w.from.pin), key(w.to.componentId, w.to.pin)]));
@@ -53,6 +58,16 @@ export function solveNetwork(project: CircuitProject, snapshot: SimulatorSnapsho
     const values = new Map<string, number[]>();
     for (const [endpoint, value] of [...base, ...outputs]) {
       const root = nets.find(endpoint); const group = values.get(root) ?? []; group.push(value); values.set(root, group);
+    }
+    // A MCU's internal pull-up is weak: it leaves a floating input HIGH but
+    // yields to a real wired low. Do not average it against an output drive.
+    for (const board of project.components.filter(component => isBoardType(component.type))) {
+      const pins = snapshot.boardPins?.[board.id]
+        ?? (snapshot.primaryBoardId === board.id || (!snapshot.primaryBoardId && board.type === project.board && board.id === project.components.find(item => item.type === board.type)?.id) ? snapshot.pins : []);
+      for (const pin of pins) if (pin.mode === "INPUT_PULLUP") {
+        const root = nets.find(key(board.id, pin.label));
+        if (!values.has(root)) values.set(root, [1]);
+      }
     }
     readings = new Map([...values].map(([root, group]) => [root, { value: group.reduce((sum, value) => sum + value, 0) / group.length, conflict: Math.max(...group) - Math.min(...group) > 0.000001 }]));
     const nextEdges: Edge[] = []; const nextOutputs: Drive[] = [];

@@ -1,10 +1,11 @@
 import { solveCircuit } from "./circuit-state.ts";
-import { DeviceRuntime, type DeviceValue } from "./devices.ts";
+import { DeviceRuntime, type DeviceValue, type I2cPeerEndpoint } from "./devices.ts";
 import { deriveMotorSupplyLoads, type MotorSupplyLoad } from "./motor-loads.ts";
 import { deviceInstances, splitDeviceArguments, DEVICE_CONSTANTS } from "./device-api.ts";
 import type { CircuitProject } from "../circuit/types.ts";
 import { COMPONENT_CATALOG } from "../circuit/catalog.ts";
-import { createInitialPinStates, parseUnoPinLabel, UNO_PWM_PINS } from "./pins.ts";
+import { createInitialPinStates, parseBoardPinLabel } from "./pins.ts";
+import { boardApiConstants, getBoardProfile, isBoardPwmPin, isBoardType } from "../circuit/boards.ts";
 import { compileArduinoSketch, evaluateRuntimeExpression } from "./parser.ts";
 import type {
   ArduinoSimulatorOptions,
@@ -55,6 +56,9 @@ function freezeSnapshot(
   lcds: LcdState[],
   tones: ToneState[],
   componentStates: Readonly<Record<string, SimulatedComponentState>>,
+  boardComponentId?: string,
+  boardId?: string,
+  existingBoardPins: SimulatorSnapshot["boardPins"] = {},
 ): SimulatorSnapshot {
   const pinSnapshot = Object.freeze(
     pins.map((pin) => Object.freeze({ ...pin })),
@@ -75,6 +79,12 @@ function freezeSnapshot(
     loopCount,
     waitRemainingMs,
     pins: pinSnapshot,
+    primaryBoardId: boardComponentId,
+    primaryBoardType: boardId,
+    boardPins: Object.freeze({
+      ...existingBoardPins,
+      ...(boardComponentId ? { [boardComponentId]: pinSnapshot } : {}),
+    }),
     serial: serialSnapshot,
     servos: Object.freeze(servos.map((item) => Object.freeze({ ...item }))),
     lcds: Object.freeze(lcds.map((item) => Object.freeze({ ...item, lines: Object.freeze([...item.lines]) }))),
@@ -102,7 +112,12 @@ export class ArduinoSimulator {
   private programCounter = 0;
   private loopCount = 0;
   private waitRemainingMs = 0;
-  private pins: UnoPinState[] = createInitialPinStates();
+  private pins: UnoPinState[];
+  private boardId: string;
+  private boardComponentId?: string;
+  private networkBoardPins: SimulatorSnapshot["boardPins"] = {};
+  private readonly requestedBoardId?: string;
+  private readonly requestedBoardComponentId?: string;
   private serial: SerialEntry[] = [];
   private variables = new Map<string, number>();
   private nextSerialId = 1;
@@ -111,6 +126,7 @@ export class ArduinoSimulator {
   private tones = new Map<number, ToneState>();
   private componentStates: Readonly<Record<string, SimulatedComponentState>> = {};
   private analogInputs = new Map<number, number>();
+  private circuitAnalogInputs = new Set<number>();
   private pulseInputs = new Map<number, number>();
   private readonly maxOperationsPerAdvance: number;
   private readonly maxSerialEntries: number;
@@ -118,6 +134,11 @@ export class ArduinoSimulator {
   private snapshot: SimulatorSnapshot;
 
   constructor(source = "", options: ArduinoSimulatorOptions = {}) {
+    this.boardId = options.boardId ?? "arduino-uno";
+    this.boardComponentId = options.boardComponentId;
+    this.requestedBoardId = options.boardId;
+    this.requestedBoardComponentId = options.boardComponentId;
+    this.pins = createInitialPinStates(this.boardId);
     this.speed = validSpeed(options.speed);
     this.maxOperationsPerAdvance = positiveInteger(
       options.maxOperationsPerAdvance,
@@ -127,7 +148,7 @@ export class ArduinoSimulator {
       options.maxSerialEntries,
       DEFAULT_MAX_SERIAL_ENTRIES,
     );
-    this.compiled = compileArduinoSketch(source);
+    this.compiled = compileArduinoSketch(source, this.boardId);
     this.variables = new Map(Object.entries(this.compiled.globals));
     this.status = this.compiled.valid ? "idle" : "error";
     this.snapshot = freezeSnapshot(
@@ -142,15 +163,38 @@ export class ArduinoSimulator {
       this.serial,
       this.compiled,
       [...this.servos.values()], [...this.lcds.values()], [...this.tones.values()], this.componentStates,
+      this.boardComponentId, this.boardId,
     );
   }
 
   attachProject(project: CircuitProject) {
-    const changed = this.project && JSON.stringify([this.project.components.map(c => [c.id, c.type]), this.project.connections]) !== JSON.stringify([project.components.map(c => [c.id, c.type]), project.connections]);
+    const selectedBoard = this.requestedBoardComponentId
+      ? project.components.find(component => component.id === this.requestedBoardComponentId && isBoardType(component.type))
+      : project.components.find(component => component.id === this.boardComponentId && isBoardType(component.type))
+        ?? project.components.find(component => component.type === (this.requestedBoardId ?? project.board));
+    const projectBoard = this.requestedBoardId ?? (selectedBoard?.type ?? project.board);
+    const nextBoardComponentId = this.requestedBoardComponentId ?? selectedBoard?.id;
+    const boardChanged = isBoardType(projectBoard) && projectBoard !== this.boardId;
+    if (boardChanged) { this.boardId = projectBoard; this.compiled = compileArduinoSketch(this.compiled.source, this.boardId); }
+    const changed = boardChanged || nextBoardComponentId !== this.boardComponentId || (this.project && JSON.stringify([this.project.components.map(c => [c.id, c.type]), this.project.connections]) !== JSON.stringify([project.components.map(c => [c.id, c.type]), project.connections]));
+    this.boardComponentId = nextBoardComponentId;
     this.project = project;
-    if (!this.devices) this.devices = new DeviceRuntime(project, this.compiled.source);
-    else this.devices.configure(project);
+    if (!this.devices) this.devices = new DeviceRuntime(project, this.compiled.source, this.boardId, this.boardComponentId);
+    else this.devices.configure(project, this.boardId, this.boardComponentId);
     if (changed) this.reset(); else this.commit();
+  }
+
+  selectBoard(boardComponentId: string): SimulatorSnapshot {
+    if (this.requestedBoardId || this.requestedBoardComponentId) {
+      throw new Error("This simulator instance is pinned to its configured board.");
+    }
+    const board = this.project?.components.find(component => component.id === boardComponentId && isBoardType(component.type));
+    if (!board) throw new Error(`Board ${boardComponentId} is not present in the attached project.`);
+    if (this.boardComponentId === board.id && this.boardId === board.type) return this.snapshot;
+    this.boardComponentId = board.id;
+    this.boardId = board.type;
+    this.compiled = compileArduinoSketch(this.compiled.source, this.boardId);
+    return this.reset();
   }
   injectPacket(componentId: string, payload: string) {
     if (this.status !== "running") return false;
@@ -160,6 +204,10 @@ export class ArduinoSimulator {
 
   getCompiledSketch(): CompiledArduinoSketch {
     return this.compiled;
+  }
+
+  getBoundDeviceComponentIds(): readonly string[] {
+    return this.devices?.boundComponentIds() ?? [];
   }
 
   getSource(): string {
@@ -178,7 +226,7 @@ export class ArduinoSimulator {
   }
 
   load(source: string): SimulatorSnapshot {
-    this.compiled = compileArduinoSketch(source);
+    this.compiled = compileArduinoSketch(source, this.boardId);
     return this.reset();
   }
 
@@ -189,7 +237,7 @@ export class ArduinoSimulator {
     this.programCounter = 0;
     this.loopCount = 0;
     this.waitRemainingMs = 0;
-    this.pins = createInitialPinStates();
+    this.pins = createInitialPinStates(this.boardId);
     this.serial = [];
     this.variables = new Map(Object.entries(this.compiled.globals));
     this.nextSerialId = 1;
@@ -323,7 +371,7 @@ export class ArduinoSimulator {
   ): SimulatorSnapshot {
     const number = this.resolvePin(pin);
     if (number === undefined) {
-      throw new RangeError(`Unknown Arduino Uno pin: ${pin}`);
+      throw new RangeError(`Unknown ${this.boardId} pin: ${pin}`);
     }
 
     const state = this.pins[number];
@@ -339,14 +387,26 @@ export class ArduinoSimulator {
 
   setAnalogInput(pin: number | string, value: number): SimulatorSnapshot {
     const number = this.resolvePin(pin);
-    if (number === undefined) throw new RangeError(`Unknown Arduino Uno pin: ${pin}`);
-    this.analogInputs.set(number, Math.round(Math.min(1023, Math.max(0, value))));
+    if (number === undefined) throw new RangeError(`Unknown ${this.boardId} pin: ${pin}`);
+    this.analogInputs.set(number, Math.round(Math.min(this.adcMaximum, Math.max(0, value))));
+    this.circuitAnalogInputs.delete(number);
     return this.snapshot;
+  }
+
+  private replaceCircuitAnalogInputs(values: Readonly<Record<number, number>> = {}) {
+    const next = new Set<number>();
+    for (const [pin, value] of Object.entries(values)) {
+      const number = Number(pin);
+      next.add(number);
+      this.analogInputs.set(number, Math.round(Math.min(this.adcMaximum, Math.max(0, value))));
+    }
+    for (const pin of this.circuitAnalogInputs) if (!next.has(pin)) this.analogInputs.delete(pin);
+    this.circuitAnalogInputs = next;
   }
 
   setPulseInput(pin: number | string, durationMicroseconds: number): SimulatorSnapshot {
     const number = this.resolvePin(pin);
-    if (number === undefined) throw new RangeError(`Unknown Arduino Uno pin: ${pin}`);
+    if (number === undefined) throw new RangeError(`Unknown ${this.boardId} pin: ${pin}`);
     this.pulseInputs.set(number, Math.max(0, durationMicroseconds));
     return this.snapshot;
   }
@@ -370,16 +430,69 @@ export class ArduinoSimulator {
         changed = true;
       }
     });
-    Object.entries(input.analog ?? {}).forEach(([pin, value]) => {
-      this.analogInputs.set(Number(pin), Math.round(Math.min(1023, Math.max(0, value))));
-    });
+    this.replaceCircuitAnalogInputs(input.analog);
     const nextComponents = input.components ?? {};
     if (JSON.stringify(this.componentStates) !== JSON.stringify(nextComponents)) {
       this.componentStates = nextComponents;
       changed = true;
     }
-    if (changed) this.commit();
+    if (changed) this.commit(false);
     return this.snapshot;
+  }
+
+  /** Supplies the other boards' current output states to the shared circuit solver. */
+  setNetworkBoardPins(boardPins: NonNullable<SimulatorSnapshot["boardPins"]>) {
+    this.networkBoardPins = boardPins;
+    this.updateDevices();
+    this.commit(false);
+  }
+
+  drainUartTransmissions() {
+    return this.devices?.drainUartTransmissions().map(item => ({
+      ...item,
+      boardComponentId: this.boardComponentId,
+      boardType: this.boardId,
+    })) ?? [];
+  }
+
+  setI2cPeers(peers: readonly I2cPeerEndpoint[]) { this.devices?.setI2cPeers(peers); }
+  getI2cPeripheralAddress() { return this.devices?.getI2cPeripheralAddress(); }
+  receiveI2cData(data: readonly number[]) {
+    if (!this.devices?.receiveI2c(data)) return false;
+    if (this.devices.isI2cReceiveHandlerRegistered()) this.executeI2cCallback("onReceive", data.length);
+    return true;
+  }
+  requestI2cData(length: number) {
+    if (!this.devices?.isI2cRequestHandlerRegistered() || !this.compiled.i2cCallbacks?.onRequest) {
+      this.devices?.reportI2cError("I2C_REQUEST_HANDLER_MISSING", `Board ${this.boardComponentId ?? this.boardId} is addressed as an I2C peripheral but has no registered Wire.onRequest() handler.`);
+      return [];
+    }
+    this.devices.beginI2cRequest();
+    this.executeI2cCallback("onRequest");
+    return this.devices.endI2cRequest().slice(0, Math.max(0, Math.trunc(length)));
+  }
+
+  private executeI2cCallback(kind: "onReceive" | "onRequest", byteCount = 0) {
+    const instructions = this.compiled.i2cCallbacks?.[kind];
+    if (!instructions?.length) return;
+    const saved = { programCounter: this.programCounter, phase: this.phase, status: this.status, waitRemainingMs: this.waitRemainingMs, pendingDelayMs: this.devices?.pendingDelayMs ?? 0 };
+    if (kind === "onReceive" && this.compiled.i2cCallbacks?.receiveParameter) this.variables.set(this.compiled.i2cCallbacks.receiveParameter, byteCount);
+    let pc = 0;
+    let operations = 0;
+    while (pc < instructions.length && operations < this.maxOperationsPerAdvance) {
+      this.programCounter = pc;
+      this.executeInstruction(instructions[pc]);
+      pc = this.programCounter + 1;
+      operations += 1;
+    }
+    this.programCounter = saved.programCounter; this.phase = saved.phase; this.status = saved.status;
+    this.waitRemainingMs = saved.waitRemainingMs;
+    if (this.devices) this.devices.pendingDelayMs = saved.pendingDelayMs;
+    this.updateDevices();
+  }
+
+  enqueueUart(port: number, baud: number, data: readonly number[]) {
+    return this.devices?.enqueueUart(port, baud, data) ?? false;
   }
 
   clearSerial(): SimulatorSnapshot {
@@ -421,21 +534,28 @@ export class ArduinoSimulator {
   }
 
   private updateDevices() {
-    this.devices?.tick(this.timeMs, this.pins, this.motorLoads);
     if (!this.project || !this.devices || !this.snapshot) return;
     const project = this.project, devices = this.devices, snapshot = this.snapshot;
-    const solve = () => solveCircuit(project, { ...snapshot, pins: this.pins, timeMs: this.timeMs, componentStates: devices.states, deviceDrives: devices.drives, deviceBridges: devices.bridges });
+    const boardPins = {
+      ...snapshot.boardPins,
+      ...this.networkBoardPins,
+      ...(this.boardComponentId ? { [this.boardComponentId]: this.pins } : {}),
+    };
+    this.devices.tick(this.timeMs, this.pins, this.motorLoads, boardPins);
+    const solve = () => solveCircuit(project, { ...snapshot, pins: this.pins, boardPins, primaryBoardId: this.boardComponentId, primaryBoardType: this.boardId, timeMs: this.timeMs, componentStates: devices.states, deviceDrives: devices.drives, deviceBridges: devices.bridges });
     let solution = solve();
     const nextMotorLoads = deriveMotorSupplyLoads(project, solution.componentStates);
     if (JSON.stringify(nextMotorLoads) !== JSON.stringify(this.motorLoads)) {
       this.motorLoads = nextMotorLoads;
       // Re-solve DC power at the same simulated instant so the supply meter
       // and battery charge see motor demand immediately, without advancing time.
-      devices.tick(this.timeMs, this.pins, this.motorLoads);
+      devices.tick(this.timeMs, this.pins, this.motorLoads, boardPins);
       solution = solve();
     }
-    for (const [number, value] of Object.entries(solution.digitalInputs)) if (this.pins[Number(number)]?.mode !== "OUTPUT") { this.pins[Number(number)].digitalValue = value; this.pins[Number(number)].pwmValue = value * 255; }
-    for (const [number, value] of Object.entries(solution.analogInputs)) this.analogInputs.set(Number(number), value);
+    const digitalInputs = this.boardComponentId ? solution.boardDigitalInputs[this.boardComponentId] : solution.digitalInputs;
+    const analogInputs = this.boardComponentId ? solution.boardAnalogInputs[this.boardComponentId] : solution.analogInputs;
+    for (const [number, value] of Object.entries(digitalInputs ?? {})) if (this.pins[Number(number)]?.mode !== "OUTPUT") { this.pins[Number(number)].digitalValue = value; this.pins[Number(number)].pwmValue = value * 255; }
+    this.replaceCircuitAnalogInputs(analogInputs);
     this.componentStates = { ...solution.componentStates, ...this.devices.states };
   }
   private execute(instruction: SketchInstruction) {
@@ -444,6 +564,13 @@ export class ArduinoSimulator {
     this.updateDevices();
   }
   private executeInstruction(instruction: SketchInstruction): void {
+    if (instruction.kind === "fileOpen") {
+      const args = [this.deviceValue(instruction.path), this.deviceValue(instruction.mode)];
+      this.devices?.invoke("SD", "open", args, text => this.deviceValue(text));
+      const opened = this.devices?.bindOpenedFile(instruction.name) ?? false;
+      this.variables.set(instruction.name, Number(opened));
+      return;
+    }
     if (instruction.kind === "bufferDeclare") {
       const size = Math.trunc(this.evaluate(instruction.size) ?? 0);
       if (size < 0 || size > 4096 || !this.devices) return;
@@ -456,7 +583,8 @@ export class ArduinoSimulator {
       return;
     }
     if (instruction.kind === "deviceCall") {
-      const args = instruction.args.map(arg => this.deviceValue(arg));
+      const serialPrint = /^Serial[1-3]$/.test(instruction.instance) && ["print", "println"].includes(instruction.method);
+      const args = instruction.args.map((arg, index) => serialPrint && index === 0 ? this.serialText(arg) : this.deviceValue(arg));
       if (instruction.instance === "__core" && instruction.method === "shiftOut") {
         const [data, clock, order, value] = args.map(Number);
         for (let bit = 0; bit < 8; bit++) {
@@ -469,12 +597,16 @@ export class ArduinoSimulator {
         }
       } else {
         this.devices?.invoke(instruction.instance, instruction.method, args, text => this.deviceValue(text));
+        if (/^Serial[1-3]$/.test(instruction.instance) && ["print", "println"].includes(instruction.method)) {
+          this.serial.push({ id: this.nextSerialId++, timestampMs: this.timeMs, text: String(args[0] ?? ""), newline: instruction.method === "println" });
+          this.serial = this.serial.slice(-this.maxSerialEntries);
+        }
         if (this.devices?.pendingDelayMs) { this.waitRemainingMs = this.devices.pendingDelayMs; this.devices.pendingDelayMs = 0; }
       }
       return;
     }
     if (instruction.kind === "serialExpression") {
-      const value = this.deviceValue(instruction.expression);
+      const value = this.serialText(instruction.expression);
       this.serial.push({ id: this.nextSerialId++, timestampMs: this.timeMs, text: String(value), newline: instruction.newline });
       this.serial = this.serial.slice(-this.maxSerialEntries); return;
     }
@@ -497,7 +629,7 @@ export class ArduinoSimulator {
     }
 
     if (instruction.kind === "servoAttach" || instruction.kind === "servoWrite") {
-      const current = this.servos.get(instruction.instance) ?? { instance: instruction.instance, pin: -1, angle: 90, attached: false };
+      const current = this.servos.get(instruction.instance) ?? { instance: instruction.instance, pin: -1, angle: 90, attached: false, boardId: this.boardId, boardComponentId: this.boardComponentId };
       const value = this.evaluate(instruction.expression);
       if (value !== undefined) {
         if (instruction.kind === "servoAttach") { current.pin = Math.trunc(value); current.attached = true; }
@@ -539,7 +671,7 @@ export class ArduinoSimulator {
     }
     if (instruction.kind === "tone") {
       const pin = Math.trunc(this.evaluate(instruction.pinExpression) ?? -1);
-      if (pin >= 0) this.tones.set(pin, { pin, active: Boolean(instruction.frequencyExpression), frequency: Math.max(0, this.evaluate(instruction.frequencyExpression ?? "0") ?? 0) });
+      if (pin >= 0) this.tones.set(pin, { pin, active: Boolean(instruction.frequencyExpression), frequency: Math.max(0, this.evaluate(instruction.frequencyExpression ?? "0") ?? 0), boardId: this.boardId, boardComponentId: this.boardComponentId });
       return;
     }
 
@@ -596,7 +728,7 @@ export class ArduinoSimulator {
     const pwmValue = rawPwm === undefined || !Number.isFinite(rawPwm)
       ? 0
       : Math.round(Math.min(255, Math.max(0, rawPwm)));
-    const digitalValue: DigitalLevel = UNO_PWM_PINS.has(instruction.pin)
+    const digitalValue: DigitalLevel = isBoardPwmPin(this.boardId, instruction.pin)
       ? pwmValue > 0
         ? 1
         : 0
@@ -612,35 +744,99 @@ export class ArduinoSimulator {
 
   private deviceValue(text: string): DeviceValue {
     const value = text.trim();
+    const indexed = /^((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*)\s*\[([^\]]+)\]$/.exec(value);
+    if (indexed) {
+      const collection = this.deviceValue(indexed[1]);
+      const index = Math.trunc(this.evaluate(indexed[2]) ?? -1);
+      return Array.isArray(collection) ? collection[index] ?? NaN : NaN;
+    }
     if (/^"[\s\S]*"$/.test(value)) { try { return JSON.parse(value) as string; } catch { return value.slice(1, -1); } }
     if (/^'.'$/.test(value)) return value.charCodeAt(1);
     if (this.devices?.values.has(value)) return this.devices.values.get(value)!;
     if (value.startsWith("&")) return value;
-    if (deviceInstances(this.compiled.source).has(value) || value === "Serial") return value;
+    if (deviceInstances(this.compiled.source, this.boardId).has(value) || value === "Serial") return value;
     if (/^SPISettings\(/.test(value)) return 0;
     const segments = value.split(".");
-    if (segments.length > 1 && this.devices?.values.has(segments[0])) {
+    if (segments.length > 1 && !value.includes("(") && this.devices?.values.has(segments[0])) {
       let result: DeviceValue = this.devices.values.get(segments.shift()!)!;
       for (const segment of segments) { if (typeof result !== "object" || Array.isArray(result)) return NaN; result = result[segment]; }
       return result;
     }
     return this.evaluate(value) ?? NaN;
   }
+
+  private serialText(expression: string): string {
+    const text = expression.trim();
+    const unwrap = (value: string) => {
+      let result = value.trim();
+      while (result.startsWith("(") && result.endsWith(")")) {
+        let depth = 0, quote = "", wrapsWholeExpression = true;
+        for (let index = 0; index < result.length; index += 1) {
+          const character = result[index];
+          if (quote) { if (character === "\\") index += 1; else if (character === quote) quote = ""; }
+          else if (character === '"' || character === "'") quote = character;
+          else if (character === "(") depth += 1;
+          else if (character === ")" && --depth === 0 && index !== result.length - 1) { wrapsWholeExpression = false; break; }
+        }
+        if (!wrapsWholeExpression) break;
+        result = result.slice(1, -1).trim();
+      }
+      return result;
+    };
+
+    const unwrapped = unwrap(text);
+    let quote = "", parenDepth = 0, question = -1;
+    for (let index = 0; index < unwrapped.length; index += 1) {
+      const character = unwrapped[index];
+      if (quote) { if (character === "\\") index += 1; else if (character === quote) quote = ""; continue; }
+      if (character === '"' || character === "'") quote = character;
+      else if (character === "(") parenDepth += 1;
+      else if (character === ")") parenDepth -= 1;
+      else if (character === "?" && parenDepth === 0) { question = index; break; }
+    }
+    if (question >= 0) {
+      let nested = 0; quote = ""; parenDepth = 0;
+      for (let index = question + 1; index < unwrapped.length; index += 1) {
+        const character = unwrapped[index];
+        if (quote) { if (character === "\\") index += 1; else if (character === quote) quote = ""; continue; }
+        if (character === '"' || character === "'") quote = character;
+        else if (character === "(") parenDepth += 1;
+        else if (character === ")") parenDepth -= 1;
+        else if (parenDepth === 0 && character === "?") nested += 1;
+        else if (parenDepth === 0 && character === ":") {
+          if (nested > 0) nested -= 1;
+          else {
+            const condition = this.evaluate(unwrapped.slice(0, question));
+            if (condition !== undefined) return this.serialText(condition !== 0 ? unwrapped.slice(question + 1, index) : unwrapped.slice(index + 1));
+            break;
+          }
+        }
+      }
+    }
+
+    if (/^"[\s\S]*"$/.test(unwrapped)) return String(this.deviceValue(unwrapped));
+    const character = /^'(?:\\.|[^'\\])'$/.exec(unwrapped);
+    if (character) {
+      const literal = character[0].slice(1, -1);
+      return literal.startsWith("\\") ? ({ "\\n": "\n", "\\r": "\r", "\\t": "\t", "\\0": "\0", "\\\\": "\\", "\\'": "'" }[literal] ?? literal.slice(1)) : literal;
+    }
+    return String(this.deviceValue(unwrapped));
+  }
+
   private evaluate(expression: string): number | undefined {
     const values = new Map(this.variables);
     values.set("LOW", 0);
     values.set("HIGH", 1);
     values.set("false", 0);
     values.set("true", 1);
-    values.set("LED_BUILTIN", 13);
-    for (let analog = 0; analog < 6; analog += 1) values.set(`A${analog}`, 14 + analog);
+    Object.entries(boardApiConstants(this.boardId)).forEach(([name, value]) => values.set(name, value));
     for (const [name, value] of Object.entries(DEVICE_CONSTANTS)) values.set(name, value);
     let expanded = expression.replace(/\b([A-Za-z_]\w*)\.getResponse\(\)/g, "$1__response");
     expanded = expanded.replace(/\bsizeof\s*\(\s*([A-Za-z_]\w*)\s*\)/g, (_text, name: string) => { const buffer = this.devices?.values.get(name); return String(Array.isArray(buffer) ? buffer.length : 1); });
     const callPattern = /([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*\(/g;
     let match: RegExpExecArray | null;
     while ((match = callPattern.exec(expanded))) {
-      if (!deviceInstances(this.compiled.source).has(match[1])) continue;
+      if (!deviceInstances(this.compiled.source, this.boardId).has(match[1])) continue;
       let depth = 1, end = callPattern.lastIndex; let quote = "";
       for (; end < expanded.length && depth; end++) {
         const char = expanded[end];
@@ -655,10 +851,9 @@ export class ArduinoSimulator {
       const placeholder = `__deviceResult${values.size}`; values.set(placeholder, Number(result));
       expanded = expanded.slice(0, match.index) + placeholder + expanded.slice(end); callPattern.lastIndex = 0;
     }
-    expanded = expanded.replace(/\b([A-Za-z_]\w*)\s*\[([^\]]+)\]/g, (_whole, name: string, index: string) => {
-      const buffer = this.devices?.values.get(name), offset = Math.trunc(this.evaluate(index) ?? -1);
+    expanded = expanded.replace(/\b((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*)\s*\[([^\]]+)\]/g, (_whole, name: string, index: string) => {
       const placeholder = `__bufferResult${values.size}`;
-      values.set(placeholder, Array.isArray(buffer) ? buffer[offset] ?? NaN : NaN); return placeholder;
+      values.set(placeholder, Number(this.deviceValue(`${name}[${index}]`))); return placeholder;
     });
     expanded = expanded.replace(/\b([A-Za-z_]\w*)(\.[A-Za-z_]\w*)+/g, (path: string) => {
       if (!this.devices?.values.has(path.split(".")[0])) return path;
@@ -681,14 +876,16 @@ export class ArduinoSimulator {
   }
 
   private resolvePin(pin: number | string): number | undefined {
-    if (typeof pin === "string") return parseUnoPinLabel(pin);
+    if (typeof pin === "string") return parseBoardPinLabel(this.boardId, pin);
     return Number.isInteger(pin) && pin >= 0 && pin < this.pins.length
       ? pin
       : undefined;
   }
 
-  private commit(): void {
-    this.updateDevices();
+  private get adcMaximum() { return 2 ** (getBoardProfile(this.boardId)?.analogResolutionBits ?? 10) - 1; }
+
+  private commit(refreshDevices = true): void {
+    if (refreshDevices) this.updateDevices();
     this.snapshot = freezeSnapshot(
       this.status,
       this.phase,
@@ -701,6 +898,7 @@ export class ArduinoSimulator {
       this.serial,
       this.compiled,
       [...this.servos.values()], [...this.lcds.values()], [...this.tones.values()], this.componentStates,
+      this.boardComponentId, this.boardId, this.snapshot.boardPins,
     );
     if (this.devices) this.snapshot = Object.freeze({ ...this.snapshot, componentStates: Object.freeze({ ...this.snapshot.componentStates, ...this.devices.states }), deviceDrives: this.devices.drives.map(d => ({ ...d })), deviceBridges: this.devices.bridges.map(b => ({ ...b })), diagnostics: [...this.snapshot.diagnostics, ...this.devices.diagnostics, ...(this.project?.components.filter(c => !COMPONENT_CATALOG[c.type]).map(c => ({ severity: "error" as const, code: "component-unavailable", message: `${c.label} has no accepted simulation model. Saved wiring is preserved.` })) ?? [])] });
     for (const listener of this.listeners) listener(this.snapshot);

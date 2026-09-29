@@ -65,6 +65,25 @@ test("Arduino Uno pin names and terminals stay readable beside its board artwork
   assert.match(styles, /\.component-arduino-uno \.schematic-pin\.connected i \{\s*width: 11px;\s*height: 11px/);
 });
 
+test("all registered boards render readable pin names over their board artwork", async () => {
+  const [studio, styles] = await Promise.all([
+    readFile(studioUrl, "utf8"),
+    readFile(symbolStylesUrl, "utf8"),
+  ]);
+
+  assert.ok(studio.includes("(!definition.symbol || isBoardType(component.type)) && <span>{pin.label}</span>"));
+  for (const boardType of [
+    "arduino-mega-2560",
+    "arduino-nano-classic",
+    "esp32-devkitc-v4",
+    "esp8266-nodemcu-v1",
+    "raspberry-pi-pico",
+  ]) {
+    assert.match(styles, new RegExp(`\\.component-${boardType} \\.schematic-pin`));
+  }
+  assert.match(styles, /\.symbol-registry__pin \{[^}]*z-index: 6/);
+});
+
 test("Arduino Uno is visible in the component library", async () => {
   const source = (await readFile(studioUrl, "utf8")).replace(/\r\n/g, "\n");
   const partsFactory = source.match(

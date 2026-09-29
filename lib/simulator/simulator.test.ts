@@ -120,6 +120,23 @@ test("executes if statements with digitalRead conditions", () => {
   assert.equal(simulator.getSnapshot().pins[13].digitalValue, 1);
 });
 
+test("executes unbraced if and else statements instead of silently skipping the remainder of loop", () => {
+  const simulator = new ArduinoSimulator(`
+    void setup() { pinMode(2, INPUT_PULLUP); pinMode(13, OUTPUT); }
+    void loop() {
+      if (digitalRead(2) == LOW) digitalWrite(13, HIGH);
+      else digitalWrite(13, LOW);
+      delay(10);
+    }
+  `);
+  assert.equal(simulator.getSnapshot().diagnostics.some(diagnostic => diagnostic.severity === "error"), false);
+  assert.ok(simulator.getCompiledSketch().loop.some(instruction => instruction.kind === "jumpIfFalse"));
+  simulator.run(); simulator.advance(0);
+  assert.equal(simulator.getSnapshot().pins[13].digitalValue, 0);
+  simulator.setDigitalInput(2, false); simulator.advance(10);
+  assert.equal(simulator.getSnapshot().pins[13].digitalValue, 1);
+});
+
 test("executes calls in nested if and else-if branches without skipped-control warnings", () => {
   const simulator = new ArduinoSimulator(`
     void setup() { pinMode(2, INPUT); pinMode(8, OUTPUT); }

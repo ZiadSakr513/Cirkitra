@@ -1,8 +1,5 @@
-import {
-  ARDUINO_UNO_BOARD,
-  CIRCUIT_PROJECT_SCHEMA_VERSION,
-  type CircuitProject,
-} from "./types.ts";
+import { CIRCUIT_PROJECT_SCHEMA_VERSION, type CircuitProject } from "./types.ts";
+import { isBoardType } from "./boards.ts";
 
 export type ValidationIssueCode =
   | "invalid_type"
@@ -185,11 +182,11 @@ export function safeParseCircuitProject(
     });
   }
 
-  if (value.board !== ARDUINO_UNO_BOARD) {
+  if (typeof value.board !== "string" || !isBoardType(value.board)) {
     issues.push({
       code: "invalid_value",
       path: "$.board",
-      message: `Only ${ARDUINO_UNO_BOARD} is supported in schema v1.`,
+      message: `Board must be one of the supported board profile IDs.`,
       received: value.board,
     });
   }
@@ -286,6 +283,21 @@ export function safeParseCircuitProject(
       message: "Expected Arduino C++ source as a string.",
       received: value.code,
     });
+  }
+
+  if (value.programs !== undefined) {
+    if (!isRecord(value.programs)) {
+      issues.push({ code: "invalid_type", path: "$.programs", message: "Expected a map of placed board IDs to sketch source strings.", received: value.programs });
+    } else {
+      Object.entries(value.programs).forEach(([boardId, source]) => {
+        if (!boardId.trim() || typeof source !== "string") {
+          issues.push({ code: "invalid_type", path: `$.programs.${boardId}`, message: "Expected a non-empty board ID and sketch source string.", received: source });
+        }
+      });
+    }
+  }
+  if (value.activeBoardId !== undefined && (typeof value.activeBoardId !== "string" || !value.activeBoardId.trim())) {
+    issues.push({ code: "invalid_type", path: "$.activeBoardId", message: "Expected a placed-board component ID.", received: value.activeBoardId });
   }
 
   if (issues.length > 0) {

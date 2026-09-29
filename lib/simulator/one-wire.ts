@@ -57,7 +57,7 @@ export class OneWireRuntime {
     }
   }
   parts(pin: number) {
-    return this.project?.components.filter(c => c.type === "ds18b20" && this.powered(c) && this.wiring!.boardConnected(c.id, "DQ", `D${pin}`) && this.wiring!.pullup(c.id, "DQ")) ?? [];
+    return this.project?.components.filter(c => c.type === "ds18b20" && this.powered(c) && this.wiring!.boardConnected(c.id, "DQ", pin) && this.wiring!.pullup(c.id, "DQ")) ?? [];
   }
   addressed(pin: number, address: readonly number[]) { return this.parts(pin).find(c => sensorRom(c.id).every((byte, i) => byte === address[i])); }
   resolution(c: CircuitComponent, value?: number) {

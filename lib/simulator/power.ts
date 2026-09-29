@@ -2,6 +2,7 @@ import type { CircuitComponent, CircuitProject } from "../circuit/types.ts";
 import { POWER_TERMINAL_GROUPS } from "../circuit/terminal-groups.ts";
 import type { SimulatedComponentState, SimulatorDiagnostic } from "./types.ts";
 import type { MotorSupplyLoad } from "./motor-loads.ts";
+import { getBoardProfile, isBoardType } from "../circuit/boards.ts";
 
 type Branch = { id: string; a: string; b: string; value: number };
 const key = (id: string, pin: string) => `${id}:${pin}`;
@@ -27,13 +28,17 @@ export class PowerRuntime {
     for (const c of project.components) {
       for (const group of POWER_TERMINAL_GROUPS[c.type] ?? []) for (const pin of group.slice(1)) join(key(c.id, group[0]), key(c.id, pin));
       if (c.type === "ground") join(key(c.id, "GND"), ground);
-      if (c.type === "arduino-uno") for (const pin of ["GND", "GND2", "GND3"]) join(key(c.id, pin), ground);
+      if (isBoardType(c.type)) for (const pin of getBoardProfile(c.type)!.groundPins) join(key(c.id, pin), ground);
     }
     const node = (id: string, pin: string) => find(key(id, pin));
     const sources: Branch[] = []; const resistors: Branch[] = []; const currents: Branch[] = [];
     const add = (list: Branch[], c: CircuitComponent, a: string, b: string, value: number, suffix = "") => list.push({ id: c.id + suffix, a: node(c.id, a), b: node(c.id, b), value });
     for (const c of project.components) {
-      if (c.type === "arduino-uno") { add(sources, c, "5V", "GND", 5, ":5V"); add(sources, c, "3V3", "GND", 3.3, ":3V3"); }
+      if (isBoardType(c.type)) {
+        const profile = getBoardProfile(c.type)!;
+        const groundPin = profile.groundPins[0] ?? "GND";
+        Object.entries(profile.rails).forEach(([pin, volts]) => add(sources, c, pin, groundPin, volts, `:${pin}`));
+      }
       if (c.type === "dc-supply" && c.properties?.enabled !== false) add(sources, c, "+", "-", prop(c, "voltage", 5));
       if (c.type === "battery-cell") {
         if (!this.charge.has(c.id)) this.charge.set(c.id, Math.max(0, Math.min(100, prop(c, "initialSoc", 50))));

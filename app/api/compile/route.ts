@@ -1,4 +1,5 @@
 import { compileArduinoSketch } from "../../../lib/simulator/index.ts";
+import { isBoardType } from "../../../lib/circuit/boards.ts";
 
 type CompileDiagnostic = {
   line: number;
@@ -80,9 +81,9 @@ export async function POST(request: Request) {
     return Response.json({ error: { code: "INVALID_JSON", message: "Request body must be JSON." } }, { status: 400 });
   }
 
-  if (body.board !== "arduino-uno" || typeof body.code !== "string") {
+  if (typeof body.board !== "string" || !isBoardType(body.board) || typeof body.code !== "string") {
     return Response.json(
-      { error: { code: "INVALID_SKETCH", message: "board must be 'arduino-uno' and code must be a string." } },
+      { error: { code: "INVALID_SKETCH", message: "board must be a supported board id and code must be a string." } },
       { status: 400 },
     );
   }
@@ -91,7 +92,7 @@ export async function POST(request: Request) {
   }
 
   const diagnostics = validateSketch(body.code);
-  const simulation = compileArduinoSketch(body.code);
+  const simulation = compileArduinoSketch(body.code, body.board);
   for (const diagnostic of simulation.diagnostics) {
     const duplicate = diagnostics.some((item) => item.line === (diagnostic.line ?? 1) && item.message === diagnostic.message);
     if (!duplicate) diagnostics.push({
@@ -108,7 +109,7 @@ export async function POST(request: Request) {
     diagnostics,
     artifact: success
       ? {
-          board: "arduino-uno",
+          board: body.board,
           sourceBytes: new TextEncoder().encode(body.code).byteLength,
           compiledAt: new Date().toISOString(),
         }
