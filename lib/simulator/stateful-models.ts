@@ -12,6 +12,7 @@ export const STATEFUL_MODEL_REGISTRY: Readonly<Record<string, string>> = Object.
   "keypad-4x4-runtime": "keypad-4x4",
   "relay-module-1ch-runtime": "relay-module-1ch-active-low",
   "ds3231-rtc-runtime": "ds3231-rtc",
+  "sn74ahct1g125-runtime": "sn74ahct1g125",
   "micro-sd-spi-runtime": "micro-sd-spi-module",
   "mfrc522-rfid-runtime": "mfrc522-rfid-module",
   "a4988-stepper-runtime": "a4988-stepper-driver",

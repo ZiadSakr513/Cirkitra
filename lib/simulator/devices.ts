@@ -119,14 +119,16 @@ export class DeviceRuntime {
     this.power.reset(); this.powerControls = {}; this.charging = {}; this.protectionSince.clear(); this.protectionLatched.clear(); this.chargerElapsed.clear(); this.chargerLastTick.clear(); this.chargerModes.clear(); this.chargerEnabled.clear(); this.pendingDelayMs = 0;
     this.wireTx = []; this.wireRx = []; this.wireMasterTransmitting = false; this.wirePeripheralAddress = undefined; this.wirePeripheralTx = []; this.wirePeripheralRx = []; this.wireOnReceive = false; this.wireOnRequest = false; this.spiAddress = undefined; this.spiSelected = undefined; this.uartRx.clear(); this.uartTx = []; this.wifiConnected = false; this.udpSockets.clear(); this.udpPackets = []; this.radioPins = [10, 9, 2]; this.oneWire.reset(); this.shtSensors.clear(); this.radios.clear(); this.zigbees.clear(); this.responseDecoders.clear(); this.gauges.clear(); this.sdMounted = undefined; this.sdHandles.clear(); this.pendingSdFile = undefined;
     for (const c of this.project.components) if (STATEFUL_PARTS.includes(c.type)) { const m = memory(); if (c.type !== "mcp23017") m.registers.fill(0); this.memory.set(c.id, m); }
-    for (const match of source.matchAll(/\b(?:const\s+)?(byte|uint8_t|char)\s+([A-Za-z_]\w*)\s*((?:\[[^\]]*\]\s*)+)\s*=\s*([^;]+);/g)) {
+    for (const match of source.matchAll(/\b(?:const\s+)?(?:unsigned\s+)?(byte|u?int(?:8|16|32|64)_t|int|long|short|size_t|float|double|char)\s+([A-Za-z_]\w*)\s*((?:\[[^\]]*\]\s*)+)\s*=\s*([^;]+);/g)) {
       const [, type, name, , initializer] = match;
       if (type === "char") {
         this.values.set(name, [...initializer.matchAll(/'(?:\\.|[^'\\])'/g)].map(([character]) => character.slice(1, -1).charCodeAt(0)));
       } else {
         const contents = initializer.slice(initializer.indexOf("{") + 1, initializer.lastIndexOf("}"));
-        const entries = splitDeviceArguments(contents).map(item => Number(item.trim()));
-        this.values.set(name, entries.every(Number.isFinite) ? entries : []);
+        const numberPattern = /(?:0[xX][\da-fA-F]+|\d+(?:\.\d+)?)(?:[uUlLfF]+)?/g;
+        const entries = [...contents.matchAll(numberPattern)].map(([item]) => Number(item.replace(/[uUlLfF]+$/, "")));
+        const residue = contents.replace(numberPattern, "").replace(/[\s,{}]/g, "");
+        this.values.set(name, residue.length === 0 && entries.length > 0 ? entries : []);
       }
     }
     for (const match of source.matchAll(/\bDeviceAddress\s+([A-Za-z_]\w*)\s*(?:=\s*\{([^}]*)\})?\s*;/g)) this.values.set(match[1], match[2] ? splitDeviceArguments(match[2]).map(Number) : Array(8).fill(0));
@@ -275,6 +277,30 @@ export class DeviceRuntime {
     return true;
   }
   private powered(c: CircuitComponent) { return this.wiring.powered(c); }
+  private ws2812DataPath(strip: CircuitComponent, dataPin: number): { logicVoltage: number; levelShifterId?: string } | undefined {
+    const profile = getBoardProfile(this.boardId);
+    if (!profile) return undefined;
+    if (this.wiring.boardConnected(strip.id, "DIN", dataPin)) return { logicVoltage: profile.logicVoltage };
+    // A required series data resistor separates the board GPIO and DIN into
+    // different electrical nets. Treat that single, explicit resistor path
+    // as a valid signal route without joining its terminals in DeviceWiring.
+    const seriesResistors = this.project.components.filter(component => component.type === "resistor"
+      && Number(component.properties?.resistance ?? 10_000) > 0
+      && !this.wiring.connected(component.id, "1", component.id, "2")
+      && (
+        (this.wiring.connected(strip.id, "DIN", component.id, "1") && this.wiring.boardConnected(component.id, "2", dataPin))
+        || (this.wiring.connected(strip.id, "DIN", component.id, "2") && this.wiring.boardConnected(component.id, "1", dataPin))
+      ));
+    if (seriesResistors.length === 1) return { logicVoltage: profile.logicVoltage };
+    const buffers = this.project.components.filter(component => component.type === "sn74ahct1g125"
+      && this.powered(component)
+      && this.wiring.connected(strip.id, "DIN", component.id, "Y")
+      && this.wiring.boardConnected(component.id, "A", dataPin)
+      && this.wiring.voltage(component.id, "OE") === 0
+      && (this.wiring.voltage(component.id, "VCC") ?? 0) >= 4.5);
+    if (buffers.length !== 1) return undefined;
+    return { logicVoltage: this.wiring.voltage(buffers[0].id, "VCC") ?? 0, levelShifterId: buffers[0].id };
+  }
   private rtcDate(c: CircuitComponent, m: DeviceMemory): Date {
     if (m.rtcEpochSeconds !== undefined && m.rtcSetAtMs !== undefined) {
       return new Date(m.rtcEpochSeconds * 1000 + Math.max(0, this.time - m.rtcSetAtMs));
@@ -381,8 +407,30 @@ export class DeviceRuntime {
       }
     }
     this.drives = []; this.states = {};
+    for (const c of this.project.components.filter(component => component.type === "sn74ahct1g125")) {
+      const supplyVoltage = this.wiring.voltage(c.id, "VCC");
+      const groundVoltage = this.wiring.voltage(c.id, "GND");
+      const enableVoltage = this.wiring.voltage(c.id, "OE");
+      const inputVoltage = this.wiring.voltage(c.id, "A");
+      const powered = this.powered(c);
+      const enabled = enableVoltage === 0;
+      const inputConnected = this.wiring.wired(c.id, "A");
+      if (powered && enableVoltage === undefined) this.error("LEVEL_SHIFTER_ENABLE_FLOATING", `${c.label} OE is active low; connect it to ground to enable the buffer.`);
+      if (powered && !inputConnected) this.error("LEVEL_SHIFTER_INPUT_OPEN", `${c.label} A is not connected to a driven digital output.`);
+      const outputLevel = powered && enabled && inputConnected && inputVoltage !== undefined ? Number(inputVoltage >= 2.0) : undefined;
+      if (outputLevel !== undefined) this.drive(c, "Y", outputLevel);
+      this.states[c.id] = {
+        type: c.type,
+        powered,
+        status: !powered ? "Unpowered" : enabled ? "Enabled" : "Disabled",
+        level: outputLevel === undefined ? "floating" : outputLevel ? "high" : "low",
+        readings: { supplyVoltage: supplyVoltage ?? 0, groundVoltage: groundVoltage ?? -1, inputVoltage: inputVoltage ?? -1 },
+      };
+    }
     this.previousShift = new Map([...this.memory].map(([id, m]) => [id, m.shift]));
     for (const c of this.project.components.filter(c => STATEFUL_PARTS.includes(c.type))) {
+      // The AHCT buffer state was resolved above alongside its output drive.
+      if (c.type === "sn74ahct1g125") continue;
       const m = this.m(c); const powered = c.type === "ds18b20" ? this.oneWire.powered(c) : this.powered(c);
       if (!powered) { m.initialized = false; m.rx = []; m.tx = []; }
       const readings: Record<string, number> = {};
@@ -456,7 +504,7 @@ export class DeviceRuntime {
       const display = c.type === "ssd1306-oled-128x64";
       const pixelStrip = c.type === "ws2812b-strip-8";
       const pixelPin = pixelStrip ? Number(this.values.get(`component:${c.id}.dataPin`) ?? -1) : -1;
-      const dataConnected = pixelStrip && pixelPin >= 0 && this.wiring.boardConnected(c.id, "DIN", pixelPin);
+      const dataConnected = pixelStrip && pixelPin >= 0 && !!this.ws2812DataPath(c, pixelPin);
       const encoder = c.type === "ky-040";
       const encoderPinsPresent = encoder && ["CLK", "DT"].every(pin => this.wiring.wired(c.id, pin));
       const keypad = c.type === "keypad-4x4";
@@ -703,13 +751,13 @@ export class DeviceRuntime {
       const dataPin = Number(ctor[1] ?? -1);
       const profile = getBoardProfile(this.boardId);
       const pinSupported = profile?.ioPins.some(pin => pin.runtimePin === dataPin && !pin.reserved && (pin.signals ?? ["digital"]).includes("digital")) ?? false;
-      const strips = this.project.components.filter(component => component.type === type && this.powered(component) && this.wiring.boardConnected(component.id, "DIN", dataPin));
+      const strips = this.project.components.filter(component => component.type === type && this.powered(component) && this.ws2812DataPath(component, dataPin));
       const c = strips.length === 1 && pinSupported ? strips[0] : undefined;
       if (!c && initialize) this.error("NEOPIXEL_NOT_CONNECTED", `${name}.begin(): connect one powered WS2812B DIN to a supported digital output on ${this.boardId}; the configured pin must match the sketch.`);
       if (c && initialize) {
         const vdd = this.wiring.voltage(c.id, "VDD") ?? 5;
         const requiredHigh = 0.7 * vdd;
-        const boardVoltage = profile?.logicVoltage ?? 0;
+        const boardVoltage = this.ws2812DataPath(c, dataPin)?.logicVoltage ?? profile?.logicVoltage ?? 0;
         if (boardVoltage + 1e-6 < requiredHigh) {
           this.error("NEOPIXEL_LOGIC_LEVEL", `${name}.begin(): ${this.boardId} provides ${boardVoltage}V logic, below the WS2812B ${requiredHigh.toFixed(2)}V DIN high threshold at ${vdd}V strip supply. Use a compatible supply or level shifter.`);
           return undefined;

@@ -1,6 +1,10 @@
 import { COMPONENT_EXAMPLES } from "../../lib/circuit/component-examples.ts";
 import type { CircuitProject } from "../../lib/circuit/types.ts";
 
+export const greenhouseMonitorPrompt = `Build a simulation-ready Arduino Uno greenhouse monitor using one DHT22, one SEN0193 soil-moisture sensor, a 16×2 parallel LCD with contrast potentiometer, a KY-040 rotary encoder, a piezo buzzer, and a red LED with its own 220 Ω resistor. Add the required DHT22 data pull-up and connect all grounds correctly.
+Show temperature, humidity, soil moisture, and the adjustable dry-soil threshold on the LCD. Start the threshold at 35%; use encoder rotation to adjust it in 5% steps from 20% to 70%. Turn on the LED and buzzer when soil moisture drops below the threshold; turn them off only after moisture rises 5 percentage points above it. The encoder’s push switch should mute the buzzer until the soil recovers, while the LED stays on. Print readings and alarm state to Serial.
+Provide complete wiring and executable code. Make encoder adjustment, dry-soil alarm, recovery hysteresis, and buzzer mute behavior pass simulation.`;
+
 export const greenhousePrompt = `Build a simulation-ready dual-zone greenhouse vent controller. Use one Arduino Uno, one TCA9548A, two BME280 sensors with the same I2C address, one MCP23017, one TB6612FNG, one DC motor as the ventilation fan, one adjustable DC supply for the motor, three LEDs, and three 220 ohm resistors.
 Connect the Uno SDA and SCL to the TCA9548A and MCP23017. Put one BME280 on TCA channel 0 and the other on channel 1, so the identical sensor addresses do not conflict. Power the sensors and mux within their rated voltage, connect all grounds, and configure each BME280 for I2C. Select each mux channel before reading that sensor, then read and print its temperature, humidity, and pressure.
 Use the MCP23017 at address 0x20 to control three indicator LEDs through their resistors. Turn on the first LED when the west zone exceeds 28 C, the second when the east zone exceeds 28 C, and the third when either zone exceeds 32 C.

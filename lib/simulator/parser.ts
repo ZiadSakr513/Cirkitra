@@ -3,6 +3,8 @@ import { boardApiConstants, boardPinLabel, getBoardProfile, isBoardDigitalOutput
 import { validateLibraryCalls } from "./libraries.ts";
 import type {
   CompiledArduinoSketch,
+  SketchHelperFunction,
+  SketchHelperStatement,
   SimulatorDiagnostic,
   SketchInstruction,
   UnoPinMode,
@@ -247,6 +249,15 @@ function tokenizeExpression(expression: string): ExpressionToken[] | undefined {
       continue;
     }
 
+    const character = /^'(?:\\.|[^'\\])'/.exec(remainder);
+    if (character) {
+      const decoded = decodeStringLiteral(character[0]);
+      if (decoded === undefined || decoded.length !== 1) return undefined;
+      tokens.push({ type: "number", value: String(decoded.charCodeAt(0)) });
+      index += character[0].length;
+      continue;
+    }
+
     const hex = /^0[xX][0-9a-fA-F]+[uUlL]*/.exec(remainder);
     if (hex) {
       tokens.push({ type: "number", value: hex[0].replace(/[uUlL]+$/, "") });
@@ -261,14 +272,17 @@ function tokenizeExpression(expression: string): ExpressionToken[] | undefined {
       continue;
     }
 
-    const identifier = /^[A-Za-z_]\w*/.exec(remainder);
+    // C++ libraries commonly expose enum values as Class::VALUE. Treat a
+    // qualified constant as one identifier so the simulator can resolve its
+    // known value instead of silently turning device commands into NaN.
+    const identifier = /^[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*/.exec(remainder);
     if (identifier) {
       tokens.push({ type: "identifier", value: identifier[0] });
       index += identifier[0].length;
       continue;
     }
 
-    const operator = /^(?:&&|\|\||==|!=|<=|>=|[+\-*/%()!,:?<>])/.exec(remainder);
+    const operator = /^(?:&&|\|\||<<|>>|==|!=|<=|>=|[+\-*/%()!,:?<>|&^])/.exec(remainder);
     if (operator) {
       tokens.push({ type: "operator", value: operator[0] });
       index += operator[0].length;
@@ -288,6 +302,7 @@ class ExpressionParser {
     private readonly tokens: ExpressionToken[],
     private readonly constants: ReadonlyMap<string, number>,
     private readonly functions: Readonly<Record<string, (...args: number[]) => number>> = {},
+    private readonly integerDivision = false,
   ) {}
 
   parse(): number | undefined {
@@ -321,12 +336,39 @@ class ExpressionParser {
   }
 
   private parseLogicalAnd(): number | undefined {
-    let value = this.parseEquality();
+    let value = this.parseBitwiseOr();
     while (value !== undefined && this.peek("&&")) {
       this.cursor += 1;
-      const right = this.parseEquality();
+      const right = this.parseBitwiseOr();
       if (right === undefined) return undefined;
       value = value !== 0 && right !== 0 ? 1 : 0;
+    }
+    return value;
+  }
+
+  private parseBitwiseOr(): number | undefined {
+    let value = this.parseBitwiseXor();
+    while (value !== undefined && this.peek("|")) {
+      this.cursor += 1; const right = this.parseBitwiseXor();
+      if (right === undefined) return undefined; value = Math.trunc(value) | Math.trunc(right);
+    }
+    return value;
+  }
+
+  private parseBitwiseXor(): number | undefined {
+    let value = this.parseBitwiseAnd();
+    while (value !== undefined && this.peek("^")) {
+      this.cursor += 1; const right = this.parseBitwiseAnd();
+      if (right === undefined) return undefined; value = Math.trunc(value) ^ Math.trunc(right);
+    }
+    return value;
+  }
+
+  private parseBitwiseAnd(): number | undefined {
+    let value = this.parseEquality();
+    while (value !== undefined && this.peek("&")) {
+      this.cursor += 1; const right = this.parseEquality();
+      if (right === undefined) return undefined; value = Math.trunc(value) & Math.trunc(right);
     }
     return value;
   }
@@ -343,12 +385,24 @@ class ExpressionParser {
   }
 
   private parseComparison(): number | undefined {
-    let value = this.parseAdditive();
+    let value = this.parseShift();
     while (value !== undefined && ["<", "<=", ">", ">="].some((item) => this.peek(item))) {
+      const operator = this.tokens[this.cursor++].value;
+      const right = this.parseShift();
+      if (right === undefined) return undefined;
+      value = Number(operator === "<" ? value < right : operator === "<=" ? value <= right : operator === ">" ? value > right : value >= right);
+    }
+    return value;
+  }
+
+  private parseShift(): number | undefined {
+    let value = this.parseAdditive();
+    while (value !== undefined && (this.peek("<<") || this.peek(">>"))) {
       const operator = this.tokens[this.cursor++].value;
       const right = this.parseAdditive();
       if (right === undefined) return undefined;
-      value = Number(operator === "<" ? value < right : operator === "<=" ? value <= right : operator === ">" ? value > right : value >= right);
+      const amount = Math.max(0, Math.min(31, Math.trunc(right)));
+      value = operator === "<<" ? Math.trunc(value) << amount : Math.trunc(value) >> amount;
     }
     return value;
   }
@@ -380,7 +434,9 @@ class ExpressionParser {
         return undefined;
       }
       if (operator === "*") value *= right;
-      if (operator === "/") value /= right;
+      if (operator === "/") value = this.integerDivision && Number.isInteger(value) && Number.isInteger(right)
+        ? Math.trunc(value / right)
+        : value / right;
       if (operator === "%") value %= right;
     }
 
@@ -388,6 +444,27 @@ class ExpressionParser {
   }
 
   private parseUnary(): number | undefined {
+    const cast = this.castTypeAhead();
+    if (cast) {
+      this.cursor = cast.end;
+      const value = this.parseUnary();
+      if (value === undefined) return undefined;
+      if (cast.type === "bool") return Number(value !== 0);
+      if (cast.type === "float" || cast.type === "double") return value;
+
+      const fixedWidth = /^(u?int)(8|16|32|64)_t$/.exec(cast.type);
+      const byteWidth = cast.type === "byte" ? 8 : undefined;
+      const width = fixedWidth ? Number(fixedWidth[2]) : byteWidth;
+      if (width) {
+        const modulus = 2 ** width;
+        const integer = Math.trunc(value);
+        const unsigned = cast.type.startsWith("u") || cast.type === "byte";
+        const wrapped = ((integer % modulus) + modulus) % modulus;
+        return unsigned || wrapped < modulus / 2 ? wrapped : wrapped - modulus;
+      }
+      return Math.trunc(value);
+    }
+
     if (this.peek("+") || this.peek("-") || this.peek("!")) {
       const operator = this.tokens[this.cursor].value;
       this.cursor += 1;
@@ -396,6 +473,21 @@ class ExpressionParser {
       return operator === "-" ? -value : operator === "!" ? Number(value === 0) : value;
     }
     return this.parsePrimary();
+  }
+
+  private castTypeAhead(): { type: string; end: number } | undefined {
+    if (!this.peek("(")) return undefined;
+    let end = this.cursor + 1;
+    const names: string[] = [];
+    while (this.tokens[end]?.type === "identifier" && names.length < 4) {
+      names.push(this.tokens[end].value);
+      end += 1;
+    }
+    if (this.tokens[end]?.value !== ")" || names.length === 0) return undefined;
+
+    const type = names.join(" ");
+    const supported = /^(?:(?:unsigned|signed)\s+)?(?:char|short(?: int)?|int|long(?: long)?(?: int)?|byte|bool|float|double|size_t|u?int(?:8|16|32|64)_t)$/;
+    return supported.test(type) ? { type, end: end + 1 } : undefined;
   }
 
   private parsePrimary(): number | undefined {
@@ -425,7 +517,10 @@ class ExpressionParser {
         this.cursor += 1;
         return this.functions[token.value]?.(...args);
       }
-      return this.constants.get(token.value);
+      const direct = this.constants.get(token.value);
+      if (direct !== undefined) return direct;
+      const scope = token.value.lastIndexOf("::");
+      return scope >= 0 ? this.constants.get(token.value.slice(scope + 2)) : undefined;
     }
 
     if (token.value === "(") {
@@ -448,10 +543,11 @@ export function evaluateRuntimeExpression(
   expression: string,
   variables: ReadonlyMap<string, number>,
   functions: Readonly<Record<string, (...args: number[]) => number>> = {},
+  integerDivision = false,
 ): number | undefined {
   const tokens = tokenizeExpression(expression.trim());
   if (!tokens) return undefined;
-  const result = new ExpressionParser(tokens, variables, functions).parse();
+  const result = new ExpressionParser(tokens, variables, functions, integerDivision).parse();
   // Failed sensor reads must overwrite the previous reading with NaN so
   // sketches can detect them with isnan() and stop actuators safely.
   return result !== undefined && (Number.isFinite(result) || Number.isNaN(result)) ? result : undefined;
@@ -479,6 +575,154 @@ function defaultConstants(boardId = "arduino-uno"): Map<string, number> {
   return constants;
 }
 
+function matchingDelimiter(source: string, opening: number, open: string, close: string): number | undefined {
+  let depth = 0;
+  let quote = "";
+  for (let index = opening; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (character === "\\") index += 1;
+      else if (character === quote) quote = "";
+    } else if (character === "\"" || character === "'") quote = character;
+    else if (character === open) depth += 1;
+    else if (character === close && --depth === 0) return index;
+  }
+  return undefined;
+}
+
+function parseHelperBody(body: string): SketchHelperStatement[] | undefined {
+  let cursor = 0;
+  const skip = () => { while (/\s/.test(body[cursor] ?? "")) cursor += 1; };
+  const parseStatement = (): SketchHelperStatement[] | undefined => {
+    skip();
+    if (body[cursor] === "{") {
+      const closing = matchingDelimiter(body, cursor, "{", "}");
+      if (closing === undefined) return undefined;
+      const nested = parseHelperBody(body.slice(cursor + 1, closing));
+      cursor = closing + 1;
+      return nested;
+    }
+    const ifMatch = /^if\s*\(/.exec(body.slice(cursor));
+    if (ifMatch) {
+      const open = cursor + ifMatch[0].lastIndexOf("(");
+      const closing = matchingDelimiter(body, open, "(", ")");
+      if (closing === undefined) return undefined;
+      const condition = body.slice(open + 1, closing).trim();
+      cursor = closing + 1;
+      const then = parseStatement();
+      if (!then) return undefined;
+      skip();
+      let otherwise: SketchHelperStatement[] = [];
+      if (/^else\b/.test(body.slice(cursor))) {
+        cursor += 4;
+        const parsedElse = parseStatement();
+        if (!parsedElse) return undefined;
+        otherwise = parsedElse;
+      }
+      return [{ kind: "if", condition, then, otherwise }];
+    }
+    const returnMatch = /^return\b/.exec(body.slice(cursor));
+    if (!returnMatch) return undefined;
+    cursor += returnMatch[0].length;
+    const start = cursor;
+    let parens = 0;
+    let quote = "";
+    for (; cursor < body.length; cursor += 1) {
+      const character = body[cursor];
+      if (quote) {
+        if (character === "\\") cursor += 1;
+        else if (character === quote) quote = "";
+      } else if (character === "\"" || character === "'") quote = character;
+      else if (character === "(") parens += 1;
+      else if (character === ")") parens -= 1;
+      else if (character === ";" && parens === 0) {
+        const expression = body.slice(start, cursor).trim();
+        cursor += 1;
+        return expression ? [{ kind: "return", expression }] : undefined;
+      }
+    }
+    return undefined;
+  };
+
+  const statements: SketchHelperStatement[] = [];
+  while (cursor < body.length) {
+    skip();
+    if (cursor >= body.length) break;
+    const next = parseStatement();
+    if (!next) return undefined;
+    statements.push(...next);
+  }
+  return statements;
+}
+
+function helperAlwaysReturns(statements: readonly SketchHelperStatement[]): boolean {
+  for (const statement of statements) {
+    if (statement.kind === "return") return true;
+    if (helperAlwaysReturns(statement.then) && helperAlwaysReturns(statement.otherwise)) return true;
+  }
+  return false;
+}
+
+function extractNumericHelpers(source: string, diagnostics: SimulatorDiagnostic[]): Record<string, SketchHelperFunction> {
+  const helpers: Record<string, SketchHelperFunction> = {};
+  const signature = /\b(?:(?:static|inline)\s+)*((?:(?:unsigned|signed)\s+)?(?:char|short(?:\s+int)?|int|long(?:\s+long)?(?:\s+int)?|byte|bool|float|double|size_t|u?int(?:8|16|32|64)_t))\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*\{/g;
+  const parameterType = /^((?:(?:const|unsigned|signed)\s+)*(?:char|short(?:\s+int)?|int|long(?:\s+long)?(?:\s+int)?|byte|bool|float|double|size_t|u?int(?:8|16|32|64)_t))\s+([A-Za-z_]\w*)$/;
+  for (const match of source.matchAll(signature)) {
+    const returnType = match[1].replace(/\b(?:const|signed|unsigned)\b/g, "").trim();
+    const name = match[2];
+    const opening = match.index! + match[0].lastIndexOf("{");
+    const closing = findClosingBrace(source, opening);
+    const line = lineAt(source, match.index!);
+    if (closing === undefined) {
+      diagnostics.push({ severity: "error", code: "UNTERMINATED_HELPER_FUNCTION", message: `${name}() is missing its closing brace.`, line });
+      continue;
+    }
+    const parsedParameters = (match[3].trim() ? match[3].split(",") : []).map(parameter => {
+      if (!parameter.trim()) return undefined;
+      const parsed = parameterType.exec(parameter.trim());
+      return parsed ? { type: parsed[1].replace(/\bconst\b/g, "").trim(), name: parsed[2] } : undefined;
+    });
+    const body = parseHelperBody(source.slice(opening + 1, closing));
+    if (parsedParameters.some(parameter => !parameter) || !body || !helperAlwaysReturns(body)) {
+      diagnostics.push({ severity: "error", code: "UNSUPPORTED_HELPER_FUNCTION", message: `${name}() must use numeric parameters and a simple body made of if/else blocks and return expressions, with a return on every path.`, line });
+      continue;
+    }
+    if (helpers[name]) {
+      diagnostics.push({ severity: "error", code: "DUPLICATE_HELPER_FUNCTION", message: `${name}() is defined more than once.`, line });
+      continue;
+    }
+    const parameters = parsedParameters as Array<{ type: string; name: string }>;
+    helpers[name] = {
+      name,
+      returnType,
+      parameters: parameters.map(parameter => parameter.name),
+      parameterTypes: parameters.map(parameter => parameter.type),
+      body,
+      line,
+    };
+  }
+  const expressionText = (statements: readonly SketchHelperStatement[]): string => statements.map(statement =>
+    statement.kind === "return"
+      ? statement.expression
+      : `${statement.condition} ${expressionText(statement.then)} ${expressionText(statement.otherwise)}`,
+  ).join(" ");
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const recursive = new Set<string>();
+  const visit = (name: string) => {
+    if (visiting.has(name)) { recursive.add(name); return; }
+    if (visited.has(name)) return;
+    visiting.add(name);
+    const body = expressionText(helpers[name].body);
+    for (const call of body.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)) if (helpers[call[1]]) visit(call[1]);
+    visiting.delete(name);
+    visited.add(name);
+  };
+  Object.keys(helpers).forEach(visit);
+  for (const name of recursive) diagnostics.push({ severity: "error", code: "RECURSIVE_HELPER_UNSUPPORTED", message: `${name}() recursively calls itself or another helper; recursive sketch helpers are outside the simulator subset.`, line: helpers[name].line });
+  return helpers;
+}
+
 function collectConstants(source: string, boardId = "arduino-uno"): Map<string, number> {
   const constants = defaultConstants(boardId);
   const pending: Array<[string, string]> = [];
@@ -487,7 +731,7 @@ function collectConstants(source: string, boardId = "arduino-uno"): Map<string, 
     pending.push([match[1], match[2].trim()]);
   }
 
-  const declaration = /\b(?:const\s+)?(?:unsigned\s+)?(?:int|long|short|byte|uint8_t|uint16_t|size_t)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g;
+  const declaration = /\b(?:const\s+)?(?:unsigned\s+)?(?:int|long|short|byte|u?int(?:8|16|32|64)_t|size_t)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g;
   for (const match of source.matchAll(declaration)) {
     pending.push([match[1], match[2].trim()]);
   }
@@ -574,7 +818,8 @@ function staticPrintValue(
     ...Object.keys(DEVICE_CONSTANTS),
     ...[...source.matchAll(/^\s*#define\s+([A-Za-z_]\w*)\b/gm)].map(match => match[1]),
   ]);
-  if (tokens.some(token => token.type === "identifier" && !staticNames.has(token.value))) return undefined;
+  if (tokens.some(token => token.type === "identifier" && !staticNames.has(token.value)
+    && !staticNames.has(token.value.slice(token.value.lastIndexOf("::") + 2)))) return undefined;
   return printValue(trimmed, constants);
 }
 
@@ -617,7 +862,7 @@ function compileBody(
     const line = lineAt(source, statement.startIndex);
     if (statement.nestingDepth > 0) continue;
 
-    if (/^(?:const\s+)?(?:unsigned\s+)?(?:int|long|short|byte|uint8_t|uint16_t|size_t)\b/.test(statement.text)) {
+    if (/^(?:const\s+)?(?:unsigned\s+)?(?:int|long|short|byte|u?int(?:8|16|32|64)_t|size_t)\b/.test(statement.text)) {
       continue;
     }
 
@@ -742,7 +987,7 @@ function compileBody(
       continue;
     }
 
-    if (callee === "delay") {
+    if (callee === "delay" || callee === "delayMicroseconds") {
       const duration = args.length === 1 ? evaluateStatic(args[0], constants) : undefined;
       if (duration === undefined || duration < 0) {
         addArgumentError(diagnostics, line, callee, "one non-negative static duration");
@@ -750,7 +995,7 @@ function compileBody(
       }
       instructions.push({
         kind: "delay",
-        durationMs: Math.round(duration),
+        durationMs: callee === "delayMicroseconds" ? duration / 1_000 : Math.round(duration),
         ...sourceInfo,
       });
       continue;
@@ -858,9 +1103,9 @@ function compileExecutableBody(
     }
     const bufferWrite = /^([A-Za-z_]\w*)\s*\[([^\]]+)\]\s*=\s*([^;]+);$/.exec(trimmed);
     if (bufferWrite) { instructions.push({ kind: "bufferWrite", name: bufferWrite[1], index: bufferWrite[2], expression: bufferWrite[3], ...sourceInfo }); return; }
-    const declaration = /^(?:(?:const\s+)?(?:unsigned\s+)?(?:int|long|short|byte|uint8_t|uint16_t|size_t|bool|float|double))\s+([A-Za-z_]\w*)(?:\s*=\s*([^;]+))?\s*;$/.exec(trimmed);
+    const declaration = /^(?:(?:const\s+)?(?:unsigned\s+)?(int|long|short|byte|u?int(?:8|16|32|64)_t|size_t|bool|float|double))\s+([A-Za-z_]\w*)(?:\s*=\s*([^;]+))?\s*;$/.exec(trimmed);
     if (declaration) {
-      instructions.push({ kind: "declare", name: declaration[1], expression: declaration[2]?.trim() ?? "0", ...sourceInfo });
+      instructions.push({ kind: "declare", name: declaration[2], expression: declaration[3]?.trim() ?? "0", integer: !["float", "double"].includes(declaration[1]!), ...sourceInfo });
       return;
     }
     const assignment = /^([A-Za-z_]\w*)\s*(=|\+=|-=|\*=|\/=|%=)\s*([^;]+)\s*;$/.exec(trimmed);
@@ -1024,11 +1269,20 @@ function collectGlobalVariables(source: string, boardId = "arduino-uno"): Record
     const value = evaluateStatic(match[2].trim(), new Map([...constants, ...Object.entries(globals)]));
     if (value !== undefined) { globals[match[1]] = value; constants.set(match[1], value); }
   }
-  for (const match of prefix.matchAll(/\b(?:unsigned\s+)?(?:int|long|short|byte|uint8_t|uint16_t|size_t|bool|float|double)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g)) {
+  for (const match of prefix.matchAll(/\b(?:unsigned\s+)?(?:int|long|short|byte|u?int(?:8|16|32|64)_t|size_t|bool|float|double)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g)) {
     const value = evaluateStatic(match[2], new Map([...constants, ...Object.entries(globals)]));
     if (value !== undefined) globals[match[1]] = value;
   }
   return globals;
+}
+
+function collectIntegerVariables(source: string): string[] {
+  const setupIndex = source.search(/\bvoid\s+setup\s*\(/);
+  const prefix = setupIndex >= 0 ? source.slice(0, setupIndex) : source;
+  const names = new Set<string>();
+  const declaration = /\b(?:const\s+)?(?:unsigned\s+)?(?:int|long|short|byte|u?int(?:8|16|32|64)_t|size_t|bool)\s+([A-Za-z_]\w*)\s*(?:=[^;]*)?;/g;
+  for (const match of prefix.matchAll(declaration)) names.add(match[1]!);
+  return [...names];
 }
 
 /**
@@ -1039,7 +1293,8 @@ function collectGlobalVariables(source: string, boardId = "arduino-uno"): Record
 export function compileArduinoSketch(source: string, boardId = "arduino-uno"): CompiledArduinoSketch {
   const diagnostics: SimulatorDiagnostic[] = [];
   const masked = maskComments(source);
-  diagnostics.push(...validateLibraryCalls(masked, boardId));
+  const helpers = extractNumericHelpers(masked, diagnostics);
+  diagnostics.push(...validateLibraryCalls(masked, boardId, Object.keys(helpers)));
   const uartCount = getBoardProfile(boardId)?.uart.length ?? 1;
   for (const match of masked.matchAll(/\bSerial([1-3])\s*\./g)) {
     const port = Number(match[1]);
@@ -1078,6 +1333,8 @@ export function compileArduinoSketch(source: string, boardId = "arduino-uno"): C
     setup,
     loop,
     globals: collectGlobalVariables(masked, boardId),
+    integerVariables: collectIntegerVariables(masked),
+    helpers,
     ...(Object.keys(callbacks).length ? { i2cCallbacks: callbacks } : {}),
     diagnostics,
     valid: !diagnostics.some((diagnostic) => diagnostic.severity === "error"),

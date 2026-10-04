@@ -1,0 +1,3271 @@
+import assert from "node:assert/strict";
+import test, { after } from "node:test";
+
+import { createDefaultBlinkProject } from "../../../../lib/circuit/default-project.ts";
+import { affectedSubsystems, canRecoverSketchOnly, classifyGenerationMode, fragmentTopologyFingerprint, hasObservableButtonEffect, includeRequiredSupportingParts, ledSeriesResistorIssues, maxDuration, peripheralPinConflictIssues, probeRecoveryTopology, repairConflictedNeoPixelDataBranch, repairMissingLedCurrentLimiters, repairUniquePeripheralPinAssignments, repairUnwiredPeripheralSignalConnections, requestedButtonBehaviorComponents, requestedRotaryControlAction, requestedWs2812DataResistorIssues, simulateButtonScenario, structuredIssueDiagnostics, validatedWiringReferenceGuidance, POST } from "./route.ts";
+import { COMPONENT_CATALOG } from "../../../../lib/circuit/index.ts";
+import { COMPONENT_EXAMPLES } from "../../../../lib/circuit/component-examples.ts";
+import { greenhouseExample, greenhouseMonitorPrompt, greenhousePrompt } from "../../../../tests/fixtures/greenhouse.ts";
+import { ArduinoSimulator } from "../../../../lib/simulator/index.ts";
+import { MultiBoardSimulator } from "../../../../lib/simulator/index.ts";
+import { isBoardType } from "../../../../lib/circuit/boards.ts";
+import { structuredFixturePrograms, structuredFixtureResponse } from "./route.test-support.ts";
+
+test("generation prompts include reusable simulator-validated pin topologies", () => {
+  const mux = validatedWiringReferenceGuidance(["arduino-uno", "bme280", "tca9548a", "mcp23017"]);
+  assert.match(mux, /tca9548a:.*\[tca9548a\]\.SD0/);
+  assert.match(mux, /mcp23017:.*\[mcp23017\]\.SDA/);
+  assert.doesNotMatch(mux, /bme280:/, "a mux request should not be shown the conflicting direct-bus sensor example");
+  assert.match(mux, /Keep every planned signal, supply rail, and ground node separate/);
+
+  const strip = validatedWiringReferenceGuidance(["ws2812b-strip-8"]);
+  assert.match(strip, /\[ws2812b-strip-8\]\.DIN/);
+  assert.match(strip, /data resistor is planned, place it in series/);
+});
+
+test("generation reports shared GPIO assignments across LCD, encoder, and direct sketch controls", () => {
+  const project = structuredClone(COMPONENT_EXAMPLES["ky-040"]());
+  assert.deepEqual(peripheralPinConflictIssues(project, "uno", project.code), [], "valid encoder pinMode calls must be recognized as setup for the same wired encoder signals");
+  project.components.push(
+    { id: "lcd", type: "lcd-16x2", label: "Room LCD", x: 600, y: 0 },
+    { id: "buzzer", type: "buzzer", label: "Alert buzzer", x: 900, y: 0 },
+  );
+  for (const [id, lcdPin, boardPin] of [
+    ["lcd-rs", "RS", "D12"],
+    ["lcd-enable", "E", "D11"],
+    ["lcd-d7", "D7", "D2"],
+    ["lcd-d6", "D6", "D3"],
+    ["lcd-d5", "D5", "D4"],
+    ["lcd-d4", "D4", "D5"],
+  ]) {
+    project.connections.push({ id, from: { componentId: "lcd", pin: lcdPin }, to: { componentId: "uno", pin: boardPin } });
+  }
+  project.connections.push({ id: "buzzer-positive", from: { componentId: "buzzer", pin: "+" }, to: { componentId: "uno", pin: "D5" } });
+  const code = `#include <LiquidCrystal.h>
+#include <Encoder.h>
+LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
+Encoder myEnc(2, 3);
+const int buzzerPin = 5;
+const int encSwPin = 4;
+void setup() { pinMode(buzzerPin, OUTPUT); pinMode(encSwPin, INPUT_PULLUP); }
+void loop() { tone(buzzerPin, 880); digitalRead(encSwPin); }`;
+  const issues = peripheralPinConflictIssues(project, "uno", code);
+  assert.equal(issues.length, 4, issues.join("\n"));
+  assert.ok(issues.some(issue => issue.includes("D2") && issue.includes("LCD (lcd-16x2)") && issue.includes("KY-040 (ky-040)") && issue.includes("Room LCD.D7") && issue.includes("wire lcd-d7")));
+  assert.ok(issues.some(issue => issue.includes("D4") && issue.includes("encSwPin") && issue.includes("Room LCD.D5")), issues.join("\n"));
+  assert.ok(issues.some(issue => issue.includes("D5") && issue.includes("buzzerPin") && issue.includes("Alert buzzer.+")));
+
+  const mismatched = structuredClone(COMPONENT_EXAMPLES["ky-040"]());
+  mismatched.code = mismatched.code.replace("Encoder knob(2,3)", "Encoder knob(7,8)");
+  const miswireIssues = peripheralPinConflictIssues(mismatched, "uno", mismatched.code);
+  assert.equal(miswireIssues.filter(issue => issue.includes("GPIO_PIN_NOT_WIRED")).length, 2, miswireIssues.join("\n"));
+});
+
+test("code-only recovery is allowed only after the candidate topology passes electrical validation", () => {
+  const sketchIssue = { code: "UNSUPPORTED_CALL", message: "invalid sketch API", componentIds: ["uno"], wireIds: [], nets: [], expectedTopology: "", stage: "code" as const };
+  const wiringIssue = { ...sketchIssue, code: "LED_SERIES_RESISTOR_BYPASSED", stage: "wiring" as const };
+  assert.equal(canRecoverSketchOnly(false, 1, [sketchIssue]), false, "a malformed sketch stage alone does not prove the assembled wiring is safe");
+  assert.equal(canRecoverSketchOnly(true, 1, [sketchIssue]), true, "a validated single-board topology can use source-only recovery");
+  assert.equal(canRecoverSketchOnly(true, 1, [sketchIssue, wiringIssue]), false, "any wiring diagnostic requires full-project recovery");
+  assert.equal(canRecoverSketchOnly(true, 2, [sketchIssue]), false, "multi-board recovery remains project-wide");
+});
+
+test("recovery topology probing detects an LED resistor bypass even before a valid sketch exists", () => {
+  const project = greenhouseExample();
+  const led = project.components.find(component => component.type === "led")!;
+  const candidate = { project, explanation: "Greenhouse", assumptions: [], warnings: [] };
+  const context = {
+    target: "simulation" as const,
+    prompt: greenhousePrompt,
+    components: [...new Map(project.components.map(component => [component.type, COMPONENT_CATALOG[component.type]])).values()],
+    multipleBoards: false,
+  };
+  const validProbe = probeRecoveryTopology(candidate, context);
+  assert.equal(validProbe.topologyValidated, true, JSON.stringify(validProbe.issues));
+
+  const bypassed = structuredClone(project);
+  bypassed.connections.push({ id: "test-led-direct-drive", from: { componentId: "uno", pin: "D6" }, to: { componentId: led.id, pin: "A" } });
+  const invalidProbe = probeRecoveryTopology({ ...candidate, project: bypassed }, context);
+  assert.equal(invalidProbe.topologyValidated, false);
+  assert.ok(invalidProbe.issues.some(issue => issue.includes("LED_SERIES_RESISTOR_BYPASSED")), JSON.stringify(invalidProbe.issues));
+  assert.ok(invalidProbe.diagnostics.some(diagnostic => diagnostic.code === "LED_SERIES_RESISTOR_BYPASSED" && diagnostic.stage === "wiring"));
+
+  const collapsedLedTerminals = structuredClone(project);
+  collapsedLedTerminals.connections.push({
+    id: "greenhouse-led-terminals-shorted",
+    from: { componentId: led.id, pin: "A" },
+    to: { componentId: led.id, pin: "K" },
+  });
+  const shortedProbe = probeRecoveryTopology({ ...candidate, project: collapsedLedTerminals }, context);
+  assert.equal(shortedProbe.topologyValidated, false, "a malformed staged sketch must not freeze a net with a shorted LED");
+  assert.ok(shortedProbe.diagnostics.some(diagnostic => diagnostic.code === "NET_COMPONENT_SHORT" && diagnostic.stage === "wiring"), JSON.stringify(shortedProbe.diagnostics));
+});
+
+test("generation aligns a named buzzer pin only when its wiring has one supported board GPIO", () => {
+  const project = structuredClone(COMPONENT_EXAMPLES["ky-040"]());
+  project.components.push({ id: "buzzer", type: "buzzer", label: "Alert buzzer", x: 800, y: 200 });
+  project.connections.push({ id: "buzzer-wire", from: { componentId: "buzzer", pin: "+" }, to: { componentId: "uno", pin: "D5" } });
+  const code = `const int buzzerPin = 12; void setup() { pinMode(buzzerPin, OUTPUT); } void loop() { tone(buzzerPin, 880); }`;
+  const repaired = repairUniquePeripheralPinAssignments(project, "uno", code);
+  assert.match(repaired.code, /buzzerPin\s*=\s*5/);
+  assert.doesNotMatch(repaired.code, /buzzerSilenced\s*=\s*5/);
+  assert.deepEqual(repaired.repairs, ["aligned buzzerPin (buzzer.+) to its unique wired GPIO"]);
+
+  project.connections.push({ id: "buzzer-second-wire", from: { componentId: "buzzer", pin: "+" }, to: { componentId: "uno", pin: "D6" } });
+  const ambiguous = repairUniquePeripheralPinAssignments(project, "uno", code);
+  assert.equal(ambiguous.code, code);
+  assert.deepEqual(ambiguous.repairs, []);
+});
+
+test("generation reconnects only isolated LCD signals to the unused pins named by its sketch", () => {
+  const project = structuredClone(COMPONENT_EXAMPLES["ky-040"]());
+  project.components.push({ id: "lcd", type: "lcd-16x2", label: "Room display", x: 600, y: 0 });
+  project.code = `#include <LiquidCrystal.h>
+#include <Encoder.h>
+LiquidCrystal lcd(8, 9, 10, 11, 12, 13);
+Encoder knob(2, 3);
+void setup(){ lcd.begin(16, 2); }
+void loop(){ lcd.print(knob.read()); }`;
+
+  const repaired = repairUnwiredPeripheralSignalConnections(project, "uno", project.code);
+  assert.equal(repaired.connections.length, 6);
+  assert.deepEqual(repaired.connections.map(connection => [connection.from.pin, connection.to.pin]), [
+    ["D8", "RS"], ["D9", "E"], ["D10", "D4"], ["D11", "D5"], ["D12", "D6"], ["D13", "D7"],
+  ]);
+  assert.equal(peripheralPinConflictIssues({ ...project, connections: [...project.connections, ...repaired.connections] }, "uno", project.code).length, 0);
+  assert.equal(repairUnwiredPeripheralSignalConnections({ ...project, connections: [...project.connections, ...repaired.connections] }, "uno", project.code).connections.length, 0);
+
+  const ambiguous = structuredClone(project);
+  ambiguous.components.push({ id: "lcd-2", type: "lcd-16x2", label: "Second display", x: 900, y: 0 });
+  assert.deepEqual(repairUnwiredPeripheralSignalConnections(ambiguous, "uno", ambiguous.code), { connections: [], repairs: [] });
+});
+
+test("generation completes a uniquely identified NeoPixel data-resistor branch", () => {
+  const project = structuredClone(COMPONENT_EXAMPLES["ky-040"]());
+  project.components.push(
+    { id: "strip", type: "ws2812b-strip-8", label: "Status strip", x: 600, y: 0 },
+    { id: "data-resistor", type: "resistor", label: "Data resistor", x: 450, y: 0, properties: { resistance: 330 } },
+  );
+  project.connections.push({ id: "strip-din-resistor", from: { componentId: "strip", pin: "DIN" }, to: { componentId: "data-resistor", pin: "2" } });
+  project.code = `#include <Adafruit_NeoPixel.h>
+Adafruit_NeoPixel strip(8, 6, NEO_GRB + NEO_KHZ800);
+void setup(){ strip.begin(); }
+void loop(){ strip.show(); }`;
+
+  const repaired = repairUnwiredPeripheralSignalConnections(project, "uno", project.code);
+  assert.equal(repaired.connections.length, 1);
+  assert.deepEqual([repaired.connections[0]!.from, repaired.connections[0]!.to], [
+    { componentId: "uno", pin: "D6" }, { componentId: "data-resistor", pin: "1" },
+  ]);
+  const connections = [...project.connections, ...repaired.connections];
+  assert.deepEqual(peripheralPinConflictIssues({ ...project, connections }, "uno", project.code), []);
+  assert.equal(repairUnwiredPeripheralSignalConnections({ ...project, connections }, "uno", project.code).connections.length, 0);
+});
+
+test("generation completes a NeoPixel branch when the sketch GPIO is already wired to a loose series resistor", () => {
+  const project = structuredClone(COMPONENT_EXAMPLES["ky-040"]());
+  project.components.push(
+    { id: "strip", type: "ws2812b-strip-8", label: "Status strip", x: 600, y: 0 },
+    { id: "data-resistor", type: "resistor", label: "Data resistor", x: 450, y: 0, properties: { resistance: 330 } },
+  );
+  project.connections.push({ id: "gpio-to-loose-resistor", from: { componentId: "uno", pin: "D6" }, to: { componentId: "data-resistor", pin: "1" } });
+  project.code = `#include <Adafruit_NeoPixel.h>
+Adafruit_NeoPixel strip(8, 6, NEO_GRB + NEO_KHZ800);
+void setup(){ strip.begin(); }
+void loop(){ strip.show(); }`;
+
+  const repaired = repairUnwiredPeripheralSignalConnections(project, "uno", project.code);
+  assert.equal(repaired.connections.length, 1);
+  assert.deepEqual([repaired.connections[0]!.from, repaired.connections[0]!.to], [
+    { componentId: "data-resistor", pin: "2" }, { componentId: "strip", pin: "DIN" },
+  ]);
+  const repairedProject = { ...project, connections: [...project.connections, ...repaired.connections] };
+  assert.deepEqual(peripheralPinConflictIssues(repairedProject, "uno", project.code), []);
+  assert.deepEqual(requestedWs2812DataResistorIssues(repairedProject, "Use a WS2812B data resistor."), []);
+  assert.equal(repairUnwiredPeripheralSignalConnections(repairedProject, "uno", project.code).connections.length, 0);
+});
+
+test("a requested WS2812B data resistor must be wired in series between the data pin and strip", () => {
+  const project = structuredClone(COMPONENT_EXAMPLES["ky-040"]());
+  project.components.push(
+    { id: "strip", type: "ws2812b-strip-8", label: "Status strip", x: 600, y: 0 },
+    { id: "data-resistor", type: "resistor", label: "Data resistor", x: 450, y: 0, properties: { resistance: 330 } },
+  );
+  const prompt = "Use a WS2812B strip and include its required data resistor.";
+  project.connections.push(
+    { id: "din-side", from: { componentId: "strip", pin: "DIN" }, to: { componentId: "data-resistor", pin: "2" } },
+    { id: "gpio-side", from: { componentId: "data-resistor", pin: "1" }, to: { componentId: "uno", pin: "D6" } },
+  );
+  assert.deepEqual(requestedWs2812DataResistorIssues(project, prompt), []);
+  project.connections.pop();
+  assert.ok(requestedWs2812DataResistorIssues(project, prompt).some(issue => issue.includes("WS2812B_DATA_RESISTOR_REQUIRED")));
+  project.connections = project.connections.filter(connection => connection.id !== "din-side");
+  project.connections.push({ id: "direct-data", from: { componentId: "strip", pin: "DIN" }, to: { componentId: "uno", pin: "D6" } });
+  assert.ok(requestedWs2812DataResistorIssues(project, prompt).length > 0, "a loose resistor or direct GPIO wire cannot satisfy the request");
+});
+
+test("generation separates an unambiguous NeoPixel data resistor from an LCD GPIO conflict", () => {
+  const project = structuredClone(COMPONENT_EXAMPLES["ky-040"]());
+  project.components.push(
+    { id: "lcd", type: "lcd-16x2", label: "Room LCD", x: 400, y: 0 },
+    { id: "strip", type: "ws2812b-strip-8", label: "Status strip", x: 800, y: 0 },
+    { id: "data-resistor", type: "resistor", label: "WS2812 data resistor", x: 650, y: 0, properties: { resistance: 330 } },
+  );
+  project.connections.push(
+    { id: "lcd-data-collision", from: { componentId: "lcd", pin: "D4" }, to: { componentId: "uno", pin: "D4" } },
+    { id: "strip-data", from: { componentId: "strip", pin: "DIN" }, to: { componentId: "data-resistor", pin: "2" } },
+    { id: "resistor-source", from: { componentId: "data-resistor", pin: "1" }, to: { componentId: "uno", pin: "D4" } },
+  );
+  const code = `#include <LiquidCrystal.h>
+#include <Adafruit_NeoPixel.h>
+LiquidCrystal lcd(2, 3, 4, 5, 6, 7);
+Adafruit_NeoPixel strip(8, 4, NEO_GRB + NEO_KHZ800);
+void setup(){ lcd.begin(16, 2); strip.begin(); }
+void loop(){ strip.show(); }`;
+  assert.ok(peripheralPinConflictIssues(project, "uno", code).some(issue => issue.includes("GPIO_PIN_CONFLICT")));
+
+  const repaired = repairConflictedNeoPixelDataBranch(project, "uno", code);
+  assert.equal(repaired.repairs.length, 1, repaired.repairs.join("\n"));
+  assert.match(repaired.code, /Adafruit_NeoPixel\s+strip\(8,\s*(\d+)/);
+  const match = /Adafruit_NeoPixel\s+strip\(8,\s*(\d+)/.exec(repaired.code);
+  assert.ok(match);
+  const newPin = Number(match[1]);
+  assert.notEqual(newPin, 4);
+  assert.ok(repaired.connections.some(connection => [connection.from, connection.to].some(endpoint => endpoint.componentId === "data-resistor" && endpoint.pin === "1")
+    && [connection.from, connection.to].some(endpoint => endpoint.componentId === "uno" && endpoint.pin === `D${newPin}`)));
+  assert.equal(repaired.connections.find(connection => connection.id === "lcd-data-collision")?.to.pin, "D4", "the independent LCD signal stays on its original pin");
+  assert.equal(peripheralPinConflictIssues({ ...project, connections: repaired.connections }, "uno", repaired.code).some(issue => issue.includes("GPIO_PIN_CONFLICT")), false);
+});
+
+test("button behavior validation targets the button the prompt assigns the action to", () => {
+  const controls = [
+    { id: "push", type: "push-button" },
+    { id: "encoder", type: "ky-040" },
+  ];
+  assert.deepEqual(
+    requestedButtonBehaviorComponents("Use the KY-040 rotary encoder to adjust the setpoint; pressing the pushbutton toggles sound.", controls).map(control => control.id),
+    ["push"],
+  );
+  assert.deepEqual(
+    requestedButtonBehaviorComponents("Press the KY-040's SW switch to mute the alarm.", controls).map(control => control.id),
+    ["encoder"],
+  );
+  assert.deepEqual(
+    requestedButtonBehaviorComponents("Press the encoder's SW switch to mute sound and press the separate pushbutton to turn off the strip.", controls).map(control => control.id),
+    ["encoder", "push"],
+  );
+  assert.deepEqual(
+    requestedButtonBehaviorComponents("The pushbutton toggles the alarm on every press.", controls).map(control => control.id),
+    ["push"],
+  );
+  assert.deepEqual(
+    requestedButtonBehaviorComponents("Pressing the encoder's SW switch mutes the alarm.", controls).map(control => control.id),
+    ["encoder"],
+  );
+  assert.equal(requestedRotaryControlAction("Turning the encoder changes the alarm threshold."), true);
+  assert.equal(requestedRotaryControlAction("The encoder's SW switch toggles alarm mode."), false);
+});
+
+test("mute-button simulation primes the requested soil alarm before comparing released and pressed states", () => {
+  const project = structuredClone(COMPONENT_EXAMPLES["ky-040"]());
+  project.components.push(
+    { id: "soil", type: "soil-moisture-sen0193", label: "Soil moisture", x: 500, y: 0, properties: { moisture: 50 } },
+    { id: "buzzer", type: "buzzer", label: "Alarm buzzer", x: 700, y: 0 },
+  );
+  project.connections.push(
+    { id: "soil-vcc", from: { componentId: "soil", pin: "VCC" }, to: { componentId: "uno", pin: "5V" } },
+    { id: "soil-gnd", from: { componentId: "soil", pin: "GND" }, to: { componentId: "uno", pin: "GND" } },
+    { id: "soil-out", from: { componentId: "soil", pin: "AOUT" }, to: { componentId: "uno", pin: "A0" } },
+    { id: "buzzer-signal", from: { componentId: "buzzer", pin: "+" }, to: { componentId: "uno", pin: "D9" } },
+    { id: "buzzer-gnd", from: { componentId: "buzzer", pin: "-" }, to: { componentId: "uno", pin: "GND" } },
+  );
+  project.code = `void setup(){ pinMode(4, INPUT_PULLUP); pinMode(9, OUTPUT); }
+void loop(){ int moisture = 100 - analogRead(A0) * 100 / 1023; int pressed = digitalRead(4); if (moisture < 35) { if (pressed == LOW) noTone(9); else tone(9, 1000); } else { noTone(9); } }`;
+
+  const prompt = "Press the KY-040 switch to mute the buzzer while soil moisture is below 35%, and keep it muted until the soil recovers.";
+  const released = simulateButtonScenario(project, project.code, undefined, prompt);
+  const pressed = simulateButtonScenario(project, project.code, "device", prompt);
+  assert.equal(
+    hasObservableButtonEffect(project, released, pressed),
+    true,
+    JSON.stringify({ message: "the validator must test mute behavior while the low-moisture alarm is active", released: released.at(-1)?.pins, pressed: pressed.at(-1)?.pins, releasedDiagnostics: released.at(-1)?.diagnostics, pressedDiagnostics: pressed.at(-1)?.diagnostics }),
+  );
+});
+
+test("a request for an unsupported capacitor gets a clear alternative before model calls", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  let providerCalls = 0;
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return new Response("unexpected model call", { status: 500 });
+  };
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: "Create a WS2812B strip circuit with its required bulk capacitor." }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 422);
+  assert.equal(body.error.code, "COMPONENT_UNAVAILABLE");
+  assert.match(body.error.message, /capacitor is not in Cirkitra's supported component catalog/);
+  assert.ok(body.error.details.some((detail: string) => /add it as a physical hardware note after export/.test(detail)));
+  assert.equal(providerCalls, 0, "unsupported parts should be identified before spending time on generation retries");
+});
+
+test("an unsupported DHT11 request is rejected with the supported DHT22 alternative", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  let providerCalls = 0;
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return new Response("unexpected model call", { status: 500 });
+  };
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: "Build a temperature and humidity monitor using a DHT11 and LCD." }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 422);
+  assert.equal(body.error.code, "COMPONENT_UNAVAILABLE");
+  assert.match(body.error.message, /DHT11 is not in Cirkitra's supported component catalog/);
+  assert.ok(body.error.details.some((detail: string) => /DHT22 \(AM2302\)/.test(detail)));
+  assert.equal(providerCalls, 0, "an unavailable sensor must not be silently replaced by a different part");
+});
+
+test("LED current-limit validation catches an output that bypasses its resistor without flagging an input", () => {
+  const project = createDefaultBlinkProject();
+  assert.deepEqual(ledSeriesResistorIssues(project), [], "the standard board → resistor → LED → ground branch is valid");
+
+  project.connections.push({
+    id: "led-direct-output-bypass",
+    from: { componentId: "uno", pin: "D4" },
+    to: { componentId: "led1", pin: "A" },
+  });
+  project.code = project.code.replace("void setup() {", "void setup() {\n  pinMode(4, OUTPUT);\n  digitalWrite(4, HIGH);");
+  const bypassIssues = ledSeriesResistorIssues(project);
+  assert.equal(bypassIssues.length, 1, bypassIssues.join("\n"));
+  assert.match(bypassIssues[0], /LED_SERIES_RESISTOR_BYPASSED/);
+  assert.match(bypassIssues[0], /D4/);
+
+  project.code = project.code.replace("pinMode(4, OUTPUT);\n  digitalWrite(4, HIGH);", "pinMode(4, INPUT);");
+  assert.deepEqual(ledSeriesResistorIssues(project), [], "a high-impedance input sharing the LED net does not bypass the resistor");
+});
+
+test("generation inserts a visible series limiter for a uniquely wired bare LED and the repaired branch simulates", () => {
+  const bareLed = createDefaultBlinkProject();
+  bareLed.components = bareLed.components.filter(component => component.id !== "r1");
+  bareLed.connections = bareLed.connections.filter(connection => connection.from.componentId !== "r1" && connection.to.componentId !== "r1");
+  bareLed.connections.push({
+    id: "uno-to-bare-led",
+    from: { componentId: "uno", pin: "D13" },
+    to: { componentId: "led1", pin: "A" },
+  });
+  assert.ok(ledSeriesResistorIssues(bareLed).some(issue => issue.includes("LED_CURRENT_LIMIT_MISSING")));
+
+  const repaired = repairMissingLedCurrentLimiters(bareLed);
+  const limiter = repaired.project.components.find(component => component.type === "resistor");
+  assert.ok(limiter, "repair must add a real, visible resistor component");
+  assert.equal(limiter.properties?.resistance, 220);
+  assert.ok(repaired.repairs.length);
+  assert.deepEqual(ledSeriesResistorIssues(repaired.project), []);
+
+  const simulator = new ArduinoSimulator(repaired.project.code);
+  simulator.attachProject(repaired.project);
+  simulator.run();
+  simulator.advance(0);
+  const snapshot = simulator.getSnapshot();
+  assert.equal(snapshot.componentStates.led1?.powered, true, JSON.stringify({ componentState: snapshot.componentStates.led1, diagnostics: snapshot.diagnostics }));
+  assert.equal(snapshot.diagnostics.some(diagnostic => diagnostic.severity === "error"), false);
+});
+
+test("generation reuses a single floating planned limiter but leaves ambiguous LED wiring for Gemini", () => {
+  const withPlannedLimiter = createDefaultBlinkProject();
+  withPlannedLimiter.connections = withPlannedLimiter.connections.filter(connection => connection.from.componentId !== "r1" && connection.to.componentId !== "r1");
+  withPlannedLimiter.connections.push({
+    id: "uno-to-bare-led",
+    from: { componentId: "uno", pin: "D13" },
+    to: { componentId: "led1", pin: "A" },
+  });
+  const reused = repairMissingLedCurrentLimiters(withPlannedLimiter);
+  assert.equal(reused.project.components.filter(component => component.type === "resistor").length, 1);
+  assert.ok(reused.project.connections.some(connection => [connection.from, connection.to].some(endpoint => endpoint.componentId === "r1")));
+  assert.deepEqual(ledSeriesResistorIssues(reused.project), []);
+
+  const ambiguous = createDefaultBlinkProject();
+  ambiguous.components = ambiguous.components.filter(component => component.id !== "r1");
+  ambiguous.connections = ambiguous.connections.filter(connection => connection.from.componentId !== "r1" && connection.to.componentId !== "r1");
+  ambiguous.connections.push(
+    { id: "uno-to-led-d13", from: { componentId: "uno", pin: "D13" }, to: { componentId: "led1", pin: "A" } },
+    { id: "uno-to-led-d12", from: { componentId: "uno", pin: "D12" }, to: { componentId: "led1", pin: "A" } },
+  );
+  ambiguous.code = ambiguous.code.replace("  pinMode(LED_PIN, OUTPUT);", "  pinMode(LED_PIN, OUTPUT);\n  pinMode(12, OUTPUT);\n  digitalWrite(12, HIGH);");
+  const before = JSON.stringify(ambiguous);
+  const skipped = repairMissingLedCurrentLimiters(ambiguous);
+  assert.deepEqual(skipped.repairs, [], "a repair must not guess when multiple driven pins meet the LED");
+  assert.equal(JSON.stringify(skipped.project), before, "an ambiguous failed project remains unchanged");
+});
+
+function threeLedSharedGroundProject() {
+  const project = createDefaultBlinkProject();
+  const board = project.components.find(component => component.id === "uno")!;
+  const firstLed = project.components.find(component => component.id === "led1")!;
+  const leds = [firstLed, ...[2, 3].map(index => ({
+    ...firstLed, id: `led${index}`, label: `Indicator ${index}`, x: firstLed.x + index * 160,
+  }))];
+  project.components = [board, ...leds];
+  project.connections = leds.flatMap((led, index) => [
+    { id: `wire-${led.id}-drive`, from: { componentId: "uno", pin: `D${index + 2}` }, to: { componentId: led.id, pin: "A" } },
+    { id: `wire-${led.id}-ground`, from: { componentId: led.id, pin: "K" }, to: { componentId: "uno", pin: "GND" } },
+  ]);
+  project.code = `void setup() { pinMode(2, OUTPUT); pinMode(3, OUTPUT); pinMode(4, OUTPUT); }
+void loop() { digitalWrite(2, HIGH); digitalWrite(3, HIGH); digitalWrite(4, HIGH); }`;
+  return project;
+}
+
+test("generation inserts one distinct limiter for each LED sharing a ground return", () => {
+  const project = threeLedSharedGroundProject();
+  const result = repairMissingLedCurrentLimiters(project);
+  assert.equal(result.repairs.length, 3, result.repairs.join("\n"));
+  assert.equal(result.project.components.filter(component => component.type === "resistor").length, 3);
+  assert.deepEqual(ledSeriesResistorIssues(result.project), []);
+
+  const resistorIds = new Set<string>();
+  for (const ledId of ["led1", "led2", "led3"]) {
+    const drive = result.project.connections.find(connection => connection.id === `wire-${ledId}-drive`);
+    assert.ok(drive);
+    const resistorEndpoint = [drive.from, drive.to].find(endpoint => endpoint.componentId !== "uno");
+    assert.ok(resistorEndpoint);
+    assert.equal(result.project.components.find(component => component.id === resistorEndpoint.componentId)?.type, "resistor");
+    resistorIds.add(resistorEndpoint.componentId);
+    assert.ok(result.project.connections.some(connection =>
+      [connection.from, connection.to].some(endpoint => endpoint.componentId === resistorEndpoint.componentId)
+        && [connection.from, connection.to].some(endpoint => endpoint.componentId === ledId && endpoint.pin === "A")));
+  }
+  assert.equal(resistorIds.size, 3, "each LED must have its own current limiter");
+
+  const simulator = new ArduinoSimulator(result.project.code);
+  simulator.attachProject(result.project);
+  simulator.run();
+  simulator.advance(0);
+  const snapshot = simulator.getSnapshot();
+  for (const id of ["led1", "led2", "led3"]) assert.equal(snapshot.componentStates[id]?.powered, true, id);
+  assert.equal(snapshot.diagnostics.some(diagnostic => diagnostic.severity === "error"), false);
+});
+
+test("generation sends an LED resistor bypass back for a targeted model repair", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+
+  const bypassed = createDefaultBlinkProject();
+  bypassed.connections.push({
+    id: "led-direct-output-bypass",
+    from: { componentId: "uno", pin: "D4" },
+    to: { componentId: "led1", pin: "A" },
+  });
+  bypassed.code = bypassed.code.replace("void setup() {", "void setup() {\n  pinMode(4, OUTPUT);\n  digitalWrite(4, HIGH);");
+  const corrected = createDefaultBlinkProject();
+  let calls = 0;
+  let repairIssues: string[] = [];
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    repairIssues = content.validationIssues ?? [];
+    return modelResponse(JSON.stringify({
+      project: Array.isArray(content.validationIssues) ? corrected : bypassed,
+      explanation: "The LED is driven through its current-limiting resistor.",
+      assumptions: [],
+      warnings: [],
+    }));
+  };
+
+  const response = await POST(generationRequest());
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(calls, 2, "the model should receive the topology error before the circuit is published");
+  assert.ok(repairIssues.some(issue => issue.includes("LED_SERIES_RESISTOR_BYPASSED")), JSON.stringify(repairIssues));
+  assert.ok(!body.project.connections.some((connection: FixtureWire) => connection.id === "led-direct-output-bypass"));
+
+  const simulator = new ArduinoSimulator();
+  simulator.attachProject(body.project);
+  simulator.run();
+  simulator.advance(0);
+  assert.equal(simulator.getSnapshot().diagnostics.some(diagnostic => diagnostic.severity === "error"), false);
+});
+
+test("ambiguous LED drive wiring is left for model repair instead of guessed", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+
+  const ambiguous = createDefaultBlinkProject();
+  ambiguous.connections = [
+    { id: "led-d13", from: { componentId: "uno", pin: "D13" }, to: { componentId: "led1", pin: "A" } },
+    { id: "led-d12", from: { componentId: "uno", pin: "D12" }, to: { componentId: "led1", pin: "A" } },
+    { id: "led-ground", from: { componentId: "led1", pin: "K" }, to: { componentId: "uno", pin: "GND" } },
+  ];
+  ambiguous.code = `void setup() { pinMode(12, OUTPUT); pinMode(13, OUTPUT); }
+void loop() { digitalWrite(12, HIGH); digitalWrite(13, HIGH); }`;
+  const repaired = createDefaultBlinkProject();
+  let repairIssues: string[] = [];
+  let calls = 0;
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    if (Array.isArray(content.validationIssues)) repairIssues = content.validationIssues;
+    return modelResponse(JSON.stringify({
+      project: Array.isArray(content.validationIssues) ? repaired : ambiguous,
+      explanation: "The LED now has one unambiguous current-limited output path.", assumptions: [], warnings: [],
+    }));
+  };
+
+  const response = await POST(generationRequest());
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(calls, 2, "planning and one model repair are used; the initial invalid topology is rejected");
+  assert.ok(repairIssues.some(issue => issue.includes("LED_CURRENT_LIMIT_MISSING")), JSON.stringify(repairIssues));
+  assert.deepEqual(ledSeriesResistorIssues(body.project), []);
+});
+
+const fetchDescriptor = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+let providerMock: typeof fetch | undefined;
+type FixtureComponent = { id: string; type: string; label?: string; x?: number; y?: number; rotation?: number; properties?: Record<string, unknown> };
+type FixtureEndpoint = { componentId: string; pin: string };
+type FixtureWire = { id?: string; from: FixtureEndpoint; to: FixtureEndpoint };
+type FixtureBoard = { id: string; type: string; label: string };
+type FixturePlan = {
+  projectId: string;
+  name: string;
+  description: string;
+  boards: FixtureBoard[];
+  components: Array<{ id: string; type: string; label: string; subsystemId: string }>;
+  subsystems: Array<{ id: string; name: string; goal: string }>;
+  nets: Array<{ id: string; name: string; subsystemIds: string[] }>;
+  estimatedNetTerminals: number;
+  requirements: Array<{ id: string; description: string }>;
+};
+type FixtureProject = {
+  id?: unknown;
+  name?: unknown;
+  description?: unknown;
+  board?: unknown;
+  components: FixtureComponent[];
+  connections?: FixtureWire[];
+  code?: unknown;
+  boardPrograms?: unknown;
+  programs?: unknown;
+};
+type FixtureEnvelope = { project: FixtureProject; explanation?: unknown; assumptions?: unknown; warnings?: unknown };
+let stagedSeed: { envelope: FixtureEnvelope; plan: FixturePlan; response?: Response } | undefined;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isFixtureComponent(value: unknown): value is FixtureComponent {
+  return isRecord(value) && typeof value.id === "string" && typeof value.type === "string";
+}
+
+test("LCD generation always makes the supported 3-pin contrast potentiometer available", () => {
+  const lcd = COMPONENT_CATALOG["lcd-16x2"]!;
+  const potentiometer = COMPONENT_CATALOG.potentiometer!;
+  const selected = includeRequiredSupportingParts([lcd]);
+  assert.ok(selected.some(part => part.id === "potentiometer"));
+  assert.equal(includeRequiredSupportingParts([lcd, potentiometer]).filter(part => part.id === "potentiometer").length, 1);
+  assert.deepEqual(potentiometer.pins.map(pin => pin.id), ["VCC", "GND", "SIG"]);
+});
+
+function isFixtureEndpoint(value: unknown): value is FixtureEndpoint {
+  return isRecord(value) && typeof value.componentId === "string" && typeof value.pin === "string";
+}
+
+function isFixtureWire(value: unknown): value is FixtureWire {
+  return isRecord(value) && isFixtureEndpoint(value.from) && isFixtureEndpoint(value.to);
+}
+
+function isFixtureEnvelope(value: unknown): value is FixtureEnvelope {
+  return isRecord(value) && isRecord(value.project) && Array.isArray(value.project.components) && value.project.components.every(isFixtureComponent);
+}
+
+async function responseEnvelope(response: Response): Promise<FixtureEnvelope | undefined> {
+  try {
+    const payload: unknown = await response.clone().json();
+    if (!isRecord(payload) || !Array.isArray(payload.candidates)) return undefined;
+    const candidate = payload.candidates[0];
+    if (!isRecord(candidate) || !isRecord(candidate.content) || !Array.isArray(candidate.content.parts)) return undefined;
+    const text = candidate.content.parts.filter(isRecord).map(part => typeof part.text === "string" ? part.text : "").join("");
+    const parsed: unknown = JSON.parse(text);
+    return isFixtureEnvelope(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function planFromEnvelope(envelope: FixtureEnvelope): FixturePlan | undefined {
+  const project = envelope.project;
+  const components = project.components;
+  const boards: FixtureBoard[] = components.filter(part => isBoardType(part.type)).map(part => ({ id: part.id, type: part.type, label: part.label ?? part.type }));
+  if (!boards.length && typeof project.board === "string" && isBoardType(project.board)) boards.push({ id: "board", type: project.board, label: "Board" });
+  if (!boards.length) return undefined;
+  const nonBoards = components.filter(part => !isBoardType(part.type));
+  const subsystemId = "main";
+  const parent = new Map<string, string>();
+  const find = (key: string): string => {
+    const root = parent.get(key) ?? key;
+    if (root === key) { parent.set(key, key); return key; }
+    const result = find(root); parent.set(key, result); return result;
+  };
+  const join = (a: string, b: string) => { const ra = find(a); const rb = find(b); if (ra !== rb) parent.set(rb, ra); };
+  const connections = (project.connections ?? []).filter(isFixtureWire);
+  for (const wire of connections) join(`${wire.from.componentId}:${wire.from.pin}`, `${wire.to.componentId}:${wire.to.pin}`);
+  const groups = new Map<string, Array<{ componentId: string; pin: string }>>();
+  for (const wire of connections) for (const endpoint of [wire.from, wire.to]) {
+    const root = find(`${endpoint.componentId}:${endpoint.pin}`);
+    const items = groups.get(root) ?? [];
+    if (!items.some(item => item.componentId === endpoint.componentId && item.pin === endpoint.pin)) items.push({ componentId: endpoint.componentId, pin: endpoint.pin });
+    groups.set(root, items);
+  }
+  const nets = [...groups.values()].filter(endpoints => endpoints.length > 1).map((_, index) => ({ id: `net_${index + 1}`, name: `Net ${index + 1}`, subsystemIds: [subsystemId] }));
+  return {
+    projectId: typeof project.id === "string" && /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(project.id) ? project.id : "mock_project",
+    name: typeof project.name === "string" ? project.name : "Mock circuit",
+    description: typeof project.description === "string" ? project.description : "Generated fixture circuit",
+    boards,
+    components: nonBoards.map(part => ({ id: part.id, type: part.type, label: part.label ?? part.type, subsystemId })),
+    subsystems: [{ id: subsystemId, name: "Main circuit", goal: "Connect and operate the requested components." }],
+    nets,
+    estimatedNetTerminals: [...groups.values()].filter(endpoints => endpoints.length > 1).reduce((sum, endpoints) => sum + endpoints.length, 0),
+    requirements: [{ id: "requested_behavior", description: typeof envelope.explanation === "string" ? envelope.explanation : "Implement the requested behavior." }],
+  };
+}
+
+function fragmentFromEnvelope(envelope: FixtureEnvelope, plan: FixturePlan, subsystemId: string) {
+  const project = envelope.project;
+  const projectParts = new Map(project.components.map(part => [part.id, part]));
+  const placements = plan.components.filter(part => part.subsystemId === subsystemId).map(part => {
+    const source = projectParts.get(part.id);
+    if (!source) return undefined;
+    const properties = Object.fromEntries(Object.entries(source.properties ?? {}).filter((entry): entry is [string, string | number | boolean] =>
+      typeof entry[1] === "string" || typeof entry[1] === "number" || typeof entry[1] === "boolean"));
+    return {
+      id: part.id,
+      x: Math.max(-900, Math.min(900, source.x ?? 0)),
+      y: Math.max(-900, Math.min(900, source.y ?? 0)),
+      rotation: source.rotation ?? 0,
+      properties,
+    };
+  }).filter((placement): placement is NonNullable<typeof placement> => !!placement);
+  const connections = (project.connections ?? []).filter(isFixtureWire);
+  const parent = new Map<string, string>();
+  const find = (key: string): string => { const root = parent.get(key) ?? key; if (root === key) { parent.set(key, key); return key; } const found = find(root); parent.set(key, found); return found; };
+  for (const wire of connections) {
+    const left = find(`${wire.from.componentId}:${wire.from.pin}`); const right = find(`${wire.to.componentId}:${wire.to.pin}`); if (left !== right) parent.set(right, left);
+  }
+  const groups = new Map<string, Array<{ componentId: string; pin: string }>>();
+  for (const wire of connections) for (const endpoint of [wire.from, wire.to]) {
+    const root = find(`${endpoint.componentId}:${endpoint.pin}`); const entries = groups.get(root) ?? [];
+    if (!entries.some(item => item.componentId === endpoint.componentId && item.pin === endpoint.pin)) entries.push({ componentId: endpoint.componentId, pin: endpoint.pin });
+    groups.set(root, entries);
+  }
+  const localNets = [...groups.values()].filter(endpoints => endpoints.length > 1);
+  const nets = plan.nets.filter(net => net.subsystemIds.includes(subsystemId)).map((net, index) => ({ id: net.id, endpoints: localNets[index] ?? [] }));
+  return { subsystemId, placements, nets };
+}
+
+function sketchesFromEnvelope(envelope: FixtureEnvelope, plan: FixturePlan) {
+  return structuredFixturePrograms(envelope, plan);
+}
+
+const testProviderFetch: typeof fetch = async (input, init) => {
+  if (!providerMock || !init?.body) throw new Error("No test provider response was configured");
+  const request: unknown = JSON.parse(String(init.body));
+  if (!isRecord(request)) throw new Error("Malformed mocked provider request");
+  const generationConfig = isRecord(request.generationConfig) ? request.generationConfig : {};
+  const responseSchema = isRecord(generationConfig.responseJsonSchema) ? generationConfig.responseJsonSchema : {};
+  const schema = isRecord(responseSchema.properties) ? responseSchema.properties : {};
+  const contents = Array.isArray(request.contents) ? request.contents : [];
+  const firstContent = isRecord(contents[0]) ? contents[0] : {};
+  const parts = Array.isArray(firstContent.parts) ? firstContent.parts : [];
+  const firstPart = isRecord(parts[0]) ? parts[0] : {};
+  const contentText = typeof firstPart.text === "string" ? firstPart.text : "{}";
+  let content: Record<string, unknown> = {};
+  try { const parsed: unknown = JSON.parse(contentText); if (isRecord(parsed)) content = parsed; } catch { /* Chat requests contain plain text. */ }
+  const repairing = Array.isArray(content.validationIssues) && content.validationIssues.length > 0;
+  if (schema.projectId) {
+    stagedSeed = undefined;
+    const response = await providerMock(input, init);
+    const envelope = await responseEnvelope(response);
+    if (!envelope) return response;
+    const plan = planFromEnvelope(envelope);
+    if (plan) {
+      stagedSeed = { envelope, plan, response };
+      return modelResponse(JSON.stringify(plan));
+    }
+    return response;
+  }
+  if (schema.project && content.recoveryMode === "whole-project-correction" && stagedSeed) {
+    const response = await providerMock(input, init);
+    const projectSchema = isRecord(schema.project) ? schema.project : {};
+    const projectProperties = isRecord(projectSchema.properties) ? projectSchema.properties : {};
+    if (Object.hasOwn(projectProperties, "code")) return response;
+    const envelope = await responseEnvelope(response);
+    if (envelope) stagedSeed.envelope = envelope;
+    return envelope ? modelResponse(JSON.stringify(structuredFixtureResponse(envelope, stagedSeed.plan))) : response;
+  }
+  if (schema.project && content.recoveryMode === "whole-project" && stagedSeed) {
+    const response = await providerMock(input, init);
+    const projectSchema = isRecord(schema.project) ? schema.project : {};
+    const projectProperties = isRecord(projectSchema.properties) ? projectSchema.properties : {};
+    // Sketch-only recovery asks for source code while retaining the already
+    // validated topology. Do not reshape that compact response as a new plan.
+    if (Object.hasOwn(projectProperties, "code")) return response;
+    const envelope = await responseEnvelope(response);
+    if (envelope) stagedSeed.envelope = envelope;
+    return envelope ? modelResponse(JSON.stringify(structuredFixtureResponse(envelope, stagedSeed.plan))) : response;
+  }
+  if (schema.project && stagedSeed?.response) {
+    const response = stagedSeed.response;
+    stagedSeed.response = undefined;
+    const envelope = await responseEnvelope(response);
+    return envelope ? modelResponse(JSON.stringify(structuredFixtureResponse(envelope, stagedSeed.plan))) : response;
+  }
+  if (schema.project && stagedSeed) {
+    const response = await providerMock(input, init);
+    const envelope = await responseEnvelope(response);
+    if (envelope) stagedSeed.envelope = envelope;
+    return envelope ? modelResponse(JSON.stringify(structuredFixtureResponse(envelope, stagedSeed.plan))) : response;
+  }
+  if (schema.subsystemId && stagedSeed) {
+    const subsystem = isRecord(content.subsystem) ? content.subsystem : {};
+    const subsystemId = typeof subsystem.id === "string" ? subsystem.id : stagedSeed.plan.subsystems[0].id;
+    if (repairing) {
+      const response = await providerMock(input, init);
+      const candidate = await responseEnvelope(response);
+      if (candidate) stagedSeed.envelope = candidate;
+      const fragment = fragmentFromEnvelope(candidate ?? stagedSeed.envelope, stagedSeed.plan, subsystemId);
+      if (fragment) return modelResponse(JSON.stringify(fragment));
+      return response;
+    }
+    return modelResponse(JSON.stringify(fragmentFromEnvelope(stagedSeed.envelope, stagedSeed.plan, subsystemId)));
+  }
+  if (schema.programs && stagedSeed) {
+    if (repairing) {
+      const response = await providerMock(input, init);
+      const candidate = await responseEnvelope(response);
+      if (candidate) stagedSeed.envelope = candidate;
+      const bundle = sketchesFromEnvelope(candidate ?? stagedSeed.envelope, stagedSeed.plan);
+      if (bundle) return modelResponse(JSON.stringify(bundle));
+      return response;
+    }
+    return modelResponse(JSON.stringify(sketchesFromEnvelope(stagedSeed.envelope, stagedSeed.plan)));
+  }
+  return providerMock(input, init);
+};
+
+Object.defineProperty(globalThis, "fetch", {
+  configurable: true,
+  enumerable: fetchDescriptor?.enumerable ?? true,
+  get: () => testProviderFetch,
+  set: value => {
+    if (value === testProviderFetch) { providerMock = undefined; stagedSeed = undefined; }
+    else { providerMock = value as typeof fetch; stagedSeed = undefined; }
+  },
+});
+after(() => { if (fetchDescriptor) Object.defineProperty(globalThis, "fetch", fetchDescriptor); });
+
+test("published runnable examples pass the generation endpoint without repair", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const originalWarn = console.warn;
+  context.after(() => {
+    globalThis.fetch = originalFetch; console.warn = originalWarn;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  console.warn = () => {};
+  for (const [id, make] of Object.entries({ ...COMPONENT_EXAMPLES, greenhouse: greenhouseExample })) await context.test(id, async () => {
+    const project = make(); let calls = 0; let feedback = "";
+    globalThis.fetch = async (_input, init) => {
+      calls++;
+      const request = JSON.parse(String(init?.body));
+      const content = JSON.parse(request.contents[0].parts[0].text);
+      if (id === "greenhouse") {
+        const schema = request.generationConfig.responseJsonSchema.properties;
+        assert.ok(schema.projectId);
+        assert.ok(schema.components);
+      }
+      if (content.validationIssues) feedback = JSON.stringify(content.validationIssues);
+      return modelResponse(JSON.stringify({ project, explanation: "Runnable circuit", assumptions: [], warnings: [] }));
+    };
+    const response = await POST(new Request("http://localhost/api/ai/generate", {
+      method: "POST", body: JSON.stringify({ prompt: id === "greenhouse" ? greenhousePrompt : `Create a circuit using ${[...new Set(project.components.map(c => c.type))].join(", ")}` }),
+    }));
+    const responseBody = await response.json();
+    assert.equal(response.status, 200, `${id}: ${feedback} ${JSON.stringify(responseBody.error ?? responseBody)}`);
+    assert.equal(calls, 1, `${id} should not require repairs: ${feedback}`);
+  });
+});
+
+test("staged generation sends an unsupported TCA9548A selector back to Gemini for repair", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = greenhouseExample();
+  const repairedProject = greenhouseExample();
+  repairedProject.code = repairedProject.code.replace("void loop(){", 'void loop(){ Serial.println("selectMuxChannel is just text");');
+  project.code = project.code
+    .replaceAll(".selectChannel(", ".selectMuxChannel(")
+    .replace("void loop(){", '/* mux.selectMuxChannel(7) in a comment */\nvoid loop(){\n  Serial.println("selectMuxChannel is just text");');
+  let providerCalls = 0;
+  let sketchInstructions = "";
+  globalThis.fetch = async (_input, init) => {
+    providerCalls += 1;
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    sketchInstructions = request.systemInstruction?.parts?.[0]?.text ?? sketchInstructions;
+    const candidate = Array.isArray(content.validationIssues) ? repairedProject : project;
+    return modelResponse(JSON.stringify({ project: candidate, explanation: "Reads both greenhouse zones and safely controls its fan.", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompt: greenhousePrompt }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(providerCalls, 2, "the invalid sketch must be sent to Gemini for a targeted repair");
+  assert.match(sketchInstructions, /mux\.selectChannel\(channel\)/);
+  assert.match(body.project.code, /mux\.selectChannel\(/);
+  assert.doesNotMatch(body.project.code, /\n\s*mux\.selectMuxChannel\(/);
+  assert.match(body.project.code, /Serial\.println\("selectMuxChannel is just text"\)/);
+  assert.equal(body.warnings.some((warning: string) => warning.includes("server corrected") || warning.includes("selectMuxChannel()")), false);
+});
+
+test("staged greenhouse generation repairs a TB6612 duplicate output pad before publication", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const malformedProject = greenhouseExample();
+  const negativeLead = malformedProject.connections.find(connection =>
+    [connection.from, connection.to].some(endpoint => endpoint.componentId === "fan-motor-a" && endpoint.pin === "-"));
+  assert.ok(negativeLead);
+  const motorLabel = malformedProject.components.find(component => component.id === "fan-motor-a")?.label;
+  assert.ok(motorLabel);
+  const mistakenPad = negativeLead.from.componentId === "fan-device" ? negativeLead.from : negativeLead.to;
+  assert.equal(mistakenPad.pin, "AO2_5");
+  mistakenPad.pin = "AO1_2";
+  let providerCalls = 0;
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return modelResponse(JSON.stringify({ project: malformedProject, explanation: "Dual-zone greenhouse fan controller.", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", body: JSON.stringify({ prompt: greenhousePrompt }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(providerCalls, 1, "the assembled staged project should be corrected before it needs an AI repair");
+  assert.ok(body.project.connections.some((connection: FixtureWire) =>
+    [connection.from, connection.to].some(endpoint => endpoint.componentId === "fan-device" && endpoint.pin === "AO2_5")
+      && [connection.from, connection.to].some(endpoint => endpoint.componentId === "fan-motor-a" && endpoint.pin === "-")));
+  assert.ok(body.assumptions.some((assumption: string) => assumption.includes(`Corrected ${motorLabel} wiring across TB6612FNG channel A`)));
+  const simulator = new ArduinoSimulator(body.project.code);
+  simulator.attachProject(body.project);
+  simulator.run();
+  simulator.advance(100);
+  const fanState = simulator.getSnapshot().componentStates["fan-motor-a"];
+  assert.equal(fanState.direction, "forward");
+  assert.ok(Math.abs((fanState.speed ?? 0) - 191 / 255) < 0.001);
+  assert.ok((simulator.getSnapshot().componentStates["fan-supply"].readings?.current ?? 0) > 0.14);
+});
+
+test("normalizes schematic-style D pin names in generated Arduino code", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = structuredClone(generatedEnvelope.project);
+  project.code = `// D12 in a comment stays text\n#define LED_PIN D13\nvoid setup(){ pinMode(LED_PIN, OUTPUT); }\nvoid loop(){ digitalWrite(LED_PIN, HIGH); Serial.println("D11 stays text"); delay(10); }`;
+  globalThis.fetch = async () => modelResponse(JSON.stringify({ project, explanation: "Blink circuit", assumptions: [], warnings: [] }));
+
+  const response = await POST(generationRequest());
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.match(body.project.code, /LED_PIN\s*=\s*13/);
+  assert.match(body.project.code, /Serial\.println\("D11 stays text"\)/);
+});
+
+test("generation repairs a button debounce sketch that never changes the circuit", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = createDefaultBlinkProject();
+  project.name = "Button controlled LED";
+  project.components.push({ id: "button", type: "push-button", label: "Button", x: 420, y: 360 });
+  project.connections.push(
+    { id: "button-input", from: { componentId: "button", pin: "1" }, to: { componentId: "uno", pin: "D2" } },
+    { id: "button-ground", from: { componentId: "button", pin: "2" }, to: { componentId: "uno", pin: "GND" } },
+  );
+  const broken = structuredClone(project);
+  broken.code = `bool lastButtonState = HIGH; unsigned long lastDebounceTime = 0; unsigned long debounceDelay = 50;
+void setup(){ pinMode(13, OUTPUT); pinMode(2, INPUT_PULLUP); }
+void loop(){ int reading = digitalRead(2); if (reading != lastButtonState) lastDebounceTime = millis(); if ((millis() - lastDebounceTime) > debounceDelay) { if (reading == LOW && lastButtonState == HIGH) digitalWrite(13, HIGH); } lastButtonState = reading; delay(10); }`;
+  const repaired = structuredClone(project);
+  repaired.code = `int lastButtonState = HIGH; bool ledOn = false;
+void setup(){ pinMode(13, OUTPUT); pinMode(2, INPUT_PULLUP); }
+void loop(){ int reading = digitalRead(2); if (reading == LOW && lastButtonState == HIGH) { ledOn = true; } lastButtonState = reading; digitalWrite(13, ledOn ? HIGH : LOW); delay(10); }`;
+  let calls = 0;
+  let repairIssues: string[] = [];
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    repairIssues = content.validationIssues ?? [];
+    return modelResponse(JSON.stringify({ project: content.validationIssues ? repaired : broken, explanation: "Button controlled LED", warnings: [], assumptions: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: "The pushbutton toggles the LED each time it is pressed." }),
+  }));
+  assert.equal(response.status, 200, JSON.stringify(repairIssues));
+  assert.equal(calls, 2);
+  assert.ok(repairIssues.some(issue => issue.includes("button behavior") && issue.includes("no observable circuit change")));
+});
+
+test("generation repairs a button-controlled edit when Gemini omits the button wires", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+
+  const broken = createDefaultBlinkProject();
+  broken.name = "Button controlled LED";
+  broken.components.push({ id: "button", type: "push-button", label: "Target Button", x: 420, y: 360 });
+  broken.code = `void setup(){ pinMode(9, OUTPUT); pinMode(2, INPUT_PULLUP); }
+void loop(){ int btnState = digitalRead(2); if (btnState == LOW) { digitalWrite(9, LOW); } else { digitalWrite(9, HIGH); delay(500); digitalWrite(9, LOW); delay(500); } }`;
+
+  const repaired = structuredClone(broken);
+  repaired.connections.push(
+    { id: "button-input", from: { componentId: "button", pin: "1" }, to: { componentId: "uno", pin: "D2" } },
+    { id: "button-ground", from: { componentId: "button", pin: "2" }, to: { componentId: "uno", pin: "GND" } },
+  );
+  let calls = 0;
+  let repairIssues: string[] = [];
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    repairIssues = content.validationIssues ?? [];
+    return modelResponse(JSON.stringify({
+      project: Array.isArray(content.validationIssues) ? repaired : broken,
+      explanation: "The button controls whether the LED blinks.",
+      warnings: [],
+      assumptions: [],
+    }));
+  };
+
+  const prompt = "Edit the current circuit. Keep its Arduino Uno, red LED, 220 ohm resistor, D9 wiring, and blink behavior. Add one push button between D2 and GND using INPUT_PULLUP. When the button is pressed, keep the LED off; when released, blink it every 500 milliseconds.";
+  const response = await POST(requestWithCurrentProject(prompt));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(repairIssues));
+  assert.equal(calls, 2, "the missing input connection should trigger one targeted repair");
+  assert.ok(repairIssues.some(issue => issue.includes("button behavior") && issue.includes("no observable circuit change")));
+  assert.equal(body.project.connections.filter((connection: FixtureWire) => [connection.from, connection.to].some(endpoint => endpoint.componentId === "button")).length, 2);
+});
+
+test("generation repairs an LED circuit that directly shorts its anode and cathode", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+
+  const shorted = structuredClone(createDefaultBlinkProject());
+  shorted.code = `void setup() { pinMode(13, OUTPUT); }
+void loop() {
+  digitalWrite(13, HIGH);
+  delay(500);
+  digitalWrite(13, LOW);
+  delay(500);
+}`;
+  shorted.connections.push({
+    id: "led-short",
+    from: { componentId: "led1", pin: "K" },
+    to: { componentId: "led1", pin: "A" },
+  });
+  const corrected = structuredClone(createDefaultBlinkProject());
+  let calls = 0;
+  let repairIssues: string[] = [];
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    repairIssues = content.validationIssues ?? [];
+    return modelResponse(JSON.stringify({
+      project: Array.isArray(content.validationIssues) ? corrected : shorted,
+      explanation: "The Uno blinks the LED through its resistor.",
+      assumptions: [],
+      warnings: [],
+    }));
+  };
+
+  const response = await POST(generationRequest());
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(calls, 2, "the shorted first proposal must receive a targeted repair");
+  assert.ok(repairIssues.some(issue => issue.includes("output-contention")), JSON.stringify(repairIssues));
+  assert.equal(body.project.connections.some((connection: FixtureWire) =>
+    [connection.from, connection.to].some(endpoint => endpoint.componentId === "led1" && endpoint.pin === "K")
+      && [connection.from, connection.to].some(endpoint => endpoint.componentId === "led1" && endpoint.pin === "A")), false);
+
+  const simulator = new ArduinoSimulator();
+  simulator.attachProject(body.project);
+  simulator.run();
+  for (let elapsed = 0; elapsed < 2_000; elapsed += 100) simulator.advance(100);
+  assert.equal(simulator.getSnapshot().diagnostics.some(diagnostic => diagnostic.severity === "error"), false);
+});
+
+test("generation checks the integrated KY-040 switch rather than counting its state as the action", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = structuredClone(COMPONENT_EXAMPLES["ky-040"]());
+  const broken = structuredClone(project);
+  broken.code = `bool lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50;
+void setup(){
+  pinMode(4, INPUT_PULLUP);
+  pinMode(13, OUTPUT);
+}
+void loop(){
+  int reading = digitalRead(4);
+  if (reading != lastButtonState) lastDebounceTime = millis();
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (reading == LOW && lastButtonState == HIGH) digitalWrite(13, HIGH);
+  }
+  lastButtonState = reading;
+  delay(10);
+}`;
+  const repaired = structuredClone(project);
+  repaired.code = `int lastButtonState = HIGH;
+bool outputOn = false;
+void setup(){
+  pinMode(4, INPUT_PULLUP);
+  pinMode(13, OUTPUT);
+}
+void loop(){
+  int reading = digitalRead(4);
+  if (reading == LOW && lastButtonState == HIGH) outputOn = !outputOn;
+  lastButtonState = reading;
+  digitalWrite(13, outputOn ? HIGH : LOW);
+  delay(10);
+}`;
+  let calls = 0;
+  let repairIssues: string[] = [];
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    repairIssues = content.validationIssues ?? [];
+    return modelResponse(JSON.stringify({ project: content.validationIssues ? repaired : broken, explanation: "Encoder button controls output", warnings: [], assumptions: [] }));
+  };
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: "Press the KY-040 encoder push switch to toggle the output." }),
+  }));
+  assert.equal(response.status, 200, JSON.stringify(repairIssues));
+  assert.equal(calls, 2);
+  assert.ok(repairIssues.some(issue => issue.includes("button behavior") && issue.includes("no observable circuit change")));
+});
+
+test("generation repairs a rotary sketch that prints encoder position without changing the requested strip output", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+
+  const project = structuredClone(COMPONENT_EXAMPLES["ky-040"]());
+  project.components.push(
+    { id: "temperature", type: "temperature-sensor", label: "Temperature", x: 650, y: 200, properties: { temperatureC: 40 } },
+    { id: "strip", type: "ws2812b-strip-8", label: "WS2812B", x: 900, y: 0 },
+    { id: "supply", type: "dc-supply", label: "5V strip supply", x: 650, y: 400, properties: { voltage: 5, enabled: true } },
+  );
+  project.connections.push(
+    { id: "temperature-vcc", from: { componentId: "temperature", pin: "VCC" }, to: { componentId: "uno", pin: "5V" } },
+    { id: "temperature-ground", from: { componentId: "temperature", pin: "GND" }, to: { componentId: "uno", pin: "GND" } },
+    { id: "temperature-out", from: { componentId: "temperature", pin: "OUT" }, to: { componentId: "uno", pin: "A0" } },
+    { id: "strip-vdd", from: { componentId: "strip", pin: "VDD" }, to: { componentId: "supply", pin: "+" } },
+    { id: "strip-ground", from: { componentId: "strip", pin: "GND" }, to: { componentId: "uno", pin: "GND" } },
+    { id: "strip-data", from: { componentId: "strip", pin: "DIN" }, to: { componentId: "uno", pin: "D6" } },
+    { id: "supply-ground", from: { componentId: "supply", pin: "-" }, to: { componentId: "uno", pin: "GND" } },
+  );
+  project.components = project.components.map(component => component.id === "device"
+    ? { ...component, properties: { ...component.properties, position: 0, pressed: false } }
+    : component);
+  const broken = structuredClone(project);
+  broken.code = `#include <Encoder.h>\n#include <Adafruit_NeoPixel.h>\nEncoder knob(2,3); Adafruit_NeoPixel strip(8,6,NEO_GRB + NEO_KHZ800);\nvoid setup(){ strip.begin(); }\nvoid loop(){ int temperature=analogRead(A0); int position=knob.read(); uint32_t color=strip.Color(0,255,0); for(int i=0;i<8;i++) strip.setPixelColor(i,color); strip.show(); Serial.println(position); delay(20); }`;
+  const repaired = structuredClone(project);
+  repaired.code = `#include <Encoder.h>\n#include <Adafruit_NeoPixel.h>\nEncoder knob(2,3); Adafruit_NeoPixel strip(8,6,NEO_GRB + NEO_KHZ800);\nvoid setup(){ strip.begin(); }\nvoid loop(){ int temperature=analogRead(A0); int position=constrain(knob.read(),0,15); int threshold=map(position,0,15,20,35); int thresholdAdc=map(threshold,20,35,143,174); uint32_t color=strip.Color(0,255,0); if(temperature>thresholdAdc) color=strip.Color(255,0,0); for(int i=0;i<8;i++) strip.setPixelColor(i,color); strip.show(); Serial.println(threshold); delay(20); }`;
+
+  let calls = 0;
+  let repairIssues: string[] = [];
+  let sketchInstructions = "";
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    sketchInstructions = request.systemInstruction?.parts?.[0]?.text ?? sketchInstructions;
+    repairIssues = content.validationIssues ?? [];
+    return modelResponse(JSON.stringify({
+      project: content.validationIssues ? repaired : broken,
+      explanation: "The encoder selects the WS2812B strip color.",
+      assumptions: [], warnings: [],
+    }));
+  };
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: "Create an Arduino Uno circuit with an analog temperature sensor, KY-040 encoder, WS2812B strip, and 5V DC supply. The encoder changes the temperature threshold from 20°C to 35°C as it is turned; show the strip red when the temperature is above the selected threshold and green otherwise. Print the selected threshold." }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(calls, 2, "an encoder sketch that only reports position must receive a targeted repair");
+  assert.ok(repairIssues.some(issue => issue.includes("encoder behavior") && issue.includes("does not change the requested circuit output")), JSON.stringify(repairIssues));
+  assert.match(sketchInstructions, /map and constrain the encoder position/i);
+
+  for (const position of [0, 15]) {
+    const scenario = structuredClone(body.project);
+    const encoder = scenario.components.find((component: { type: string }) => component.type === "ky-040");
+    encoder.properties = { ...encoder.properties, position };
+    const temperature = scenario.components.find((component: { type: string }) => component.type === "temperature-sensor");
+    temperature.properties = { ...temperature.properties, temperatureC: 27.5 };
+    const simulator = new ArduinoSimulator(scenario.code);
+    simulator.attachProject(scenario);
+    simulator.run(); simulator.advance(0); simulator.advance(100);
+    const pixel = simulator.getSnapshot().componentStates.strip?.pixels?.[0];
+    assert.deepEqual([pixel?.r, pixel?.g], position === 0 ? [255, 0] : [0, 255]);
+  }
+});
+
+test("a fresh single-board request ignores boards in the previous project", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const previousProject = structuredClone(generatedEnvelope.project);
+  previousProject.components.push({ id: "old-mega", type: "arduino-mega-2560", label: "Old Mega", x: 400, y: 0 });
+  previousProject.programs = { uno: previousProject.code, "old-mega": "void setup(){} void loop(){ delay(10); }" };
+  let multipleBoardRuleSelected = false;
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    multipleBoardRuleSelected = request.systemInstruction.parts[0].text.includes("The user explicitly requested multiple boards.");
+    return modelResponse(JSON.stringify({ project: generatedEnvelope.project, explanation: "Fresh Uno circuit", warnings: [], assumptions: [] }));
+  };
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: "Create a fresh single-board Uno circuit that blinks an LED.", currentProject: previousProject }),
+  }));
+  assert.equal(response.status, 200);
+  assert.equal(multipleBoardRuleSelected, false, "the old multi-board canvas must not change a fresh-generation request into a multi-board request");
+  const body = await response.json();
+  assert.equal(body.project.components.filter((component: { type: string }) => component.type.startsWith("arduino-")).length, 1);
+});
+
+test("greenhouse mux, expander and externally supplied fan respond to live conditions", () => {
+  const project = greenhouseExample();
+  const sim = new ArduinoSimulator(project.code); sim.attachProject(project); sim.run(); sim.advance(100);
+  assert.deepEqual(sim.getSnapshot().diagnostics.filter(d => d.severity === "error"), []);
+  const states = sim.getSnapshot().componentStates;
+  assert.equal(states["fan-motor-a"].direction, "forward");
+  assert.ok(Math.abs(states["fan-motor-a"].speed! - 191 / 255) < 0.001);
+  assert.ok(Math.abs((states["fan-supply"].readings?.current ?? 0) - 0.2 * (191 / 255)) < 0.002, JSON.stringify(states["fan-supply"]));
+  for (const id of ["io-led", "led-1", "led-2"]) assert.equal(states[id].powered, true);
+  project.components.find(c => c.id === "sensor")!.properties!.temperature = 24;
+  project.components.find(c => c.id === "east")!.properties!.temperature = 26;
+  sim.attachProject(project); sim.advance(500);
+  assert.equal(sim.getSnapshot().componentStates["fan-motor-a"].speed, 0);
+  assert.equal(sim.getSnapshot().componentStates["fan-supply"].readings?.current, 0);
+  project.components.find(c => c.id === "sensor")!.properties!.temperature = 34;
+  sim.attachProject(project); sim.advance(500);
+  assert.ok(sim.getSnapshot().componentStates["fan-motor-a"].speed! > 0);
+  assert.ok((sim.getSnapshot().componentStates["fan-supply"].readings?.current ?? 0) > 0.14);
+  project.components.find(c => c.id === "fan-supply")!.properties!.enabled = false;
+  sim.attachProject(project); sim.advance(500);
+  assert.equal(sim.getSnapshot().componentStates["fan-motor-a"].direction, "coast");
+  assert.equal(sim.getSnapshot().componentStates["fan-supply"].readings?.current, 0);
+  project.components.find(c => c.id === "fan-supply")!.properties!.enabled = true;
+  project.connections = project.connections.filter(w => !(w.from.componentId === "fan-supply" && w.from.pin === "-"));
+  sim.attachProject(project); sim.advance(500);
+  assert.equal(sim.getSnapshot().componentStates["fan-motor-a"].direction, "coast");
+  project.connections.push({ id: "restore-return", from: { componentId: "fan-supply", pin: "-" }, to: { componentId: "uno", pin: "GND" } });
+  project.connections = project.connections.filter(w => !(w.from.componentId === "sensor" && w.from.pin === "SDI"));
+  sim.attachProject(project); sim.advance(500);
+  assert.equal(sim.getSnapshot().componentStates["fan-motor-a"].speed, 0);
+  assert.ok(sim.getSnapshot().serial.some(entry => entry.text === "Sensor unavailable"));
+});
+
+test("generation repairs missing mixed-board OLED bus wires only to its explicitly named ESP32", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = COMPONENT_EXAMPLES["ssd1306-oled-128x64"]();
+  const board = project.components.find(component => component.id === "uno")!;
+  board.id = "esp"; board.type = "esp32-devkitc-v4"; board.label = "ESP32 DevKitC V4";
+  project.board = "esp32-devkitc-v4"; project.activeBoardId = "esp";
+  project.components.push({ id: "pico", type: "raspberry-pi-pico", label: "Raspberry Pi Pico", x: 900, y: 0, properties: {} });
+  for (const connection of project.connections) for (const endpoint of [connection.from, connection.to]) {
+    if (endpoint.componentId === "uno") {
+      endpoint.componentId = "esp";
+      if (endpoint.pin === "A4") endpoint.pin = "GPIO21";
+      else if (endpoint.pin === "A5") endpoint.pin = "GPIO22";
+    }
+  }
+  const oledId = project.components.find(component => component.type === "ssd1306-oled-128x64")!.id;
+  project.connections = project.connections.filter(connection => ![connection.from, connection.to].some(endpoint =>
+    endpoint.componentId === oledId && ["SDA", "SCL"].includes(endpoint.pin))
+    || ![connection.from, connection.to].some(endpoint => endpoint.componentId === "esp" && ["GPIO21", "GPIO22"].includes(endpoint.pin)));
+  const espSketch = project.code;
+  const picoSketch = `void setup(){ pinMode(25, OUTPUT); Serial.begin(9600); }\nvoid loop(){ digitalWrite(25,HIGH); Serial.println("Pico alive"); delay(500); digitalWrite(25,LOW); delay(500); }`;
+  project.programs = { esp: espSketch, pico: picoSketch };
+  project.code = espSketch;
+  project.connections.push({ id: "shared-ground", from: { componentId: "esp", pin: "GND" }, to: { componentId: "pico", pin: "GND" } });
+  globalThis.fetch = async () => modelResponse(JSON.stringify({ project, explanation: "OLED attached to ESP32 while the Pico runs independently", warnings: [], assumptions: [] }));
+
+  const prompt = "Create exactly one ESP32 DevKitC V4, one Raspberry Pi Pico and one SSD1306 OLED. Connect the OLED only to ESP32 GPIO21 SDA, GPIO22 SCL, 3V3 and ground. Have ESP32 display PICO READY while the Pico independently blinks GP25. Share grounds; do not join board power rails.";
+  const response = await POST(new Request("http://localhost/api/ai/generate", { method: "POST", body: JSON.stringify({ prompt }) }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body.error));
+  assert.ok(body.project.connections.some((wire: FixtureWire) => [wire.from, wire.to].some(endpoint => endpoint.componentId === oledId && endpoint.pin === "SDA")
+    && [wire.from, wire.to].some(endpoint => endpoint.componentId === "esp" && endpoint.pin === "GPIO21")));
+  assert.ok(body.project.connections.some((wire: FixtureWire) => [wire.from, wire.to].some(endpoint => endpoint.componentId === oledId && endpoint.pin === "SCL")
+    && [wire.from, wire.to].some(endpoint => endpoint.componentId === "esp" && endpoint.pin === "GPIO22")));
+  const simulator = new MultiBoardSimulator(); simulator.attachProject(body.project); simulator.run();
+  for (let time = 0; time < 700; time += 16.67) simulator.advance(16.67);
+  const snapshot = simulator.getSnapshot();
+  assert.deepEqual(snapshot.diagnostics.filter(diagnostic => diagnostic.severity === "error"), []);
+  assert.match(snapshot.componentStates[oledId]?.display?.[0] ?? "", /Cirkitra ready/);
+  assert.ok(snapshot.boardSerial?.pico?.some(entry => entry.text === "Pico alive"));
+});
+
+test("generation restores floating reset, I2C-mode, and default-address straps before simulation", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = greenhouseExample();
+  const floatingPins = new Map<string, Set<string>>([
+    ["device", new Set(["RESET", "A0", "A1", "A2"])],
+    ["io-device", new Set(["RESET", "A0", "A1", "A2"])],
+    ["sensor", new Set(["CSB", "SDO"])],
+    ["east", new Set(["CSB", "SDO"])],
+  ]);
+  project.connections = project.connections.filter(connection => ![connection.from, connection.to].some(endpoint => floatingPins.get(endpoint.componentId)?.has(endpoint.pin)));
+  const originalConnectionCount = project.connections.length;
+  globalThis.fetch = async () => modelResponse(JSON.stringify({ project, explanation: "Two-zone greenhouse controller", warnings: [], assumptions: [] }));
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", { method: "POST", body: JSON.stringify({ prompt: greenhousePrompt }) }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body.error));
+  assert.ok(body.project.connections.length > originalConnectionCount);
+  assert.ok(body.assumptions.some((assumption: string) => /TCA9548A.*RESET/.test(assumption)));
+  assert.ok(body.assumptions.some((assumption: string) => /MCP23017.*RESET/.test(assumption)));
+  assert.ok(body.assumptions.some((assumption: string) => /CSB/.test(assumption)));
+  const simulator = new ArduinoSimulator(body.project.code);
+  simulator.attachProject(body.project);
+  simulator.run(); simulator.advance(1_000);
+  const snapshot = simulator.getSnapshot();
+  assert.deepEqual(snapshot.diagnostics.filter(diagnostic => diagnostic.severity === "error"), []);
+  assert.equal(snapshot.componentStates.sensor?.readings?.temperature, body.project.components.find((component: FixtureComponent) => component.id === "sensor")?.properties?.temperature);
+  assert.equal(snapshot.componentStates.east?.readings?.temperature, body.project.components.find((component: FixtureComponent) => component.id === "east")?.properties?.temperature);
+});
+
+test("generation deterministically aligns MCP23017 LED branches with their code outputs", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+
+  const repaired = greenhouseExample();
+  const mismatched = structuredClone(repaired);
+  repaired.code = repaired.code
+    .replaceAll("io.pinMode(0,", "io.pinMode(8,")
+    .replaceAll("io.pinMode(1,", "io.pinMode(9,")
+    .replaceAll("io.pinMode(2,", "io.pinMode(10,")
+    .replaceAll("io.digitalWrite(0,", "io.digitalWrite(8,")
+    .replaceAll("io.digitalWrite(1,", "io.digitalWrite(9,")
+    .replaceAll("io.digitalWrite(2,", "io.digitalWrite(10,");
+  for (const connection of mismatched.connections) {
+    for (const endpoint of [connection.from, connection.to]) {
+      if (endpoint.componentId === "io-device" && /^GPA[0-2]$/.test(endpoint.pin)) {
+        endpoint.pin = endpoint.pin.replace("GPA", "GPB");
+      }
+    }
+  }
+  let repairFeedback = "";
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    const input = JSON.parse(request.contents[0].parts[0].text);
+    if (Array.isArray(input.validationIssues)) repairFeedback = input.validationIssues.join("\n");
+    const project = input.validationIssues?.length ? repaired : mismatched;
+    return modelResponse(JSON.stringify({ project, explanation: "Greenhouse controller", warnings: [], assumptions: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: greenhousePrompt }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body.error));
+  assert.equal(repairFeedback, "", "the explicitly mapped three-indicator request can repair this mismatch without another model call");
+  for (let index = 0; index < 3; index += 1) {
+    const resistorId = index === 0 ? "io-resistor-led" : `res-${index}`;
+    assert.ok(body.project.connections.some((connection: FixtureWire) =>
+      [connection.from, connection.to].some(endpoint => endpoint.componentId === "io-device" && endpoint.pin === `GPA${index}`)
+      && [connection.from, connection.to].some(endpoint => endpoint.componentId === resistorId && endpoint.pin === "1")), `LED output ${index} must match its programmed GPA pin`);
+  }
+
+  const simulator = new ArduinoSimulator(body.project.code);
+  simulator.attachProject(body.project);
+  simulator.run();
+  simulator.advance(1_000);
+  const snapshot = simulator.getSnapshot();
+  assert.deepEqual(snapshot.diagnostics.filter(diagnostic => diagnostic.severity === "error"), []);
+  for (const id of ["io-led", "led-1", "led-2"]) assert.equal(snapshot.componentStates[id]?.powered, true, id);
+});
+
+test("staged generation rejects a no-op Gemini sketch repair without returning a partial project", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const invalid = greenhouseExample();
+  invalid.code = invalid.code.replaceAll(".selectChannel(", ".selectMuxChannel(");
+  let repairRequests = 0;
+  let wholeProjectRecoveryRequests = 0;
+  let wholeProjectCorrectionRequests = 0;
+  let recoveryContent: Record<string, unknown> | undefined;
+  let correctionContent: Record<string, unknown> | undefined;
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    if (content.recoveryMode === "whole-project") {
+      wholeProjectRecoveryRequests += 1;
+      recoveryContent = content;
+    } else if (content.recoveryMode === "whole-project-correction") {
+      wholeProjectCorrectionRequests += 1;
+      correctionContent = content;
+    } else if (Array.isArray(content.validationIssues)) repairRequests += 1;
+    return modelResponse(JSON.stringify({ project: invalid, explanation: "Greenhouse controller", assumptions: [], warnings: [] }));
+  };
+  const response = await POST(new Request("http://localhost/api/ai/generate", { method: "POST", body: JSON.stringify({ prompt: greenhousePrompt }) }));
+  const body = await response.json();
+  assert.equal(response.status, 502);
+  assert.equal(body.error.code, "AI_WHOLE_PROJECT_RECOVERY_FAILED");
+  assert.ok(repairRequests >= 2, "Gemini receives both bounded targeted repair opportunities");
+  assert.equal(wholeProjectRecoveryRequests, 1, "one complete-circuit recovery follows failed targeted repair");
+  assert.equal(wholeProjectCorrectionRequests, 2, "a failed source recovery gets one bounded validation-guided retry inside that recovery");
+  assert.equal(recoveryContent?.request, greenhousePrompt, "recovery keeps the original prompt");
+  assert.ok(isRecord(recoveryContent?.failedCandidate) && isRecord(recoveryContent.failedCandidate.project), "recovery receives the complete assembled candidate");
+  assert.ok(Array.isArray(recoveryContent?.validationIssues) && recoveryContent.validationIssues.some(issue => String(issue).includes("selectMuxChannel")));
+  assert.ok(Array.isArray(recoveryContent?.validationDiagnostics) && recoveryContent.validationDiagnostics.some(item => isRecord(item) && item.code === "UNSUPPORTED_CALL"));
+  assert.ok(isRecord(correctionContent?.failedCandidate) && isRecord(correctionContent.failedCandidate.project), "schema correction retains the complete candidate");
+  assert.ok(Array.isArray(correctionContent?.validationIssues) && correctionContent.validationIssues.some(issue => /selectMuxChannel|programs/.test(String(issue))), "schema correction receives the exact rejected-program details");
+  assert.ok(body.error.details.length > 0, "deduplicated validation diagnostics remain available for the UI details panel");
+  assert.equal(Object.hasOwn(body, "project"), false, "a failed repair must never return a partial project for the canvas");
+});
+
+test("cross-fragment GPIO collisions trigger complete topology recovery and never publish an invalid candidate", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  const previousWarn = console.warn;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    console.warn = previousWarn;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  console.warn = () => {};
+
+  const subsystemIds = ["sensors", "controls", "display", "alarm"];
+  const plan = {
+    projectId: "greenhouse_monitor",
+    name: "Greenhouse monitor",
+    description: "Measure soil and climate, show values, and sound an alarm.",
+    boards: [{ id: "uno", type: "arduino-uno", label: "Arduino Uno" }],
+    components: [
+      { id: "dht", type: "dht22", label: "DHT22", subsystemId: "sensors" },
+      { id: "soil", type: "soil-moisture-sen0193", label: "SEN0193", subsystemId: "sensors" },
+      { id: "dht_pullup", type: "resistor", label: "DHT data pull-up", subsystemId: "sensors" },
+      { id: "encoder", type: "ky-040", label: "KY-040", subsystemId: "controls" },
+      { id: "lcd", type: "lcd-16x2", label: "16x2 LCD", subsystemId: "display" },
+      { id: "pot", type: "potentiometer", label: "LCD contrast potentiometer", subsystemId: "display" },
+      { id: "buzzer", type: "buzzer", label: "Piezo buzzer", subsystemId: "alarm" },
+      { id: "led", type: "led", label: "Red alarm LED", subsystemId: "alarm" },
+      { id: "led_resistor", type: "resistor", label: "220 ohm LED series resistor", subsystemId: "alarm" },
+    ],
+    subsystems: subsystemIds.map(id => ({ id, name: id, goal: `Implement the ${id} part of the greenhouse monitor.` })),
+    nets: [
+      { id: "rail_5v", name: "5V logic rail", subsystemIds: ["sensors", "controls", "display"] },
+      { id: "ground", name: "Common ground return", subsystemIds },
+      { id: "dht_data", name: "DHT data", subsystemIds: ["sensors"] },
+      { id: "soil_output", name: "Soil analog output", subsystemIds: ["sensors"] },
+      { id: "encoder_clock", name: "Encoder CLK", subsystemIds: ["controls"] },
+      { id: "encoder_data", name: "Encoder DT", subsystemIds: ["controls"] },
+      { id: "encoder_switch", name: "Encoder SW", subsystemIds: ["controls"] },
+      { id: "lcd_rs", name: "LCD RS", subsystemIds: ["display"] },
+      { id: "lcd_enable", name: "LCD E", subsystemIds: ["display"] },
+      { id: "lcd_d4", name: "LCD D4", subsystemIds: ["display"] },
+      { id: "lcd_d5", name: "LCD D5", subsystemIds: ["display"] },
+      { id: "lcd_d6", name: "LCD D6", subsystemIds: ["display"] },
+      { id: "lcd_d7", name: "LCD D7", subsystemIds: ["display"] },
+      { id: "contrast", name: "LCD contrast control", subsystemIds: ["display"] },
+      { id: "buzzer_signal", name: "Buzzer signal", subsystemIds: ["alarm"] },
+      { id: "led_signal", name: "LED resistor input", subsystemIds: ["alarm"] },
+      { id: "led_anode", name: "LED anode", subsystemIds: ["alarm"] },
+    ],
+    estimatedNetTerminals: 31,
+    requirements: [{ id: "alarm", description: "Display readings and implement the dry-soil alarm." }],
+  };
+  const fragments: Record<string, unknown> = {
+    sensors: {
+      subsystemId: "sensors",
+      placements: ["dht", "soil", "dht_pullup"].map(id => ({ id, x: 0, y: 0 })),
+      nets: [
+        { id: "rail_5v", endpoints: [{ componentId: "uno", pin: "5V" }, { componentId: "dht", pin: "VDD" }, { componentId: "soil", pin: "VCC" }, { componentId: "dht_pullup", pin: "2" }] },
+        { id: "ground", endpoints: [{ componentId: "uno", pin: "GND" }, { componentId: "dht", pin: "GND" }, { componentId: "soil", pin: "GND" }] },
+        { id: "dht_data", endpoints: [{ componentId: "uno", pin: "D2" }, { componentId: "dht", pin: "DATA" }, { componentId: "dht_pullup", pin: "1" }] },
+        { id: "soil_output", endpoints: [{ componentId: "uno", pin: "A0" }, { componentId: "soil", pin: "AOUT" }] },
+      ],
+    },
+    controls: {
+      subsystemId: "controls",
+      placements: [{ id: "encoder", x: 0, y: 0 }],
+      nets: [
+        { id: "rail_5v", endpoints: [{ componentId: "uno", pin: "5V" }, { componentId: "encoder", pin: "VCC" }] },
+        { id: "ground", endpoints: [{ componentId: "uno", pin: "GND" }, { componentId: "encoder", pin: "GND" }] },
+        { id: "encoder_clock", endpoints: [{ componentId: "uno", pin: "D2" }, { componentId: "encoder", pin: "CLK" }] },
+        { id: "encoder_data", endpoints: [{ componentId: "uno", pin: "D3" }, { componentId: "encoder", pin: "DT" }] },
+        { id: "encoder_switch", endpoints: [{ componentId: "uno", pin: "D8" }, { componentId: "encoder", pin: "SW" }] },
+      ],
+    },
+    display: {
+      subsystemId: "display",
+      placements: [{ id: "lcd", x: 0, y: 0 }, { id: "pot", x: 0, y: 0 }],
+      nets: [
+        { id: "rail_5v", endpoints: [{ componentId: "uno", pin: "5V" }, { componentId: "lcd", pin: "VDD" }, { componentId: "pot", pin: "VCC" }] },
+        { id: "ground", endpoints: [{ componentId: "uno", pin: "GND" }, { componentId: "lcd", pin: "VSS" }, { componentId: "lcd", pin: "RW" }, { componentId: "pot", pin: "GND" }] },
+        { id: "lcd_rs", endpoints: [{ componentId: "uno", pin: "D12" }, { componentId: "lcd", pin: "RS" }] },
+        { id: "lcd_enable", endpoints: [{ componentId: "uno", pin: "D11" }, { componentId: "lcd", pin: "E" }] },
+        { id: "lcd_d4", endpoints: [{ componentId: "uno", pin: "D5" }, { componentId: "lcd", pin: "D4" }] },
+        { id: "lcd_d5", endpoints: [{ componentId: "uno", pin: "D4" }, { componentId: "lcd", pin: "D5" }] },
+        { id: "lcd_d6", endpoints: [{ componentId: "uno", pin: "D7" }, { componentId: "lcd", pin: "D6" }] },
+        { id: "lcd_d7", endpoints: [{ componentId: "uno", pin: "D6" }, { componentId: "lcd", pin: "D7" }] },
+        { id: "contrast", endpoints: [{ componentId: "lcd", pin: "VO" }, { componentId: "pot", pin: "SIG" }] },
+      ],
+    },
+    alarm: {
+      subsystemId: "alarm",
+      placements: ["buzzer", "led", "led_resistor"].map(id => ({ id, x: 0, y: 0 })),
+      nets: [
+        { id: "ground", endpoints: [{ componentId: "uno", pin: "GND" }, { componentId: "buzzer", pin: "-" }, { componentId: "led", pin: "K" }] },
+        { id: "buzzer_signal", endpoints: [{ componentId: "uno", pin: "D10" }, { componentId: "buzzer", pin: "+" }] },
+        { id: "led_signal", endpoints: [{ componentId: "uno", pin: "D9" }, { componentId: "led_resistor", pin: "1" }] },
+        { id: "led_anode", endpoints: [{ componentId: "led_resistor", pin: "2" }, { componentId: "led", pin: "A" }] },
+      ],
+    },
+  };
+  let targetedRepairCalls = 0;
+  let wholeProjectRecoveryCalls = 0;
+  let wholeProjectCorrectionCalls = 0;
+  let recoveryContent: Record<string, unknown> | undefined;
+  let correctionSchema: Record<string, unknown> | undefined;
+  const invalidRecovery = createDefaultBlinkProject();
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    const schema = request.generationConfig.responseJsonSchema.properties;
+    if (schema.projectId) return modelResponse(JSON.stringify(plan));
+    if (schema.subsystemId) {
+      const subsystemId = content.subsystem.id;
+      if (Array.isArray(content.validationIssues)) {
+        targetedRepairCalls += 1;
+        assert.ok(content.validationIssues.some((issue: string) => issue.includes("NET_ENDPOINT_OWNERSHIP")));
+        assert.ok(content.validationDiagnostics.some((item: Record<string, unknown>) => item.code === "NET_ENDPOINT_OWNERSHIP"));
+      }
+      return modelResponse(JSON.stringify(fragments[subsystemId]));
+    }
+    if (content.recoveryMode === "whole-project") {
+      wholeProjectRecoveryCalls += 1;
+      recoveryContent = content;
+    } else if (content.recoveryMode === "whole-project-correction") {
+      wholeProjectCorrectionCalls += 1;
+      correctionSchema = schema;
+    }
+    return modelResponse(JSON.stringify({ project: invalidRecovery, explanation: "Invalid recovery candidate", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: greenhouseMonitorPrompt }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 502, JSON.stringify(body));
+  assert.equal(body.error.code, "AI_WHOLE_PROJECT_RECOVERY_FAILED", JSON.stringify(body));
+  assert.ok(targetedRepairCalls > 0, "the affected wiring fragments receive a bounded targeted repair");
+  assert.equal(wholeProjectRecoveryCalls, 1, "unresolved cross-fragment ownership gets one whole-project recovery");
+  assert.equal(wholeProjectCorrectionCalls, 2, "topology failures retain bounded complete-project corrections");
+  assert.equal(recoveryContent?.request, greenhouseMonitorPrompt);
+  assert.ok(Array.isArray(recoveryContent?.validationIssues) && recoveryContent.validationIssues.some((issue: string) => issue.includes("NET_ENDPOINT_OWNERSHIP")));
+  assert.ok(Array.isArray(recoveryContent?.validationDiagnostics) && recoveryContent.validationDiagnostics.some((item: Record<string, unknown>) => item.code === "NET_ENDPOINT_OWNERSHIP" && item.stage === "wiring"));
+  const projectSchema = correctionSchema?.project as Record<string, unknown> | undefined;
+  const projectProperties = projectSchema?.properties as Record<string, unknown> | undefined;
+  assert.ok(projectProperties?.components && projectProperties.connections, "wiring recovery keeps the complete project schema instead of switching to code-only repair");
+  assert.equal(Object.hasOwn(body, "project"), false, "an invalid whole-project candidate is never published");
+});
+
+test("whole-project recovery can publish a corrected candidate after targeted repair fails", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const invalid = greenhouseExample();
+  invalid.code = invalid.code.replaceAll(".selectChannel(", ".selectMuxChannel(");
+  const corrected = greenhouseExample();
+  let wholeProjectRecoveryRequests = 0;
+  let recoveryContent: Record<string, unknown> | undefined;
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    if (content.recoveryMode === "whole-project") {
+      wholeProjectRecoveryRequests += 1;
+      recoveryContent = content;
+      return modelResponse(JSON.stringify({ project: corrected, explanation: "The complete greenhouse circuit now validates.", assumptions: [], warnings: [] }));
+    }
+    return modelResponse(JSON.stringify({ project: invalid, explanation: "Greenhouse controller", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", { method: "POST", body: JSON.stringify({ prompt: greenhousePrompt }) }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body.error ?? body));
+  assert.equal(wholeProjectRecoveryRequests, 1);
+  assert.equal(recoveryContent?.request, greenhousePrompt);
+  assert.ok(isRecord(recoveryContent?.failedCandidate) && isRecord(recoveryContent.failedCandidate.project));
+  assert.ok(Array.isArray(recoveryContent?.validationDiagnostics) && recoveryContent.validationDiagnostics.length > 0);
+  assert.match(body.project.code, /mux\.selectChannel\(/);
+  assert.doesNotMatch(body.project.code, /mux\.selectMuxChannel\(/);
+  assert.equal(ledSeriesResistorIssues(body.project).length, 0);
+});
+
+test("code-only whole-project recovery preserves validated topology and replaces a malformed structured sketch", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const invalid = greenhouseExample();
+  invalid.code = invalid.code.replaceAll(".selectChannel(", ".selectMuxChannel(");
+  const recoveredTopology = structuredClone(invalid);
+  const recoveredSensor = recoveredTopology.components.find(component => component.type === "bme280");
+  assert.ok(recoveredSensor);
+  recoveredSensor.x += 37;
+  const corrected = greenhouseExample();
+  let wholeProjectRecoveryRequests = 0;
+  let sourceCorrectionRequests = 0;
+  let correctionContent: Record<string, unknown> | undefined;
+  let correctionSchema: Record<string, unknown> | undefined;
+  let initialRecoverySchema: Record<string, unknown> | undefined;
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    if (content.recoveryMode === "whole-project") {
+      wholeProjectRecoveryRequests += 1;
+      initialRecoverySchema = request.generationConfig.responseJsonSchema;
+      return modelResponse(JSON.stringify({ project: recoveredTopology, explanation: "Malformed structured sketch with repaired topology", assumptions: [], warnings: [] }));
+    }
+    if (content.recoveryMode === "whole-project-correction") {
+      sourceCorrectionRequests += 1;
+      correctionContent = content;
+      correctionSchema = request.generationConfig.responseJsonSchema;
+      return modelResponse(JSON.stringify({ project: { code: corrected.code }, explanation: "Validated complete greenhouse recovery", assumptions: [], warnings: [] }));
+    }
+    return modelResponse(JSON.stringify({ project: invalid, explanation: "Greenhouse controller", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", { method: "POST", body: JSON.stringify({ prompt: greenhousePrompt }) }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body.error ?? body));
+  assert.equal(wholeProjectRecoveryRequests, 1);
+  assert.equal(sourceCorrectionRequests, 1, "one single-board source correction runs within the same bounded recovery");
+  assert.equal(correctionContent?.request, greenhousePrompt);
+  assert.ok(isRecord(correctionContent?.failedCandidate) && isRecord(correctionContent.failedCandidate.project));
+  assert.ok(Array.isArray(correctionContent?.validationIssues) && correctionContent.validationIssues.length > 0);
+  assert.ok(isRecord(correctionSchema) && isRecord(correctionSchema.properties) && isRecord(correctionSchema.properties.project));
+  assert.deepEqual(Object.keys((correctionSchema.properties.project as Record<string, unknown>).properties as Record<string, unknown>), ["code"]);
+  assert.ok(isRecord(initialRecoverySchema) && isRecord(initialRecoverySchema.properties) && isRecord(initialRecoverySchema.properties.project));
+  assert.deepEqual(Object.keys((initialRecoverySchema.properties.project as Record<string, unknown>).properties as Record<string, unknown>), ["code"], "a code-only fault should recover source against the existing complete topology");
+  const initialCandidate = correctionContent!.failedCandidate as { project: FixtureEnvelope["project"] };
+  assert.equal(
+    body.project.components.find((component: { type: string; x: number }) => component.type === "bme280")?.x,
+    initialCandidate.project.components.find(component => component.type === "bme280")?.x,
+    "sketch-only recovery must preserve the validated topology while repairing code",
+  );
+  assert.match(body.project.code, /mux\.selectChannel\(/);
+  assert.doesNotMatch(body.project.code, /mux\.selectMuxChannel\(/);
+  assert.ok(corrected.components.every(expected => body.project.components.some((component: { id: string }) => component.id === expected.id)), "the corrected sketch merges into the complete circuit rather than replacing it");
+  assert.ok(body.project.connections.length > 0, "the complete candidate topology remains in the merged result");
+  assert.equal(ledSeriesResistorIssues(body.project).length, 0);
+});
+
+test("staged sketch rejection reaches whole-project recovery and gets one source validation retry", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  const previousWarn = console.warn;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    console.warn = previousWarn;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  console.warn = () => {};
+
+  const invalidSketch = greenhouseExample();
+  invalidSketch.code = invalidSketch.code.replace("Serial.println(w);", "Serial.println(w#temperature);");
+  const invalidRecovery = greenhouseExample();
+  invalidRecovery.code = invalidRecovery.code.replaceAll(".selectChannel(", ".selectMuxChannel(");
+  const corrected = greenhouseExample();
+  let recoveryContent: Record<string, unknown> | undefined;
+  let sourceCorrectionContent: Record<string, unknown> | undefined;
+  let sourceCorrectionRequests = 0;
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    if (content.recoveryMode === "whole-project") {
+      recoveryContent = content;
+      return modelResponse(JSON.stringify({ project: invalidRecovery, explanation: "Retry invalid sketch recovery", assumptions: [], warnings: [] }));
+    }
+    if (content.recoveryMode === "whole-project-correction") {
+      sourceCorrectionRequests += 1;
+      if (content.repairAttempt === 2) sourceCorrectionContent = content;
+      return modelResponse(JSON.stringify({
+        project: { code: sourceCorrectionRequests === 1 ? invalidRecovery.code : corrected.code },
+        explanation: "Validated complete greenhouse source recovery",
+        assumptions: [], warnings: [],
+      }));
+    }
+    return modelResponse(JSON.stringify({ project: invalidSketch, explanation: "Greenhouse controller", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: greenhousePrompt }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body.error ?? body));
+  assert.equal(sourceCorrectionRequests, 2, "the second source recovery must validate and publish the corrected candidate");
+  assert.equal(recoveryContent?.request, greenhousePrompt);
+  assert.ok(typeof recoveryContent?.rejectedSketchResponse === "string");
+  assert.match(String(recoveryContent?.rejectedSketchResponse), /w#temperature/);
+  assert.equal(sourceCorrectionContent?.repairAttempt, 2);
+  assert.ok(Array.isArray(sourceCorrectionContent?.validationIssues) && sourceCorrectionContent.validationIssues.length > 0);
+  assert.match(String(sourceCorrectionContent?.rejectedSketchResponse), /w#temperature/);
+  assert.match(String(sourceCorrectionContent?.rejectedResponse), /selectMuxChannel/);
+  assert.doesNotMatch(body.project.code, /w#temperature/);
+  assert.deepEqual(ledSeriesResistorIssues(body.project), []);
+});
+
+test("generation repairs missing temperature indicator series wires and verifies each zone", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+
+  const repaired = greenhouseExample();
+  const indicatorLeds = repaired.components.filter(component => component.type === "led");
+  if (indicatorLeds[0]) indicatorLeds[0].label = "West Alarm LED";
+  if (indicatorLeds[1]) indicatorLeds[1].label = "East Alarm LED";
+  if (indicatorLeds[2]) indicatorLeds[2].label = "Overheat Alarm LED";
+  const disconnectedIndicators = structuredClone(repaired);
+  const ledIds = new Set(disconnectedIndicators.components.filter(component => component.type === "led").map(component => component.id));
+  disconnectedIndicators.connections = disconnectedIndicators.connections.filter(connection =>
+    ![connection.from, connection.to].some(endpoint => ledIds.has(endpoint.componentId) && endpoint.pin === "A"));
+  let repairFeedback = "";
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    const input = JSON.parse(request.contents[0].parts[0].text);
+    if (Array.isArray(input.validationIssues)) repairFeedback = input.validationIssues.join("\n");
+    return modelResponse(JSON.stringify({ project: disconnectedIndicators, explanation: "Greenhouse controller", warnings: [], assumptions: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: greenhousePrompt }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body.error));
+  assert.equal(repairFeedback, "", "the wire omission is safely repaired before asking Gemini for another attempt");
+  assert.ok(body.assumptions.some((item: string) => /Completed a missing generated LED series wire/.test(item)));
+
+  const simulator = new ArduinoSimulator(body.project.code);
+  simulator.attachProject(body.project);
+  simulator.run();
+  simulator.advance(1_000);
+  const sensors = body.project.components.filter((component: { type: string }) => component.type === "bme280");
+  const westSensor = sensors.find((component: { label: string }) => /west/i.test(component.label)) ?? sensors[0];
+  const eastSensor = sensors.find((component: { label: string }) => /east/i.test(component.label)) ?? sensors[1];
+  const setTemperatures = (westTemperature: number, eastTemperature: number) => {
+    westSensor.properties.temperature = westTemperature;
+    eastSensor.properties.temperature = eastTemperature;
+    simulator.attachProject(body.project);
+    return simulator.advance(1_000).componentStates;
+  };
+  let states = setTemperatures(30, 23);
+  assert.equal(states["io-led"]?.powered, true);
+  assert.equal(states["led-1"]?.powered, false);
+  assert.equal(states["led-2"]?.powered, false);
+  states = setTemperatures(23, 30);
+  assert.equal(states["io-led"]?.powered, false);
+  assert.equal(states["led-1"]?.powered, true);
+  assert.equal(states["led-2"]?.powered, false);
+  states = setTemperatures(33, 23);
+  assert.equal(states["io-led"]?.powered, true);
+  assert.equal(states["led-1"]?.powered, false);
+  assert.equal(states["led-2"]?.powered, true);
+});
+
+test("generation isolates three labeled temperature LEDs that were shorted onto one MCP23017 output", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+
+  const miswired = greenhouseExample();
+  const leds = miswired.components.filter(component => component.type === "led");
+  const resistors = miswired.components.filter(component => component.type === "resistor" && Number(component.properties?.resistance) >= 150 && Number(component.properties?.resistance) <= 500);
+  assert.equal(leds.length, 3);
+  assert.equal(resistors.length, 3);
+  const roles = ["west", "east", "critical"] as const;
+  leds.forEach((led, index) => { led.label = [`West Zone High LED`, `East Zone High LED`, `Critical Temp LED`][index]!; });
+  resistors.forEach((resistor, index) => { resistor.label = [`West LED resistor`, `East LED resistor`, `Critical LED resistor`][index]!; });
+  const branchIds = new Set([...leds, ...resistors].map(component => component.id));
+  miswired.connections = miswired.connections.filter(connection => ![connection.from, connection.to].some(endpoint =>
+    branchIds.has(endpoint.componentId)
+    || (endpoint.componentId === "io-device" && /^GPA[0-2]$/.test(endpoint.pin))));
+  for (let index = 0; index < 3; index += 1) {
+    const led = leds[index]!;
+    const resistor = resistors[index]!;
+    miswired.connections.push(
+      { id: `fault-gp2-${index}`, from: { componentId: "io-device", pin: "GPA2" }, to: { componentId: resistor.id, pin: "1" } },
+      { id: `fault-res-led-${index}`, from: { componentId: resistor.id, pin: "2" }, to: { componentId: led.id, pin: "A" } },
+      { id: `fault-led-gnd-${index}`, from: { componentId: led.id, pin: "K" }, to: { componentId: "uno", pin: "GND" } },
+    );
+  }
+  let providerCalls = 0;
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return modelResponse(JSON.stringify({ project: miswired, explanation: "Two-zone greenhouse indicators", warnings: [], assumptions: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", { method: "POST", body: JSON.stringify({ prompt: greenhousePrompt }) }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body.error ?? body));
+  assert.equal(providerCalls, 1, "this clearly mapped fault should be repaired locally before another provider call");
+  for (let index = 0; index < 3; index += 1) {
+    const led = leds[index]!;
+    const resistor = resistors[index]!;
+    const gpio = `GPA${index}`;
+    assert.ok(body.project.connections.some((connection: FixtureWire) =>
+      [connection.from, connection.to].some(endpoint => endpoint.componentId === "io-device" && endpoint.pin === gpio)
+      && [connection.from, connection.to].some(endpoint => endpoint.componentId === resistor.id && endpoint.pin === "1")), `${roles[index]} output needs a dedicated source resistor`);
+    assert.ok(body.project.connections.some((connection: FixtureWire) =>
+      [connection.from, connection.to].some(endpoint => endpoint.componentId === resistor.id && endpoint.pin === "2")
+      && [connection.from, connection.to].some(endpoint => endpoint.componentId === led.id && endpoint.pin === "A")), `${roles[index]} LED must remain in series with its resistor`);
+  }
+  assert.ok(body.assumptions.some((assumption: string) => /rewired .*MCP23017 GPA0/.test(assumption)));
+  assert.ok(body.assumptions.some((assumption: string) => /rewired .*MCP23017 GPA1/.test(assumption)));
+  assert.ok(body.assumptions.some((assumption: string) => /rewired .*MCP23017 GPA2/.test(assumption)));
+
+  const sensors = body.project.components.filter((component: { type: string }) => component.type === "bme280");
+  const zoneStates = (westTemperature: number, eastTemperature: number) => {
+    const scenario = structuredClone(body.project);
+    const scenarioSensors = scenario.components.filter((component: { type: string }) => component.type === "bme280");
+    const west = scenarioSensors.find((component: { label: string }) => /west/i.test(component.label)) ?? scenarioSensors[0];
+    const east = scenarioSensors.find((component: { label: string }) => /east/i.test(component.label)) ?? scenarioSensors.find((component: { id: string }) => component.id !== west.id);
+    west.properties = { ...west.properties, temperature: westTemperature };
+    east.properties = { ...east.properties, temperature: eastTemperature };
+    const simulator = new ArduinoSimulator(scenario.code);
+    simulator.attachProject(scenario);
+    simulator.run(); simulator.advance(0); simulator.advance(10_000);
+    return simulator.getSnapshot().componentStates;
+  };
+  assert.equal(sensors.length, 2);
+  assert.deepEqual(leds.map((led, index) => body.project.components.find((component: { id: string }) => component.id === led.id)?.label ?? index), ["West Zone High LED", "East Zone High LED", "Critical Temp LED"]);
+  let states = zoneStates(30, 23);
+  assert.deepEqual(leds.map(led => Boolean(states[led.id]?.powered)), [true, false, false]);
+  states = zoneStates(23, 30);
+  assert.deepEqual(leds.map(led => Boolean(states[led.id]?.powered)), [false, true, false]);
+  states = zoneStates(33, 23);
+  assert.deepEqual(leds.map(led => Boolean(states[led.id]?.powered)), [true, false, true]);
+});
+
+test("generation safely repairs missing sensor power from the one compatible board rail", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  const previousWarn = console.warn;
+  context.after(() => {
+    globalThis.fetch = previousFetch; console.warn = previousWarn;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret"; console.warn = () => {};
+  const project = COMPONENT_EXAMPLES.bme280();
+  project.connections = project.connections.filter(w => w.from.pin !== "VDD");
+  const issues: string[] = [];
+  globalThis.fetch = async (_input, init) => {
+    const content = JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+    issues.push(...(content.validationIssues ?? []));
+    return modelResponse(JSON.stringify({ project, explanation: "Missing power", warnings: [], assumptions: [] }));
+  };
+  const response = await POST(new Request("http://localhost/api/ai/generate", { method: "POST", body: JSON.stringify({ prompt: "Create a BME280 circuit" }) }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(issues.length, 0, "the unambiguous 3.3 V board rail should repair this missing connection before model repair");
+  assert.ok(body.project.connections.some((wire: { from: { componentId: string; pin: string }; to: { componentId: string; pin: string } }) =>
+    (wire.from.componentId === "device" && wire.from.pin === "VDD" && wire.to.componentId === "uno" && wire.to.pin === "3V3")
+    || (wire.to.componentId === "device" && wire.to.pin === "VDD" && wire.from.componentId === "uno" && wire.from.pin === "3V3")),
+  "repaired BME280 VDD should connect to the compatible Uno 3.3 V rail");
+});
+
+test("generation rejects a fan fail-safe that does not report an unavailable sensor", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = greenhouseExample();
+  project.code = project.code.replace('Serial.println("Sensor unavailable");', 'Serial.println("Reading");');
+  let repairFeedback = "";
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    const input = JSON.parse(request.contents[0].parts[0].text);
+    if (Array.isArray(input.validationIssues)) repairFeedback = input.validationIssues.join("\n");
+    return modelResponse(JSON.stringify({ project, explanation: "Greenhouse controller", warnings: [], assumptions: [] }));
+  };
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: greenhousePrompt }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 502);
+  assert.match(repairFeedback, /does not report the sensor fault in Serial/);
+  assert.match(body.error.details.join("\n"), /does not report the sensor fault in Serial/);
+});
+
+test("generation repairs a temperature controller to report unavailable BME sensors and stop the fan", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const repaired = greenhouseExample();
+  const broken = structuredClone(repaired);
+  broken.code = broken.code.replace('Serial.println("Sensor unavailable");', 'Serial.println("Reading");');
+  let repairFeedback = "";
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    const input = JSON.parse(request.contents[0].parts[0].text);
+    if (Array.isArray(input.validationIssues)) repairFeedback = input.validationIssues.join("\n");
+    return modelResponse(JSON.stringify({ project: input.validationIssues?.length ? repaired : broken, explanation: "Greenhouse controller", warnings: [], assumptions: [] }));
+  };
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: greenhousePrompt }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body.error));
+  assert.match(repairFeedback, /does not report the sensor fault in Serial/);
+
+  const disconnected = structuredClone(body.project);
+  const west = disconnected.components.find((component: { type: string; label: string }) => component.type === "bme280" && /west/i.test(component.label)) ?? disconnected.components.find((component: { type: string }) => component.type === "bme280");
+  disconnected.connections = disconnected.connections.filter((connection: FixtureWire) =>
+    ![connection.from, connection.to].some(endpoint => endpoint.componentId === west.id && endpoint.pin === "SDI"));
+  const simulator = new ArduinoSimulator(disconnected.code);
+  simulator.attachProject(disconnected);
+  simulator.run();
+  simulator.advance(10_000);
+  const snapshot = simulator.getSnapshot();
+  assert.ok(snapshot.diagnostics.some(diagnostic => diagnostic.code === "DEVICE_NOT_CONNECTED"));
+  assert.ok(snapshot.diagnostics.filter(diagnostic => diagnostic.severity === "error").every(diagnostic => diagnostic.code === "DEVICE_NOT_CONNECTED"));
+  assert.ok(snapshot.serial.some(entry => /sensor unavailable/i.test(entry.text)));
+  const motor = disconnected.components.find((component: { type: string }) => component.type === "dc-motor");
+  assert.equal(snapshot.componentStates[motor.id]?.speed, 0);
+});
+
+test("generation repairs a TB6612FNG with a disconnected STBY pin before publication", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = COMPONENT_EXAMPLES.tb6612fng();
+  project.connections = project.connections.filter((connection) =>
+    ![connection.from, connection.to].some((endpoint) => endpoint.componentId === "device" && endpoint.pin === "STBY"));
+  let calls = 0;
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    const input = JSON.parse(request.contents[0].parts[0].text);
+    if (input.validationIssues) assert.fail(`unexpected repair attempt: ${JSON.stringify(input.validationIssues)}`);
+    return modelResponse(JSON.stringify({ project, explanation: "TB6612 motor driver", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", body: JSON.stringify({ prompt: "Create a TB6612FNG motor driver circuit" }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(calls, 1, "a safe disconnected standby fix should not spend an AI repair attempt");
+  assert.ok(body.project.connections.some((connection: { from: { componentId: string; pin: string }; to: { componentId: string; pin: string } }) =>
+    [connection.from, connection.to].some((endpoint) => endpoint.componentId === "device" && endpoint.pin === "STBY")));
+});
+
+test("generation uses an explicitly requested DC supply for the motor driver", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = COMPONENT_EXAMPLES.tb6612fng();
+  project.components.push({ id: "motor-supply", type: "dc-supply", label: "Adjustable motor supply", x: 400, y: 0, properties: { voltage: 7.4, enabled: true } });
+  project.connections = project.connections.filter(connection =>
+    ![connection.from, connection.to].some(endpoint => endpoint.componentId === "device" && ["VM1", "VM2", "VM3"].includes(endpoint.pin)));
+  for (const pin of ["VM1", "VM2", "VM3"]) project.connections.push({
+    id: `wrong-${pin}`, from: { componentId: "device", pin }, to: { componentId: "uno", pin: "VIN" },
+  });
+  let providerCalls = 0;
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return modelResponse(JSON.stringify({ project, explanation: "A motor driver on a separate supply", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", body: JSON.stringify({ prompt: "Create a TB6612FNG motor driver circuit with a separate adjustable DC motor supply." }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body.error ?? body));
+  assert.ok(providerCalls <= 3, `the repair should use only normal planning and generation stages; observed ${providerCalls} provider calls`);
+  const connected = (start: FixtureEndpoint, target: FixtureEndpoint) => {
+    const pending = [`${start.componentId}:${start.pin}`]; const visited = new Set<string>();
+    while (pending.length) {
+      const current = pending.pop()!;
+      if (visited.has(current)) continue;
+      visited.add(current);
+      for (const connection of body.project.connections as FixtureWire[]) {
+        if (`${connection.from.componentId}:${connection.from.pin}` === current) pending.push(`${connection.to.componentId}:${connection.to.pin}`);
+        if (`${connection.to.componentId}:${connection.to.pin}` === current) pending.push(`${connection.from.componentId}:${connection.from.pin}`);
+      }
+    }
+    return visited.has(`${target.componentId}:${target.pin}`);
+  };
+  for (const pin of ["VM1", "VM2", "VM3"]) assert.ok(connected({ componentId: "device", pin }, { componentId: "motor-supply", pin: "+" }), `${pin} must use the requested motor supply`);
+  const commonReturns = [
+    ...["GND", "GND2", "GND3"].map(pin => ({ componentId: "uno", pin })),
+    ...(body.project.components as FixtureComponent[]).filter(component => component.type === "ground").map(component => ({ componentId: component.id, pin: "GND" })),
+  ];
+  assert.ok(commonReturns.some(endpoint => connected({ componentId: "motor-supply", pin: "-" }, endpoint)),
+    "external supply return must join the circuit ground");
+});
+
+test("generation honors an explicit numeric STBY GPIO before the generic enable fallback", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = COMPONENT_EXAMPLES.tb6612fng();
+  project.connections = project.connections.filter(connection =>
+    ![connection.from, connection.to].some(endpoint => endpoint.componentId === "device" && endpoint.pin === "STBY"));
+  project.code = "void setup(){ pinMode(5,OUTPUT); pinMode(6,OUTPUT); pinMode(8,OUTPUT); digitalWrite(8,HIGH); analogWrite(5,128); analogWrite(6,255); } void loop(){ delay(100); }";
+  globalThis.fetch = async () => modelResponse(JSON.stringify({ project, explanation: "Uno-controlled TB6612FNG motor circuit", assumptions: [], warnings: [] }));
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: "Create a TB6612FNG motor driver circuit. Use Uno D8 for STBY and drive digital pin 8 HIGH in setup so the connected motors run." }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  const standbyWire = body.project.connections.find((connection: FixtureWire) =>
+    [connection.from, connection.to].some(endpoint => endpoint.componentId === "device" && endpoint.pin === "STBY"));
+  assert.ok(standbyWire);
+  assert.ok([standbyWire.from, standbyWire.to].some(endpoint => endpoint.componentId === "uno" && endpoint.pin === "D8"), "STBY must follow the explicit sketch GPIO");
+  assert.ok(![standbyWire.from, standbyWire.to].some(endpoint => endpoint.componentId === "uno" && endpoint.pin === "5V"), "STBY must not also be tied to VCC");
+
+  const simulator = new ArduinoSimulator(body.project.code);
+  simulator.attachProject(body.project);
+  simulator.run();
+  simulator.advance(100);
+  assert.ok((simulator.getSnapshot().componentStates["motor-a"]?.speed ?? 0) > 0, "the explicitly enabled driver should run its motor");
+});
+
+test("generation deterministically corrects a TB6612 duplicate output pad before publication", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const malformedProject = COMPONENT_EXAMPLES.tb6612fng();
+  const negativeLead = malformedProject.connections.find(connection =>
+    [connection.from, connection.to].some(endpoint => endpoint.componentId === "motor-a" && endpoint.pin === "-"));
+  assert.ok(negativeLead);
+  const mistakenPad = negativeLead.from.componentId === "device" ? negativeLead.from : negativeLead.to;
+  mistakenPad.pin = "AO1_2";
+  let providerCalls = 0;
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return modelResponse(JSON.stringify({ project: malformedProject, explanation: "A TB6612FNG drives a motor.", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", body: JSON.stringify({ prompt: "Create a TB6612FNG circuit with a DC motor" }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(providerCalls, 1, "a known duplicate output-pad error should not require another Gemini attempt");
+  assert.ok(body.project.connections.some((connection: FixtureWire) =>
+    [connection.from, connection.to].some(endpoint => endpoint.componentId === "device" && endpoint.pin === "AO2_5")
+      && [connection.from, connection.to].some(endpoint => endpoint.componentId === "motor-a" && endpoint.pin === "-")));
+  assert.ok(body.assumptions.some((assumption: string) => assumption.includes("Corrected motor-a wiring across TB6612FNG channel A")));
+});
+
+test("generation reroutes an undriven TB6612 standby wire from an unused Uno pin", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = COMPONENT_EXAMPLES.tb6612fng();
+  const standbyWire = project.connections.find((connection) =>
+    [connection.from, connection.to].some((endpoint) => endpoint.componentId === "device" && endpoint.pin === "STBY"));
+  assert.ok(standbyWire);
+  if (standbyWire.from.componentId === "device" && standbyWire.from.pin === "STBY") standbyWire.to = { componentId: "uno", pin: "D7" };
+  else standbyWire.from = { componentId: "uno", pin: "D7" };
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return modelResponse(JSON.stringify({ project, explanation: "TB6612 motor driver", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", body: JSON.stringify({ prompt: "Create a TB6612FNG motor driver circuit" }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(calls, 1, "the unused MCU input should be replaced before preflight");
+  const vccWire = body.project.connections.find((connection: { from: { componentId: string; pin: string }; to: { componentId: string; pin: string } }) =>
+    [connection.from, connection.to].some((endpoint) => endpoint.componentId === "device" && endpoint.pin === "VCC"));
+  const fixedStandbyWire = body.project.connections.find((connection: { from: { componentId: string; pin: string }; to: { componentId: string; pin: string } }) =>
+    [connection.from, connection.to].some((endpoint) => endpoint.componentId === "device" && endpoint.pin === "STBY"));
+  assert.ok(vccWire && fixedStandbyWire);
+  const vccPeer = vccWire.from.componentId === "device" && vccWire.from.pin === "VCC" ? vccWire.to : vccWire.from;
+  const standbyPeer = fixedStandbyWire.from.componentId === "device" && fixedStandbyWire.from.pin === "STBY" ? fixedStandbyWire.to : fixedStandbyWire.from;
+  assert.deepEqual(standbyPeer, vccPeer);
+});
+
+test("generation repairs an undriven TB6612 standby pin connected through a floating net", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const repairedProject = COMPONENT_EXAMPLES.tb6612fng();
+  const invalidProject = structuredClone(repairedProject);
+  const standby = invalidProject.connections.find((connection) =>
+    [connection.from, connection.to].some((endpoint) => endpoint.componentId === "device" && endpoint.pin === "STBY"));
+  assert.ok(standby);
+  invalidProject.components.push({ id: "floating", type: "resistor", label: "Floating standby net", x: 0, y: 0 });
+  if (standby.from.componentId === "device" && standby.from.pin === "STBY") standby.to = { componentId: "floating", pin: "1" };
+  else standby.from = { componentId: "floating", pin: "1" };
+  invalidProject.connections.push({ id: "floating-tail", from: { componentId: "floating", pin: "2" }, to: { componentId: "uno", pin: "D7" } });
+
+  let calls = 0;
+  let repairIssues: string[] = [];
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    const input = JSON.parse(request.contents[0].parts[0].text);
+    repairIssues = input.validationIssues ?? [];
+    const project = input.validationIssues ? repairedProject : invalidProject;
+    return modelResponse(JSON.stringify({ project, explanation: "TB6612 motor driver", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", body: JSON.stringify({ prompt: "Create a TB6612FNG motor driver circuit" }),
+  }));
+  assert.equal(response.status, 200, JSON.stringify(await response.clone().json()));
+  assert.equal(calls, 2, "the floating-control diagnostic must trigger a repair attempt");
+  assert.ok(repairIssues.some((issue) => issue.includes("floating-control") && issue.includes("STBY")));
+});
+
+test("generation repairs motor controls left undriven after sketch startup", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const invalidProject = COMPONENT_EXAMPLES.tb6612fng();
+  invalidProject.code = "void setup(){} void loop(){ delay(100); }";
+  const repairedProject = COMPONENT_EXAMPLES.tb6612fng();
+  let calls = 0; let repairCalls = 0; let repairIssues: string[] = [];
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    const input = JSON.parse(request.contents[0].parts[0].text);
+    repairIssues = input.validationIssues ?? [];
+    if (repairIssues.length) repairCalls += 1;
+    return modelResponse(JSON.stringify({ project: input.validationIssues ? repairedProject : invalidProject, explanation: "TB6612 motor driver", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", body: JSON.stringify({ prompt: "Create a TB6612FNG motor driver circuit" }),
+  }));
+  assert.equal(response.status, 200);
+  assert.ok(calls >= 2, "the generated circuit must receive a targeted repair");
+  assert.ok(repairCalls > 0 && repairCalls <= 2, "targeted motor-control repairs must stay within the two-attempt limit");
+  assert.ok(repairIssues.some(issue => issue.includes("floating-control") && issue.includes("PWMA")));
+});
+
+test("staged generation repairs a fan sketch that never starts at its hot threshold", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const repairedProject = greenhouseExample();
+  const invalidProject = structuredClone(repairedProject);
+  invalidProject.code = invalidProject.code.replace(
+    "if (fan) { analogWrite(5, 191); } else { analogWrite(5, 0); }",
+    "analogWrite(5, 0);",
+  );
+  assert.notEqual(invalidProject.code, repairedProject.code, "the fixture must keep the fan stopped in every temperature case");
+  let providerCalls = 0;
+  let repairIssues: string[] = [];
+  let repairInstructions = "";
+  globalThis.fetch = async (_input, init) => {
+    providerCalls += 1;
+    const request = JSON.parse(String(init?.body));
+    const input = JSON.parse(request.contents[0].parts[0].text);
+    repairIssues = input.validationIssues ?? repairIssues;
+    if (repairIssues.length) repairInstructions = request.systemInstruction.parts[0].text;
+    const project = input.validationIssues ? repairedProject : invalidProject;
+    return modelResponse(JSON.stringify({ project, explanation: "A two-zone fan controller.", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", body: JSON.stringify({ prompt: greenhousePrompt }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.ok(providerCalls >= 2, "the invalid staged sketch must receive a targeted repair");
+  assert.ok(repairIssues.some(issue => issue.includes("project.code fan behavior") && issue.includes("turn-on threshold")), JSON.stringify(repairIssues));
+  assert.match(repairInstructions, /FAN BEHAVIOR REPAIR/);
+  assert.match(repairInstructions, /requested PWM value on that branch/);
+  assert.match(body.project.code, /if \(fan\)/);
+});
+
+test("sketch-only fan recovery receives the complete candidate and precise diagnostics", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY; const previousWarn = console.warn;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    console.warn = previousWarn;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  console.warn = () => {};
+  process.env.GEMINI_API_KEY = "test-secret";
+  const repairedProject = greenhouseExample();
+  const invalidProject = structuredClone(repairedProject);
+  invalidProject.code = invalidProject.code.replace(
+    "if (fan) { analogWrite(5, 191); } else { analogWrite(5, 0); }",
+    "analogWrite(5, 0);",
+  );
+  let wholeRecoveryCalls = 0;
+  let targetedRepairs = 0;
+  let recoveryContent: Record<string, unknown> | undefined;
+  let recoverySchema: Record<string, unknown> | undefined;
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    if (content.recoveryMode === "whole-project") {
+      wholeRecoveryCalls += 1;
+      recoveryContent = content;
+      recoverySchema = request.generationConfig.responseJsonSchema;
+      return modelResponse(JSON.stringify({ project: { code: repairedProject.code }, explanation: "Repaired temperature fan sketch", assumptions: [], warnings: [] }));
+    }
+    if (Array.isArray(content.validationIssues)) targetedRepairs += 1;
+    return modelResponse(JSON.stringify({ project: invalidProject, explanation: "Fan controller", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", body: JSON.stringify({ prompt: greenhousePrompt }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body.error ?? body));
+  assert.equal(wholeRecoveryCalls, 1, "one whole-circuit recovery should repair the complete sketch");
+  assert.ok(targetedRepairs > 0 && targetedRepairs <= 4, `targeted repairs remain within the two sketch plus two complete-project stage limits (saw ${targetedRepairs})`);
+  assert.equal(recoveryContent?.request, greenhousePrompt);
+  assert.ok(isRecord(recoveryContent?.failedCandidate) && isRecord(recoveryContent.failedCandidate.project));
+  const candidateProject = recoveryContent!.failedCandidate as { project: { components: unknown[]; connections: unknown[] } };
+  assert.ok(candidateProject.project.components.length > 1 && candidateProject.project.connections.length > 1, "fallback must receive the complete assembled circuit, not a subsystem fragment");
+  assert.ok(Array.isArray(recoveryContent?.validationDiagnostics) && recoveryContent.validationDiagnostics.some(item => isRecord(item) && item.stage === "code" && /fan behavior/.test(String(item.message))));
+  assert.ok(isRecord(recoverySchema) && isRecord(recoverySchema.properties) && isRecord(recoverySchema.properties.project));
+  assert.deepEqual(Object.keys((recoverySchema.properties.project as Record<string, unknown>).properties as Record<string, unknown>), ["code"], "a sketch-only recovery preserves the already validated wiring");
+  assert.match(body.project.code, /analogWrite\(5, 191\)/);
+  assert.equal(ledSeriesResistorIssues(body.project).length, 0);
+});
+
+test("fan behavior validation enforces an explicit PWM percentage written with a percent sign", async context => {
+  const previousFetch = globalThis.fetch; const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const repairedProject = greenhouseExample();
+  const underpoweredProject = structuredClone(repairedProject);
+  underpoweredProject.code = underpoweredProject.code.replace("analogWrite(5, 191)", "analogWrite(5, 64)");
+  assert.notEqual(underpoweredProject.code, repairedProject.code);
+  let repairIssues: string[] = [];
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    const input = JSON.parse(request.contents[0].parts[0].text);
+    repairIssues = input.validationIssues ?? repairIssues;
+    return modelResponse(JSON.stringify({
+      project: input.validationIssues?.length ? repairedProject : underpoweredProject,
+      explanation: "A two-zone fan controller.", assumptions: [], warnings: [],
+    }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", body: JSON.stringify({ prompt: greenhousePrompt }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.ok(repairIssues.some(issue => issue.includes("75% PWM") && issue.includes("PWMA")), JSON.stringify(repairIssues));
+});
+
+const generatedEnvelope = {
+  project: createDefaultBlinkProject(),
+  explanation: "Generated a validated blink circuit.",
+  assumptions: [],
+  warnings: [],
+};
+
+test("Gemini schema rejection retries in JSON mode and still validates the complete circuit", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const originalWarn = console.warn;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  console.warn = () => {};
+  const plan = planFromEnvelope(generatedEnvelope);
+  assert.ok(plan);
+  const circuitFixture = generatedEnvelope as unknown as Parameters<typeof structuredFixtureResponse>[0];
+  let calls = 0;
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    if (calls === 1) {
+      assert.ok(request.generationConfig.responseJsonSchema.properties.projectId, "planning retains its structured schema");
+      return modelResponse(JSON.stringify(plan));
+    }
+    if (calls === 2) {
+      assert.ok(request.generationConfig.responseJsonSchema.properties.project, "the first complete-project request uses its scoped schema");
+      const structuredProgram = request.generationConfig.responseJsonSchema.properties.programs.items.properties.program;
+      assert.deepEqual(structuredProgram.required, ["headers", "objects", "globals", "functions"]);
+      assert.deepEqual(structuredProgram.properties.functions.items.required, ["name", "returnType", "parameters", "body"]);
+      assert.ok(JSON.stringify(request.generationConfig.responseJsonSchema).length < 12_000, "the complete-project schema stays within a compact provider-safe size");
+      return Response.json({ error: { code: 400, status: "INVALID_ARGUMENT", message: "Request contains an invalid argument." } }, { status: 400 });
+    }
+    assert.equal(request.generationConfig.responseJsonSchema, undefined, "the compatibility retry omits only Gemini's rejected schema");
+    assert.equal(request.generationConfig.responseMimeType, "application/json");
+    return modelResponse(JSON.stringify(structuredFixtureResponse(circuitFixture, plan)));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompt: "Blink an LED" }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body.error ?? body));
+  assert.equal(calls, 3, "Gemini should be retried once with the same request and a compatible JSON response mode");
+  assert.ok(body.project && body.project.code.includes("digitalWrite"), "only the validated Gemini proposal reaches the response");
+});
+
+test("allows complex generation to use the five-minute route window", () => {
+  assert.equal(maxDuration, 300);
+});
+
+test("explicit multi-board generation validates and runs independent wired UART sketches", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const megaCode = "void setup(){ Serial1.begin(9600); } void loop(){ Serial1.println(\"A\"); delay(100); }";
+  const espCode = "void setup(){ Serial2.begin(9600); Serial.begin(9600); } void loop(){ if(Serial2.available()){ int value=Serial2.read(); if(value=='P'){ Serial2.write('A'); } } delay(10); }";
+  const repairedEspCode = "void setup(){ Serial2.begin(9600, SERIAL_8N1, 16, 17); Serial.begin(9600); } void loop(){ if(Serial2.available()){ int value=Serial2.read(); Serial.println(value); } delay(10); }";
+  const project = {
+    schemaVersion: 1, id: "uart-boards", name: "Wired UART controllers", description: "Two controllers exchange a byte.", board: "arduino-mega-2560",
+    components: [
+      { id: "mega", type: "arduino-mega-2560", label: "Mega sender", x: 0, y: 0 },
+      { id: "esp", type: "esp32-devkitc-v4", label: "ESP32 receiver", x: 480, y: 0 },
+    ],
+    connections: [
+      { id: "tx-rx", from: { componentId: "mega", pin: "D18" }, to: { componentId: "esp", pin: "GPIO16" } },
+      { id: "rx-tx", from: { componentId: "esp", pin: "GPIO17" }, to: { componentId: "mega", pin: "D19" } },
+      { id: "shared-ground", from: { componentId: "mega", pin: "GND" }, to: { componentId: "esp", pin: "GND" } },
+    ],
+    code: megaCode,
+    boardPrograms: [{ boardId: "mega", code: megaCode }, { boardId: "esp", code: espCode }],
+  };
+  let requestSchema: { properties?: Record<string, unknown> } | undefined;
+  let sketchInstructions = "";
+  let calls = 0;
+  let repairIssues: string[] = [];
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const request = JSON.parse(String(init?.body));
+    requestSchema = request.generationConfig.responseJsonSchema;
+    sketchInstructions = request.systemInstruction?.parts?.[0]?.text ?? sketchInstructions;
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    repairIssues = content.validationIssues ?? [];
+    const responseProject = content.validationIssues
+      ? { ...project, boardPrograms: [{ boardId: "mega", code: megaCode }, { boardId: "esp", code: repairedEspCode }] }
+      : project;
+    return modelResponse(JSON.stringify({ project: responseProject, explanation: "Two wired controllers run separate sketches.", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompt: "Build a simulation with an Arduino Mega 2560 and ESP32 DevKitC V4 that exchange bytes over wired UART. Log every received UART byte to the ESP32 USB Serial Monitor." }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(calls, 2, "generation should repair a receiver sketch that silently discards the received byte");
+  assert.ok(repairIssues.some(issue => issue.includes("USB Serial Monitor") && issue.includes("Serial1/Serial2")), "generation should distinguish the wired UART from monitor output");
+  assert.match(sketchInstructions, /Do not declare local char variables or use C-style casts/);
+  assert.match(sketchInstructions, /early return is supported/i);
+  assert.match(sketchInstructions, /do not use break, continue, goto/i);
+  assert.ok(requestSchema?.properties?.programs, "repair request should be a per-board sketch bundle");
+  assert.match(body.project.programs.mega, /Serial1\.begin\(9600\)/);
+  assert.match(body.project.programs.mega, /Serial1\.println\("A"\)/);
+  assert.match(body.project.programs.esp, /Serial1\.begin\(9600\)/);
+  assert.match(body.project.programs.esp, /Serial1\.read\(\)/);
+  assert.doesNotMatch(body.project.programs.esp, /Serial2/);
+  assert.ok(body.warnings.some((warning: string) => warning.includes("GPIO16") && warning.includes("GPIO17") && warning.includes("Serial2")), "the simulator-specific ESP32 UART normalization should be disclosed");
+
+  const simulator = new MultiBoardSimulator();
+  simulator.attachProject(body.project);
+  simulator.run();
+  simulator.advance(0);
+  for (let step = 0; step < 20; step += 1) simulator.advance(20);
+  assert.ok(simulator.getSnapshot().boardSerial?.esp?.some(entry => entry.text === "65"), "receiver sketch should observe the sender byte through the connected RX/TX pins");
+});
+
+test("an edit that promises to preserve wiring keeps the original wire endpoints before publishing", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+
+  const megaCode = `void setup() { Serial.begin(9600); Serial1.begin(9600); }
+void loop() {
+  Serial1.write('P');
+  Serial.println("Sent P");
+  delay(1000);
+  if (Serial1.available() > 0) {
+    int incoming = Serial1.read();
+    Serial.print("Mega received: ");
+    Serial.println(incoming);
+  }
+  delay(1000);
+}`;
+  const espCode = "void setup(){ Serial.begin(115200); Serial1.begin(9600); pinMode(2, OUTPUT); } void loop(){ if(Serial1.available()>0){ int incoming=Serial1.read(); Serial.println(incoming); if(incoming=='P'){ digitalWrite(2,HIGH); Serial1.write('A'); } } delay(100); }";
+  const currentProject = {
+    schemaVersion: 1,
+    id: "preserved-uart",
+    name: "Preserved UART",
+    description: "A wired two-board UART handshake.",
+    board: "arduino-mega-2560",
+    components: [
+      { id: "mega", type: "arduino-mega-2560", label: "Mega", x: 0, y: 0 },
+      { id: "esp", type: "esp32-devkitc-v4", label: "ESP32", x: 500, y: 0 },
+    ],
+    connections: [
+      { id: "mega-tx", from: { componentId: "mega", pin: "D18" }, to: { componentId: "esp", pin: "GPIO16" } },
+      { id: "esp-tx", from: { componentId: "esp", pin: "GPIO17" }, to: { componentId: "mega", pin: "D19" } },
+      { id: "shared-ground", from: { componentId: "mega", pin: "GND" }, to: { componentId: "esp", pin: "GND" } },
+    ],
+    code: megaCode,
+    programs: { mega: megaCode, esp: espCode },
+  };
+  const changedProject = structuredClone(currentProject);
+  changedProject.connections[0] = { id: "mega-tx", from: { componentId: "mega", pin: "D1" }, to: { componentId: "esp", pin: "GPIO3" } };
+  changedProject.connections[1] = { id: "esp-tx", from: { componentId: "mega", pin: "D0" }, to: { componentId: "esp", pin: "GPIO1" } };
+  let repairRequests = 0;
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    if (Array.isArray(content.validationIssues)) repairRequests += 1;
+    return modelResponse(JSON.stringify({ project: changedProject, explanation: "ESP32 reports the received byte and responds to the Mega.", assumptions: [], warnings: [] }));
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      prompt: "Edit the current Arduino Mega 2560 and ESP32 circuit. Preserve every wire and do not alter wiring. Do not add physical parts. Keep the UART P/A handshake, log each received byte to the ESP32 USB Serial Monitor, and turn on the ESP32 built-in LED on GPIO2 when P arrives.",
+      currentProject,
+    }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(repairRequests, 0, "the app should deterministically preserve explicitly protected wiring instead of spending another provider call");
+  assert.deepEqual(body.project.connections.map((wire: FixtureWire) => [wire.from.componentId, wire.from.pin, wire.to.componentId, wire.to.pin]), [
+    ["mega", "D18", "esp", "GPIO16"],
+    ["esp", "GPIO17", "mega", "D19"],
+    ["mega", "GND", "esp", "GND"],
+  ]);
+  assert.equal(body.project.components.length, 2, "edit keeps the same two boards");
+
+  const simulator = new MultiBoardSimulator();
+  simulator.attachProject(body.project);
+  simulator.run();
+  for (let elapsed = 0; elapsed <= 2500; elapsed += 16.67) simulator.advance(16.67);
+  const snapshot = simulator.getSnapshot();
+  assert.ok(snapshot.boardSerial?.esp?.some(entry => entry.text === "80"), "ESP32 should receive the P byte through the preserved D18/GPIO16 wire");
+  assert.ok(snapshot.boardSerial?.mega?.some(entry => entry.text === "65"), `Mega should receive the A acknowledgement through the preserved GPIO17/D19 wire: ${JSON.stringify({ serial: snapshot.boardSerial, diagnostics: snapshot.diagnostics, programs: body.project.programs })}`);
+});
+
+function modelResponse(text: string, finishReason = "STOP") {
+  return Response.json({
+    candidates: [{ finishReason, content: { parts: [{ text }] } }],
+  });
+}
+
+function generationRequest(model?: string) {
+  return new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompt: "Blink an LED", ...(model ? { model } : {}) }),
+  });
+}
+
+function requestWithCurrentProject(prompt: string) {
+  return new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompt, currentProject: createDefaultBlinkProject() }),
+  });
+}
+
+test("ordinary greetings receive a model-generated chat reply without circuit generation", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  let requestBody: {
+    generationConfig: { maxOutputTokens: number; responseMimeType: string; responseJsonSchema: { required: string[] } };
+    contents: Array<{ parts: Array<{ text: string }> }>;
+  } | undefined;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body));
+    return modelResponse(JSON.stringify({ reply: "Hello! How can I help with your circuit?" }));
+  };
+
+  const response = await POST(requestWithCurrentProject("hello"));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.deepEqual(body, {
+    kind: "chat",
+    reply: "Hello! How can I help with your circuit?",
+    model: "gemini-3.5-flash-lite",
+  });
+  assert.equal(requestBody?.generationConfig.maxOutputTokens, 512);
+  assert.equal(requestBody?.generationConfig.responseMimeType, "application/json");
+  assert.deepEqual(requestBody?.generationConfig.responseJsonSchema.required, ["reply"]);
+  assert.equal(requestBody?.contents[0].parts[0].text, "hello");
+});
+
+test("standalone and ambiguous prompts create fresh circuits without current project context", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const requests: RequestInit[] = [];
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    requests.push(init ?? {});
+    return modelResponse(JSON.stringify(generatedEnvelope));
+  };
+
+  for (const prompt of ["Blink an LED", "Make something useful"]) {
+    const response = await POST(requestWithCurrentProject(prompt));
+    assert.equal(response.status, 200);
+  }
+  for (const request of requests) {
+    const body = JSON.parse(String(request.body));
+    const data = JSON.parse(body.contents[0].parts[0].text);
+    assert.equal(data.mode, "create");
+    assert.equal("currentProject" in data, false);
+  }
+});
+
+test("explicit fresh circuit prompts stay in create mode when behavior mentions changing an output", () => {
+  assert.equal(
+    classifyGenerationMode("Create a fresh Arduino Uno circuit with a KY-040 and WS2812B strip; rotate the encoder to change the strip color.", true),
+    "create",
+  );
+  assert.equal(classifyGenerationMode("Change the strip color in the current circuit", true), "edit");
+});
+
+test("explicit edit prompts include the current project", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const requests: RequestInit[] = [];
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    requests.push(init ?? {});
+    return modelResponse(JSON.stringify(generatedEnvelope));
+  };
+
+  for (const prompt of ["Modify the current circuit", "Update the current circuit", "Edit the current circuit"]) {
+    const response = await POST(requestWithCurrentProject(prompt));
+    assert.equal(response.status, 200);
+  }
+  for (const request of requests) {
+    const body = JSON.parse(String(request.body));
+    const data = JSON.parse(body.contents[0].parts[0].text);
+    assert.equal(data.mode, "edit");
+    assert.deepEqual(data.currentProject, createDefaultBlinkProject());
+  }
+});
+
+test("forwards only the default and selected Gemini models", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (input, init) => {
+    requests.push({ url: String(input), init });
+    return Response.json({
+      candidates: [{
+        finishReason: "STOP",
+        content: { parts: [{ text: JSON.stringify(generatedEnvelope) }] },
+      }],
+    });
+  };
+
+  const defaultResponse = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompt: "Blink an LED" }),
+  }));
+  const liteResponse = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompt: "Blink an LED", model: "gemini-3.5-flash-lite" }),
+  }));
+
+  assert.equal(defaultResponse.status, 200);
+  assert.equal(liteResponse.status, 200);
+  assert.equal((await defaultResponse.json()).model, "gemini-3.5-flash-lite");
+  assert.equal((await liteResponse.json()).model, "gemini-3.5-flash-lite");
+  assert.match(requests[0].url, /models\/gemini-3\.5-flash-lite:generateContent$/);
+  assert.match(requests[1].url, /models\/gemini-3\.5-flash-lite:generateContent$/);
+
+  for (const request of requests) {
+    const headers = new Headers(request.init?.headers);
+    const body = JSON.parse(String(request.init?.body));
+    assert.equal(headers.get("x-goog-api-key"), "test-secret");
+    assert.equal(body.generationConfig.maxOutputTokens, 32_768);
+    assert.equal(body.generationConfig.responseMimeType, "application/json");
+    assert.equal(body.generationConfig.responseJsonSchema.type, "object");
+    assert.ok(body.generationConfig.responseJsonSchema.properties.projectId);
+    assert.equal("temperature" in body.generationConfig, false);
+  }
+});
+
+test("repairs malformed JSON before returning a circuit", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const requests: RequestInit[] = [];
+  const responses = [
+    modelResponse('{"project":'),
+    modelResponse(JSON.stringify(generatedEnvelope)),
+  ];
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    requests.push(init ?? {});
+    return responses.shift() ?? modelResponse("");
+  };
+
+  const response = await POST(generationRequest("gemini-3.5-flash-lite"));
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).model, "gemini-3.5-flash-lite");
+  assert.equal(requests.length, 2);
+  const repairBody = JSON.parse(String(requests[1].body));
+  const repairData = JSON.parse(repairBody.contents[0].parts[0].text);
+  assert.match(repairData.task, /Repair only the circuit plan response/);
+  assert.deepEqual(repairData.validationIssues, ["response invalid_json"]);
+  assert.equal(repairData.rejectedResponse, '{"project":');
+});
+
+test("passes schema issues into the repair attempt", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const requests: RequestInit[] = [];
+  const responses = [
+    modelResponse(JSON.stringify({ project: {} })),
+    modelResponse(JSON.stringify(generatedEnvelope)),
+  ];
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    requests.push(init ?? {});
+    return responses.shift() ?? modelResponse("");
+  };
+
+  const response = await POST(generationRequest());
+  assert.equal(response.status, 200);
+  const repairBody = JSON.parse(String(requests[1].body));
+  const repairData = JSON.parse(repairBody.contents[0].parts[0].text);
+  assert.ok(repairData.validationIssues.some((issue: string) => issue.includes("boards must contain")));
+  assert.equal("details" in (await response.json()), false);
+});
+
+test("repairs simulator-unsupported Arduino code before accepting a project", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const requests: RequestInit[] = [];
+  const unsupported = {
+    ...generatedEnvelope,
+    project: { ...generatedEnvelope.project, code: "void setup(){ lcd.unsupported(); } void loop(){}" },
+  };
+  const responses = [modelResponse(JSON.stringify(unsupported)), modelResponse(JSON.stringify(generatedEnvelope))];
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    requests.push(init ?? {});
+    return responses.shift() ?? modelResponse("");
+  };
+  const response = await POST(generationRequest());
+  assert.equal(response.status, 200);
+  assert.equal(requests.length, 2);
+  const repairBody = JSON.parse(String(requests[1].body));
+  const repairData = JSON.parse(repairBody.contents[0].parts[0].text);
+  assert.ok(repairData.validationIssues.some((issue: string) => issue.includes("programs.uno") && issue.includes("calls unsupported lcd.unsupported()")));
+});
+
+test("regenerates cleanly when repair is also malformed", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const requests: RequestInit[] = [];
+  const responses = [
+    modelResponse("not json"),
+    modelResponse("still not json"),
+    modelResponse(JSON.stringify(generatedEnvelope)),
+  ];
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    requests.push(init ?? {});
+    return responses.shift() ?? modelResponse("");
+  };
+
+  const response = await POST(generationRequest());
+  assert.equal(response.status, 200);
+  assert.equal(requests.length, 3);
+  const firstBody = JSON.parse(String(requests[0].body));
+  const repairBody = JSON.parse(String(requests[1].body));
+  const regeneratedBody = JSON.parse(String(requests[2].body));
+  const regeneratedData = JSON.parse(regeneratedBody.contents[0].parts[0].text);
+  assert.equal(regeneratedData.rejectedResponse, "still not json");
+  assert.match(regeneratedData.task, /Repair only the circuit plan response/);
+  assert.equal(JSON.parse(firstBody.contents[0].parts[0].text).mode, "create");
+  assert.notEqual(
+    repairBody.contents[0].parts[0].text,
+    firstBody.contents[0].parts[0].text,
+  );
+});
+
+test("reports when the provider repeats a malformed generation response", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  let calls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async () => {
+    calls += 1;
+    return modelResponse("malformed");
+  };
+
+  const response = await POST(generationRequest());
+  const body = await response.json();
+  assert.equal(response.status, 502);
+  assert.equal(calls, 3);
+  assert.equal(body.error.code, "AI_REPAIR_NO_CHANGE");
+  assert.match(body.error.message, /same invalid/);
+  assert.ok(Array.isArray(body.error.details));
+});
+
+test("provider request rejection exposes sanitized field diagnostics", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async () => Response.json({ error: {
+    message: "Request contains an invalid argument.",
+    details: [{ fieldViolations: [{ field: "generationConfig.responseFormat", description: "unsupported schema field" }] }],
+  } }, { status: 400 });
+
+  const response = await POST(generationRequest());
+  const body = await response.json();
+  assert.equal(response.status, 502);
+  assert.deepEqual(body.error.details, ["generationConfig.responseFormat: unsupported schema field"]);
+});
+
+test("daily Gemini quota exhaustion reports the provider error without retrying the same model", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const originalWarn = console.warn;
+  let calls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
+    console.warn = originalWarn;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  console.warn = () => {};
+  globalThis.setTimeout = ((...args: Parameters<typeof setTimeout>) => {
+    const [callback, delay, ...extra] = args;
+    return originalSetTimeout(callback, delay === 30_000 || delay === 60_000 ? 0 : delay, ...extra);
+  }) as typeof setTimeout;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return Response.json({ error: {
+      status: "RESOURCE_EXHAUSTED",
+      message: "You exceeded your current quota.",
+      details: [{
+        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+        violations: [{ quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier" }],
+      }],
+    } }, { status: 429 });
+  };
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/x-ndjson" },
+    body: JSON.stringify({ prompt: "Blink an LED" }),
+  }));
+  const events = (await response.text()).trim().split("\n").map(line => JSON.parse(line));
+  const error = events.at(-1)?.error;
+  assert.equal(calls, 1);
+  assert.equal(events.at(-1)?.type, "error");
+  assert.equal(error?.code, "AI_DAILY_QUOTA_EXCEEDED");
+  assert.equal(error?.retryable, false);
+  assert.match(error?.message ?? "", /daily request quota is exhausted/i);
+  assert.ok(error?.details?.some((detail: string) => detail.includes("You exceeded your current quota")));
+});
+
+
+test("NDJSON generation streams planning, generation, validation, and one complete result", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async () => modelResponse(JSON.stringify(generatedEnvelope));
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/x-ndjson" },
+    body: JSON.stringify({ prompt: "Blink an LED" }),
+  }));
+  assert.equal(response.headers.get("content-type"), "application/x-ndjson; charset=utf-8");
+  const events = (await response.text()).trim().split("\n").map(line => JSON.parse(line));
+  assert.deepEqual(events.at(-1)?.type, "complete");
+  assert.equal(events.filter(event => event.type === "complete").length, 1);
+  const stages = events.filter(event => event.type === "progress").map(event => event.stage);
+  assert.ok(stages.includes("planning"));
+  assert.ok(stages.includes("generating"));
+  assert.ok(stages.includes("validating"));
+  assert.ok(events.at(-1)?.result?.project?.schemaVersion === 1);
+});
+
+test("transient Gemini failures are retried and expose the provider's HTTP status", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  let calls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async () => {
+    calls += 1;
+    return Response.json({ error: { status: "UNAVAILABLE", message: "This model is currently experiencing high demand." } }, { status: 503, headers: { "retry-after": "0" } });
+  };
+
+  const response = await POST(generationRequest());
+  const body = await response.json();
+  assert.equal(response.status, 503);
+  assert.equal(calls, 1 + 2);
+  assert.equal(body.error.code, "AI_UNAVAILABLE");
+  assert.match(body.error.message, /Gemini returned temporary HTTP 503 \(UNAVAILABLE\)/);
+  assert.deepEqual(body.error.details, ["Google Gemini: This model is currently experiencing high demand."]);
+  assert.equal(body.error.retryable, true);
+});
+
+test("Retry-After beyond the request deadline is not retried", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  let calls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async () => {
+    calls += 1;
+    return Response.json({ error: { message: "temporarily unavailable" } }, { status: 503, headers: { "retry-after": "3600" } });
+  };
+  const response = await POST(generationRequest());
+  assert.equal(response.status, 503);
+  assert.equal(calls, 1);
+});
+
+test("generation succeeds after a transient Gemini 503", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) return Response.json({ error: { message: "temporarily unavailable" } }, { status: 503, headers: { "retry-after": "0" } });
+    return modelResponse(JSON.stringify(generatedEnvelope));
+  };
+
+  const response = await POST(generationRequest());
+  assert.equal(response.status, 200);
+  assert.equal(calls, 2);
+});
+
+test("a transient provider connection failure is retried before generation is reported failed", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.setTimeout = ((...args: Parameters<typeof setTimeout>) => {
+    const [callback, delay, ...extra] = args;
+    return originalSetTimeout(callback, delay === 30_000 || delay === 60_000 ? 0 : delay, ...extra);
+  }) as typeof setTimeout;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) throw new TypeError("temporary network failure");
+    return modelResponse(JSON.stringify(generatedEnvelope));
+  };
+
+  const response = await POST(generationRequest());
+  assert.equal(response.status, 200);
+  assert.equal(calls, 2);
+});
+
+test("provider network failures expose sanitized low-level diagnostics in the UI and server log", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const originalWarn = console.warn;
+  const warnings: string[] = [];
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
+    console.warn = originalWarn;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret-do-not-log";
+  console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+  globalThis.setTimeout = ((...args: Parameters<typeof setTimeout>) => {
+    const [callback, delay, ...extra] = args;
+    return originalSetTimeout(callback, delay === 30_000 || delay === 60_000 ? 0 : delay, ...extra);
+  }) as typeof setTimeout;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    const denied = Object.assign(new Error("socket permission denied"), { code: "EACCES", errno: -4092, syscall: "connect" });
+    const unreachable = Object.assign(new Error("no network route"), { code: "ENETUNREACH", errno: -4062, syscall: "connect" });
+    const aggregate = Object.assign(new AggregateError([denied, unreachable], "all connection attempts failed"), { code: "EACCES" });
+    throw new TypeError("fetch failed", { cause: aggregate });
+  };
+
+  const response = await POST(generationRequest());
+  const body = await response.json() as { error?: { code?: string; message?: string; details?: string[] } };
+  assert.equal(response.status, 503);
+  assert.equal(body.error?.code, "AI_UNAVAILABLE");
+  assert.equal(calls, 3, "the request should retain its bounded retry behavior");
+  assert.ok(body.error?.details?.some(detail => detail.includes("EACCES") && detail.includes("ENETUNREACH")));
+  assert.match(body.error?.details?.[0] ?? "", /outbound socket connection/);
+  assert.ok(warnings.some(line => line.includes("[ai-generation-network-retry]") && line.includes("EACCES") && line.includes("ENETUNREACH") && line.includes("connect")));
+  assert.ok(warnings.some(line => line.includes("[ai-generation-network-failure]") && line.includes("outbound_access_denied+network_unreachable")));
+  assert.doesNotMatch(warnings.join("\n"), /test-secret-do-not-log|Blink an LED|socket permission denied|all connection attempts failed/);
+});
+
+
+test("newly published sensor and radio hardware pass simulation preflight", async context => {
+  const originalFetch = globalThis.fetch; const originalKey = process.env.GEMINI_API_KEY;
+  context.after(() => { globalThis.fetch = originalFetch; if (originalKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = originalKey; });
+  process.env.GEMINI_API_KEY = "test-secret";
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return Response.json({ error: { message: "temporary provider failure" } }, { status: 503, headers: { "retry-after": "3600" } });
+  };
+  for (const name of ["BME280", "LoRa", "Zigbee"]) {
+    const response = await POST(new Request("http://localhost/api/ai/generate", { method: "POST", body: JSON.stringify({ prompt: `Create a circuit with ${name}`, target: "simulation" }) }));
+    assert.equal(response.status, 503);
+    assert.notEqual((await response.json()).error.code, "COMPONENT_UNAVAILABLE");
+  }
+  assert.equal(calls, 3);
+});
+
+test("non-simulation generation modes are rejected without provider access", async context => {
+  const originalFetch = globalThis.fetch;
+  context.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => { throw new Error("must not contact provider"); };
+  const response = await POST(new Request("http://localhost/api/ai/generate", { method: "POST", body: JSON.stringify({ prompt: "Create a BME280 circuit", target: "design" }) }));
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).error.code, "INVALID_GENERATION_TARGET");
+});
+
+test("simulation never accepts a provider-inserted unregistered part", async context => {
+  const originalFetch = globalThis.fetch; const originalKey = process.env.GEMINI_API_KEY;
+  context.after(() => { globalThis.fetch = originalFetch; if (originalKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = originalKey; });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const envelope = structuredClone(generatedEnvelope);
+  envelope.project.components.push({ id: "draft", type: "unfinished-draft-part", label: "Draft part", x: 700, y: 0 });
+  globalThis.fetch = async () => modelResponse(JSON.stringify(envelope));
+  const response = await POST(generationRequest());
+  assert.equal(response.status, 502);
+});
+
+test("I2C connection failures retry every subsystem that owns a bus device or named bus net", () => {
+  const plan: FixturePlan = {
+    projectId: "bus_retry",
+    name: "Bus retry",
+    description: "",
+    boards: [{ id: "uno", type: "arduino-uno", label: "Arduino Uno" }],
+    components: [
+      { id: "mux", type: "tca9548a", label: "Mux", subsystemId: "sensing" },
+      { id: "west", type: "bme280", label: "West sensor", subsystemId: "sensing" },
+      { id: "io", type: "mcp23017", label: "LED expander", subsystemId: "indicators" },
+      { id: "driver", type: "tb6612fng", label: "Fan driver", subsystemId: "fan" },
+    ],
+    subsystems: [
+      { id: "sensing", name: "Sensing", goal: "Read sensors" },
+      { id: "indicators", name: "Indicators", goal: "Control LEDs" },
+      { id: "fan", name: "Fan", goal: "Control the fan" },
+    ],
+    nets: [{ id: "i2c", name: "Upstream I2C SDA/SCL", subsystemIds: ["sensing", "indicators"] }],
+    estimatedNetTerminals: 12,
+    requirements: [{ id: "read", description: "Read sensors" }],
+  };
+
+  const affected = affectedSubsystems(plan, ["project.circuit DEVICE_NOT_CONNECTED: mux.begin: no powered, correctly wired device responds."]);
+  assert.deepEqual(new Set(affected), new Set(["sensing", "indicators"]));
+});
+
+test("shared-ground LED diagnostics belong only to the indicator subsystem", () => {
+  const project = threeLedSharedGroundProject();
+  project.components.push(
+    { id: "sensor", type: "bme280", label: "Climate sensor", x: 500, y: 500 },
+    { id: "display", type: "lcd-16x2", label: "Status display", x: 800, y: 500 },
+    { id: "button", type: "push-button", label: "Mode button", x: 1100, y: 500 },
+    { id: "motor", type: "dc-motor", label: "Fan motor", x: 1400, y: 500 },
+  );
+  for (const [id, pin] of [["sensor", "GND"], ["display", "GND"], ["button", "2"], ["motor", "-"]] as const) {
+    project.connections.push({ id: `wire-${id}-common-return`, from: { componentId: id, pin }, to: { componentId: "uno", pin: "GND" } });
+  }
+  const plan: FixturePlan = {
+    projectId: "shared_ground_test", name: "Shared ground", description: "",
+    boards: [{ id: "uno", type: "arduino-uno", label: "Arduino Uno" }],
+    components: [
+      ...["led1", "led2", "led3"].map((id, index) => ({ id, type: "led", label: `Indicator ${index + 1}`, subsystemId: "indicators" })),
+      { id: "sensor", type: "bme280", label: "Climate sensor", subsystemId: "sensors" },
+      { id: "display", type: "lcd-16x2", label: "Status display", subsystemId: "display" },
+      { id: "button", type: "push-button", label: "Mode button", subsystemId: "inputs" },
+      { id: "motor", type: "dc-motor", label: "Fan motor", subsystemId: "actuators" },
+    ],
+    subsystems: [
+      { id: "indicators", name: "Indicators", goal: "Drive the LEDs." },
+      { id: "sensors", name: "Sensors", goal: "Read the sensor." },
+      { id: "display", name: "Display", goal: "Show status." },
+      { id: "inputs", name: "Inputs", goal: "Read the button." },
+      { id: "actuators", name: "Actuators", goal: "Drive the motor." },
+    ],
+    nets: [{ id: "common_ground", name: "Common GND", subsystemIds: ["indicators", "sensors", "display", "inputs", "actuators"] }],
+    estimatedNetTerminals: 20, requirements: [],
+  };
+  const issues = ledSeriesResistorIssues(project);
+  const diagnostics = structuredIssueDiagnostics(project, issues);
+  assert.equal(diagnostics.length, 3);
+  for (const diagnostic of diagnostics) {
+    assert.equal(diagnostic.componentIds.length, 1);
+    assert.match(diagnostic.componentIds[0]!, /^led[1-3]$/);
+    assert.ok(diagnostic.wireIds.length <= 2, diagnostic.wireIds.join(", "));
+    assert.ok(diagnostic.wireIds.every(id => id.includes(diagnostic.componentIds[0]!)), diagnostic.wireIds.join(", "));
+  }
+  assert.deepEqual(affectedSubsystems(plan, issues, diagnostics), ["indicators"]);
+});
+
+test("staged repairs include NeoPixel subsystems alongside simultaneous I2C faults", () => {
+  const plan: FixturePlan = {
+    projectId: "mixed_bus_and_strip_faults",
+    name: "RTC and strip",
+    description: "",
+    boards: [{ id: "uno", type: "arduino-uno", label: "Arduino Uno" }],
+    components: [
+      { id: "bme", type: "bme280", label: "BME280 Sensor", subsystemId: "sensing" },
+      { id: "rtc", type: "ds3231-rtc", label: "DS3231 RTC", subsystemId: "clock" },
+      { id: "strip", type: "ws2812b-strip-8", label: "WS2812B LED Strip", subsystemId: "lighting" },
+    ],
+    subsystems: [
+      { id: "sensing", name: "Sensing", goal: "Read environment" },
+      { id: "clock", name: "Clock", goal: "Read time" },
+      { id: "lighting", name: "Lighting", goal: "Drive pixels" },
+    ],
+    nets: [{ id: "i2c", name: "Shared I2C SDA/SCL bus", subsystemIds: ["sensing", "clock"] }],
+    estimatedNetTerminals: 16,
+    requirements: [{ id: "display", description: "Show readings" }],
+  };
+
+  const affected = affectedSubsystems(plan, [
+    "project.circuit DEVICE_NOT_CONNECTED: bme.begin(): no powered, correctly wired BME280 responds.",
+    "project.circuit NEOPIXEL_NOT_CONNECTED: strip.begin(): no powered, correctly wired WS2812B responds on its configured digital pin.",
+  ]);
+  assert.deepEqual(new Set(affected), new Set(["sensing", "clock", "lighting"]));
+});
+
+test("fragment fingerprints ignore canvas placement but detect changed electrical endpoints", () => {
+  const fragment = {
+    subsystemId: "fan",
+    placements: [{ id: "motor", x: 0, y: 0, properties: { rpm: 1000 } }],
+    nets: [{ id: "motor-output", endpoints: [{ componentId: "driver", pin: "AO1_1" }, { componentId: "motor", pin: "+" }] }],
+  };
+  const moved = structuredClone(fragment);
+  moved.placements[0].x = 700;
+  moved.placements[0].y = -400;
+  assert.equal(fragmentTopologyFingerprint(moved), fragmentTopologyFingerprint(fragment));
+  const rewired = structuredClone(fragment);
+  rewired.nets[0].endpoints[0].pin = "AO2_5";
+  assert.notEqual(fragmentTopologyFingerprint(rewired), fragmentTopologyFingerprint(fragment));
+});
+
+test("structured motor diagnostics select the precise motor subsystem", () => {
+  const plan = {
+    components: [
+      { id: "west", type: "bme280", label: "West sensor", subsystemId: "sensing" },
+      { id: "fan", type: "dc-motor", label: "Ventilation fan", subsystemId: "motor" },
+      { id: "driver", type: "tb6612fng", label: "Motor driver", subsystemId: "motor" },
+    ],
+    subsystems: [{ id: "sensing", name: "Sensing", goal: "Read both zones" }, { id: "motor", name: "Ventilation", goal: "Drive fan" }],
+    nets: [{ id: "fan-net", name: "Fan channel A output", subsystemIds: ["motor"] }],
+  } as Parameters<typeof affectedSubsystems>[0];
+  const issue = "project.circuit motor-terminals-shorted: Ventilation fan + and - are connected to the same net.";
+  const diagnostic = {
+    code: "motor-terminals-shorted", message: "Ventilation fan + and - are connected to the same net.",
+    componentIds: ["fan", "driver"], wireIds: ["wire_fan-net_1", "wire_fan-net_2"],
+    nets: [{ id: "fan-net", endpoints: [{ componentId: "fan", pin: "+" }, { componentId: "fan", pin: "-" }], wireIds: ["wire_fan-net_1", "wire_fan-net_2"] }],
+    expectedTopology: "Separate motor terminals across opposite channel outputs.",
+  };
+  assert.deepEqual(affectedSubsystems(plan, [issue], [diagnostic]), ["motor"]);
+});

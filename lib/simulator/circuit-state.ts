@@ -270,7 +270,12 @@ export function solveCircuit(
   const powered = (id: string) => high(id, "VCC") && low(id, "GND");
   const diagnostics: SimulatorDiagnostic[] = validatePartWiring(project);
   if (!network.stable) diagnostics.push({ severity: "error", code: "circuit-unstable", message: "The circuit did not settle; check feedback and switched connections." });
-  if (network.conflict) diagnostics.push({ severity: "error", code: "output-contention", message: "A circuit net is being driven to conflicting voltage levels." });
+  if (network.conflict) {
+    const nets = (network.conflicts ?? []).slice(0, 3).join("; ");
+    diagnostics.push({ severity: "error", code: "output-contention", message: nets
+      ? `Conflicting output levels share a wire net: ${nets}. Separate these pins or correct the output wiring.`
+      : "A circuit net is being driven to conflicting voltage levels; inspect the connected output pins and separate incompatible drives." });
+  }
   const componentStates: Record<string, SimulatedComponentState> = {};
   const level = (id: string, pin: string) => {
     const item = reading(id, pin);
@@ -286,19 +291,6 @@ export function solveCircuit(
     } else if (definition && simulationCapability(definition) === "unavailable") {
       componentStates[id] = { type, powered: false };
       diagnostics.push({ severity: "error", code: "component-unavailable", message: `${component.label} has no accepted simulation model yet. Its saved wiring is preserved; remove it from this circuit to run.` });
-    } else if (definition?.simulation?.model && (STATEFUL_MODEL_REGISTRY[definition.simulation.model] || POWER_MODEL_REGISTRY[definition.simulation.model])) {
-      // These models are evaluated by DeviceRuntime, not the combinational network.
-      const state = snapshot.componentStates[id];
-      componentStates[id] = state ?? { type, powered: false };
-      if (STATEFUL_MODEL_REGISTRY[definition.simulation.model] && !state?.powered) diagnostics.push({ severity: "warning", code: "component-unpowered", message: `${component.label}: connect its supply and ground pins.` });
-    } else if (definition?.simulation?.model) {
-      const result = network.results.get(id);
-      const isPowered = network.stable && !!result?.powered;
-      componentStates[id] = type === "soil-moisture-sen0193"
-        ? { type, powered: isPowered, status: isPowered ? "Monitoring" : "Unpowered", analogValue: Math.round((result?.outputs.AOUT ?? 0) * 1023), readings: isPowered ? { moisture: Number(component.properties?.moisture ?? 50) } : {} }
-        : { type, powered: isPowered, channels: result?.outputs };
-      if (!result?.powered) diagnostics.push({ severity: "warning", code: "component-unpowered", message: `${component.label}: connect its supply and ground pins.` });
-      if (result?.missing.length) diagnostics.push({ severity: "warning", code: "floating-control", message: `${component.label}: undriven control or sense pins: ${[...new Set(result.missing)].join(", ")}.` });
     } else if (["hc-sr04", "temperature-sensor", "pir-sensor"].includes(type)) {
       const isPowered = network.stable && high(id, "VCC") && low(id, "GND");
       if (type === "temperature-sensor") {
@@ -313,6 +305,19 @@ export function solveCircuit(
         componentStates[id] = { type, powered: isPowered, readings: isPowered ? { distanceCm: distance } : {} };
       }
       if (!isPowered) diagnostics.push({ severity: "warning", code: "component-unpowered", message: `${component.label}: connect its supply and ground pins.` });
+    } else if (definition?.simulation?.model && (STATEFUL_MODEL_REGISTRY[definition.simulation.model] || POWER_MODEL_REGISTRY[definition.simulation.model])) {
+      // These models are evaluated by DeviceRuntime, not the combinational network.
+      const state = snapshot.componentStates[id];
+      componentStates[id] = state ?? { type, powered: false };
+      if (STATEFUL_MODEL_REGISTRY[definition.simulation.model] && !state?.powered) diagnostics.push({ severity: "warning", code: "component-unpowered", message: `${component.label}: connect its supply and ground pins.` });
+    } else if (definition?.simulation?.model) {
+      const result = network.results.get(id);
+      const isPowered = network.stable && !!result?.powered;
+      componentStates[id] = type === "soil-moisture-sen0193"
+        ? { type, powered: isPowered, status: isPowered ? "Monitoring" : "Unpowered", analogValue: Math.round((result?.outputs.AOUT ?? 0) * 1023), readings: isPowered ? { moisture: Number(component.properties?.moisture ?? 50) } : {} }
+        : { type, powered: isPowered, channels: result?.outputs };
+      if (!result?.powered) diagnostics.push({ severity: "warning", code: "component-unpowered", message: `${component.label}: connect its supply and ground pins.` });
+      if (result?.missing.length) diagnostics.push({ severity: "warning", code: "floating-control", message: `${component.label}: undriven control or sense pins: ${[...new Set(result.missing)].join(", ")}.` });
     } else if (type === "led" || type === "buzzer") {
       const a = reading(id, type === "led" ? "A" : "+");
       const b = reading(id, type === "led" ? "K" : "-");

@@ -20,11 +20,13 @@ import type {
   SimulatorPhase,
   SimulatorSnapshot,
   SimulatorStatus,
+  SketchHelperStatement,
   SketchInstruction,
   UnoPinState,
 } from "./types.ts";
 
 const DEFAULT_MAX_OPERATIONS = 1_000;
+const NO_DELAY_OPERATION_BUDGET = 64;
 const DEFAULT_MAX_SERIAL_ENTRIES = 500;
 const MIN_SPEED = 0.05;
 const MAX_SPEED = 100;
@@ -120,6 +122,7 @@ export class ArduinoSimulator {
   private readonly requestedBoardComponentId?: string;
   private serial: SerialEntry[] = [];
   private variables = new Map<string, number>();
+  private integerVariables = new Set<string>();
   private nextSerialId = 1;
   private servos = new Map<string, ServoState>();
   private lcds = new Map<string, LcdState>();
@@ -128,6 +131,7 @@ export class ArduinoSimulator {
   private analogInputs = new Map<number, number>();
   private circuitAnalogInputs = new Set<number>();
   private pulseInputs = new Map<number, number>();
+  private circuitPulseInputs = new Map<number, number>();
   private readonly maxOperationsPerAdvance: number;
   private readonly maxSerialEntries: number;
   private readonly listeners = new Set<SimulatorListener>();
@@ -149,7 +153,8 @@ export class ArduinoSimulator {
       DEFAULT_MAX_SERIAL_ENTRIES,
     );
     this.compiled = compileArduinoSketch(source, this.boardId);
-    this.variables = new Map(Object.entries(this.compiled.globals));
+    this.integerVariables = new Set(this.compiled.integerVariables ?? []);
+    this.variables = new Map(Object.entries(this.compiled.globals).map(([name, value]) => [name, this.integerVariables.has(name) ? Math.trunc(value) : value]));
     this.status = this.compiled.valid ? "idle" : "error";
     this.snapshot = freezeSnapshot(
       this.status,
@@ -239,7 +244,8 @@ export class ArduinoSimulator {
     this.waitRemainingMs = 0;
     this.pins = createInitialPinStates(this.boardId);
     this.serial = [];
-    this.variables = new Map(Object.entries(this.compiled.globals));
+    this.integerVariables = new Set(this.compiled.integerVariables ?? []);
+    this.variables = new Map(Object.entries(this.compiled.globals).map(([name, value]) => [name, this.integerVariables.has(name) ? Math.trunc(value) : value]));
     this.nextSerialId = 1;
     this.servos.clear();
     this.lcds.clear();
@@ -337,8 +343,15 @@ export class ArduinoSimulator {
       budget = 0;
     }
     let operations = 0;
+    // A tight Arduino loop is normal on hardware, but running a thousand
+    // instructions per animation frame can monopolize the browser when each
+    // instruction also refreshes the connected device models. Yield sooner
+    // for sketches without a delay so the editor remains interactive.
+    const operationBudget = this.compiled.loop.some(i => i.kind === "delay")
+      ? this.maxOperationsPerAdvance
+      : Math.min(this.maxOperationsPerAdvance, NO_DELAY_OPERATION_BUDGET);
 
-    while (this.status === "running" && operations < this.maxOperationsPerAdvance) {
+    while (this.status === "running" && operations < operationBudget) {
       this.normalizeCursor();
       if (this.status !== "running") break;
 
@@ -556,12 +569,63 @@ export class ArduinoSimulator {
     const analogInputs = this.boardComponentId ? solution.boardAnalogInputs[this.boardComponentId] : solution.analogInputs;
     for (const [number, value] of Object.entries(digitalInputs ?? {})) if (this.pins[Number(number)]?.mode !== "OUTPUT") { this.pins[Number(number)].digitalValue = value; this.pins[Number(number)].pwmValue = value * 255; }
     this.replaceCircuitAnalogInputs(analogInputs);
+    this.replaceCircuitPulseInputs(project, solution.componentStates);
     this.componentStates = { ...solution.componentStates, ...this.devices.states };
   }
+
+  /** Bind a powered HC-SR04's configured distance to its wired board ECHO pin.
+   * Explicit setPulseInput() values remain overrides for interactive tests. */
+  private replaceCircuitPulseInputs(project: CircuitProject, componentStates: Readonly<Record<string, SimulatedComponentState>>) {
+    const next = new Map<number, number>();
+    const conflictingPins = new Set<number>();
+    const boards = project.components.filter(component => isBoardType(component.type)
+      && (!this.boardComponentId || component.id === this.boardComponentId));
+    for (const sensor of project.components.filter(component => component.type === "hc-sr04")) {
+      if (!componentStates[sensor.id]?.powered) continue;
+      const echoWire = project.connections.find(connection => {
+        const endpoint = connection.from.componentId === sensor.id && connection.from.pin === "ECHO"
+          ? connection.to
+          : connection.to.componentId === sensor.id && connection.to.pin === "ECHO" ? connection.from : undefined;
+        if (!endpoint) return false;
+        const board = boards.find(candidate => candidate.id === endpoint.componentId);
+        return !!board && !!getBoardProfile(board.type)?.ioPins.some(pin => pin.id === endpoint.pin);
+      });
+      if (!echoWire) continue;
+      const endpoint = echoWire.from.componentId === sensor.id ? echoWire.to : echoWire.from;
+      const board = boards.find(candidate => candidate.id === endpoint.componentId);
+      const profile = board ? getBoardProfile(board.type) : undefined;
+      const pin = profile?.ioPins.find(candidate => candidate.id === endpoint.pin)?.runtimePin;
+      if (pin === undefined || conflictingPins.has(pin)) continue;
+      const sensorState = componentStates[sensor.id];
+      const distance = Number(sensorState?.readings?.distanceCm ?? sensor.properties?.distanceCm ?? 100);
+      const duration = Math.max(0, Math.min(400, Number.isFinite(distance) ? distance : 100)) * 58.3;
+      if (next.has(pin) && Math.abs(next.get(pin)! - duration) > 1) {
+        next.delete(pin);
+        conflictingPins.add(pin);
+      } else next.set(pin, duration);
+    }
+    this.circuitPulseInputs = next;
+  }
   private execute(instruction: SketchInstruction) {
-    this.updateDevices(); this.executeInstruction(instruction);
+    const isSerialCall = instruction.kind === "deviceCall" && /^Serial[1-3]$/.test(instruction.instance);
+    const readsPins = /\b(?:digitalRead|analogRead|pulseIn)\s*\(/.test(JSON.stringify(instruction));
+    const writesPin = instruction.kind === "pinMode" || instruction.kind === "digitalWrite" || instruction.kind === "digitalWriteExpression" || instruction.kind === "analogWrite" || instruction.kind === "analogWriteExpression";
+    const pinBefore = writesPin ? { ...this.pins[instruction.pin] } : undefined;
+    if (instruction.kind === "fileOpen" || instruction.kind === "deviceCall" && !isSerialCall || readsPins) this.updateDevices();
+    this.executeInstruction(instruction);
     if (this.devices?.pendingDelayMs) { this.waitRemainingMs = this.devices.pendingDelayMs; this.devices.pendingDelayMs = 0; }
-    this.updateDevices();
+    if (writesPin && pinBefore) {
+      const pinAfter = this.pins[instruction.pin];
+      if (pinBefore.mode !== pinAfter.mode || pinBefore.digitalValue !== pinAfter.digitalValue || pinBefore.pwmValue !== pinAfter.pwmValue) {
+        // External devices must see every electrical edge, even when a sketch
+        // raises and lowers a pin during one animation-frame advance.
+        this.updateDevices();
+        // The DC model derives ideal-switch conduction from the just-updated
+        // GPIO voltage. A same-time settling pass applies that gate state to
+        // load current without advancing the battery clock twice.
+        if (this.project?.components.some(component => component.type === "ideal-mosfet")) this.updateDevices();
+      }
+    }
   }
   private executeInstruction(instruction: SketchInstruction): void {
     if (instruction.kind === "fileOpen") {
@@ -624,7 +688,11 @@ export class ArduinoSimulator {
 
     if (instruction.kind === "declare" || instruction.kind === "assign") {
       const value = this.evaluate(instruction.expression);
-      if (value !== undefined) this.variables.set(instruction.name, value);
+      if (instruction.kind === "declare" && instruction.integer !== undefined) {
+        if (instruction.integer) this.integerVariables.add(instruction.name);
+        else this.integerVariables.delete(instruction.name);
+      }
+      if (value !== undefined) this.variables.set(instruction.name, this.integerVariables.has(instruction.name) ? Math.trunc(value) : value);
       return;
     }
 
@@ -823,7 +891,35 @@ export class ArduinoSimulator {
     return String(this.deviceValue(unwrapped));
   }
 
-  private evaluate(expression: string): number | undefined {
+  private evaluateHelper(name: string, args: readonly number[], depth: number): number | undefined {
+    const helper = this.compiled.helpers[name];
+    if (!helper || depth > 16 || args.length !== helper.parameters.length) return undefined;
+    const integral = (type: string) => !/\b(?:float|double)\b/.test(type);
+    const integerArithmetic = integral(helper.returnType) && helper.parameterTypes.every(integral);
+    const previousVariables = this.variables;
+    this.variables = new Map(previousVariables);
+    helper.parameters.forEach((parameter, index) => this.variables.set(parameter, integral(helper.parameterTypes[index]) ? Math.trunc(args[index]) : args[index]));
+    const evaluateStatements = (statements: readonly SketchHelperStatement[]): { returned: boolean; value?: number } => {
+      for (const statement of statements) {
+        if (statement.kind === "return") return { returned: true, value: this.evaluate(statement.expression, depth, integerArithmetic) };
+        const condition = this.evaluate(statement.condition, depth, integerArithmetic);
+        if (condition === undefined) return { returned: true };
+        const branch = evaluateStatements(condition !== 0 ? statement.then : statement.otherwise);
+        if (branch.returned) return branch;
+      }
+      return { returned: false };
+    };
+    try {
+      const result = evaluateStatements(helper.body);
+      return result.returned && result.value !== undefined
+        ? integral(helper.returnType) ? Math.trunc(result.value) : result.value
+        : undefined;
+    } finally {
+      this.variables = previousVariables;
+    }
+  }
+
+  private evaluate(expression: string, helperDepth = 0, integerDivision = false): number | undefined {
     const values = new Map(this.variables);
     values.set("LOW", 0);
     values.set("HIGH", 1);
@@ -865,14 +961,17 @@ export class ArduinoSimulator {
       isnan: value => Number(Number.isNaN(value)),
       digitalRead: (pin) => this.pins[Math.trunc(pin)]?.digitalValue ?? 0,
       analogRead: (pin) => this.analogInputs.get(Math.trunc(pin)) ?? 0,
-      pulseIn: (pin) => this.pulseInputs.get(Math.trunc(pin)) ?? 0,
+      pulseIn: (pin) => this.pulseInputs.get(Math.trunc(pin)) ?? this.circuitPulseInputs.get(Math.trunc(pin)) ?? 0,
       map: (value, fromLow, fromHigh, toLow, toHigh) => fromHigh === fromLow ? toLow : (value - fromLow) * (toHigh - toLow) / (fromHigh - fromLow) + toLow,
       constrain: (value, low, high) => Math.min(high, Math.max(low, value)),
       min: (...args) => Math.min(...args),
       max: (...args) => Math.max(...args),
     };
     this.servos.forEach((servo, name) => { functions[`servoRead_${name}`] = () => servo.angle; });
-    return evaluateRuntimeExpression(normalized, values, functions);
+    Object.keys(this.compiled.helpers).forEach(name => {
+      functions[name] = (...args) => this.evaluateHelper(name, args, helperDepth + 1) ?? Number.NaN;
+    });
+    return evaluateRuntimeExpression(normalized, values, functions, integerDivision);
   }
 
   private resolvePin(pin: number | string): number | undefined {
