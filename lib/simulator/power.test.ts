@@ -47,4 +47,27 @@ test("protection switch disconnects the load and source conflicts produce diagno
   const conflict = runtime.solve(project, 0, { switch: 1 });
   assert.ok(conflict.diagnostics.some(d => d.code === "DC_POWER_CONFLICT"));
   assert.equal(conflict.states.cell.powered, false);
+  assert.match(conflict.diagnostics.find(d => d.code === "DC_POWER_CONFLICT")?.message ?? "", /cell.*3\.6 V.*source.*5 V|source.*5 V.*cell.*3\.6 V/);
+});
+
+test("redundant equal-voltage sources share a rail without a false power conflict", () => {
+  const { project, add, wire, runtime } = circuit();
+  add("supply-a", "dc-supply", { voltage: 5 }); add("supply-b", "dc-supply", { voltage: 5 }); add("load", "dc-load", { resistance: 10 });
+  wire("supply-a", "+", "supply-b", "+"); wire("supply-a", "-", "supply-b", "-");
+  wire("supply-a", "+", "load", "+"); wire("load", "-", "supply-a", "-"); wire("supply-a", "-", "gnd", "GND");
+  const result = runtime.solve(project, 0);
+  assert.deepEqual(result.diagnostics, []);
+  close(result.voltage("load", "+")!, 5);
+  close(result.current("load"), 0.5);
+});
+
+test("conflicting sources identify both components, voltages, and the shared net", () => {
+  const { project, add, wire, runtime } = circuit();
+  add("five", "dc-supply", { voltage: 5 }); add("nine", "dc-supply", { voltage: 9 });
+  wire("five", "+", "nine", "+"); wire("five", "-", "nine", "-"); wire("five", "-", "gnd", "GND");
+  const diagnostic = runtime.solve(project, 0).diagnostics.find(item => item.code === "DC_POWER_CONFLICT");
+  assert.ok(diagnostic);
+  assert.match(diagnostic.message, /five.*5 V/);
+  assert.match(diagnostic.message, /nine.*9 V/);
+  assert.match(diagnostic.message, /nets/);
 });

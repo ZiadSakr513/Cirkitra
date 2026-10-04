@@ -81,6 +81,9 @@ type PanelResizeState = {
 };
 type CanvasTool = "select" | "pan";
 type MobilePanel = "library" | "assistant" | null;
+type GenerationProgress = { stage: string; detail?: string; progress?: { completed: number; total: number } };
+type GenerationFailure = { prompt: string; model: GeminiModel; retryable: boolean };
+type GenerationEnvelope = { kind?: "chat"; reply?: string; project?: unknown; explanation?: string; warnings?: string[]; model?: unknown; error?: { code?: string; message?: string; retryable?: boolean; details?: string[] } };
 type MarqueeState = {
   pointerId: number;
   startClientX: number;
@@ -247,6 +250,86 @@ function statusLabel(snapshot: SimulatorSnapshot) {
   return "Stopped";
 }
 
+class GenerationRequestError extends Error {
+  code: string;
+  retryable: boolean;
+  details?: string[];
+  constructor(message: string, code = "AI_UNAVAILABLE", retryable = true, details?: string[]) {
+    super(message);
+    this.name = "GenerationRequestError";
+    this.code = code;
+    this.retryable = retryable;
+    this.details = details;
+  }
+}
+
+function conciseGenerationError(error: GenerationRequestError) {
+  if (error.code === "COMPONENT_UNAVAILABLE") {
+    return `${error.message} Try a supported equivalent from the parts catalog, or describe the same behavior using available parts.`;
+  }
+  if (error.details?.some(detail => /outside the simulator expression grammar|unsupported (?:expression|syntax)|must be a balanced expression/i.test(detail))) {
+    return "The generated sketch used syntax the simulator cannot run, and its repair still failed validation. Retry this prompt; your current circuit was left unchanged.";
+  }
+  if (error.details?.some(detail => /missing sketch for board|programs\.\w+: program\.(?:objects|globals|functions)/i.test(detail))) {
+    return "The repair did not return a complete executable sketch. Retry this prompt; your current circuit was left unchanged.";
+  }
+  if (error.details?.some(detail => /UNSUPPORTED_CALL|calls unsupported/i.test(detail))) {
+    if (error.details.some(detail => /selectMuxChannel/i.test(detail))) {
+      return "The sketch used an unsupported TCA9548A method. Use mux.selectChannel(channel), which the simulator supports.";
+    }
+    return "The sketch used a method this part does not support in the simulator. Retry the prompt to generate a supported sketch.";
+  }
+  if (["AI_WHOLE_PROJECT_RECOVERY_FAILED", "AI_REPAIR_NO_CHANGE", "AI_REPAIR_EXHAUSTED", "AI_STAGE_INVALID", "AI_VALIDATION_FAILED", "AI_ASSEMBLY_FAILED"].includes(error.code)) {
+    return "Cirkitra could not validate the complete circuit after its repair attempts. Retry this prompt; your current circuit was left unchanged.";
+  }
+  if (error.code === "AI_DEADLINE_EXCEEDED") {
+    return "Circuit generation took too long to finish. Try a smaller request or split this design into steps.";
+  }
+  return error.message;
+}
+
+async function readGenerationResponse(response: Response, onProgress: (progress: GenerationProgress) => void): Promise<GenerationEnvelope> {
+  if (!response.headers.get("content-type")?.includes("application/x-ndjson")) {
+    const body = await response.json().catch(() => ({})) as GenerationEnvelope;
+    if (!response.ok) throw new GenerationRequestError(body.error?.message ?? "AI generation failed.", body.error?.code, body.error?.retryable ?? response.status >= 500, body.error?.details);
+    return body;
+  }
+  const reader = response.body?.getReader();
+  if (!reader) throw new GenerationRequestError("The generation stream ended before a result arrived.");
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let terminal: GenerationEnvelope | undefined;
+  const processLine = (line: string) => {
+    if (!line.trim()) return;
+    let event: { type?: string; stage?: string; detail?: string; progress?: { completed: number; total: number }; result?: GenerationEnvelope; error?: { code?: string; message?: string; retryable?: boolean; details?: string[] } };
+    try { event = JSON.parse(line) as typeof event; }
+    catch { throw new GenerationRequestError("Cirkitra received an unreadable generation update."); }
+    if (event.type === "progress" && event.stage) onProgress({ stage: event.stage, detail: event.detail, progress: event.progress });
+    else if (event.type === "complete") terminal = event.result ?? {};
+    else if (event.type === "error") throw new GenerationRequestError(event.error?.message ?? "AI generation failed.", event.error?.code, event.error?.retryable ?? true, event.error?.details);
+  };
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newline = buffer.indexOf("\n");
+      while (newline >= 0) {
+        processLine(buffer.slice(0, newline));
+        buffer = buffer.slice(newline + 1);
+        newline = buffer.indexOf("\n");
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) processLine(buffer);
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  }
+  if (!terminal) throw new GenerationRequestError("The generation stream ended without a complete result.");
+  return terminal;
+}
+
 export function CircuitStudio() {
   const [hydrated, setHydrated] = useState(false);
   const initialProject = useMemo(() => createDefaultBlinkProject(), []);
@@ -293,6 +376,9 @@ export function CircuitStudio() {
   const [chat, setChat] = useState<ChatMessage[]>([]);
   const [generating, setGenerating] = useState(false);
   const [generationError, setGenerationError] = useState<string | null>(null);
+  const [generationErrorDetails, setGenerationErrorDetails] = useState<string[]>([]);
+  const [generationStage, setGenerationStage] = useState<GenerationProgress | null>(null);
+  const [failedGeneration, setFailedGeneration] = useState<GenerationFailure | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [compileMessages, setCompileMessages] = useState<CompileMessage[]>([]);
   const [buildState, setBuildState] = useState<"idle" | "building" | "ready" | "error">("idle");
@@ -377,41 +463,51 @@ export function CircuitStudio() {
     nextHistory.push(copy);
     if (nextHistory.length > 60) nextHistory.shift();
     historyRef.current = nextHistory;
+    projectRef.current = normalized;
     setHistoryIndex(nextHistory.length - 1);
     setHistoryLength(nextHistory.length);
     setProject(normalized);
+    try {
+      if (typeof window !== "undefined") window.localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
+    } catch {
+      // The canvas should still update if browser storage is unavailable.
+    }
     setBuildState("idle");
   }, [historyIndex, setBuildState]);
 
   useEffect(() => {
     // Prevent hydration mismatch by deferring localStorage access until after mount
     if (typeof window === 'undefined') return;
-    
-    try {
-      const saved = window.localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const parsed = safeParseCircuitProject(JSON.parse(saved));
-        if (parsed.success) {
-          const normalized = normalizeGroundReturns(parsed.data);
-          queueMicrotask(() => {
+
+    const frame = window.requestAnimationFrame(() => {
+      try {
+        const saved = window.localStorage.getItem(STORAGE_KEY);
+        if (saved) {
+          const parsed = safeParseCircuitProject(JSON.parse(saved));
+          if (parsed.success) {
+            const normalized = normalizeGroundReturns(parsed.data);
+            projectRef.current = normalized;
             setProject(normalized);
             historyRef.current = [deepClone(normalized)];
             setHistoryIndex(0);
             setHistoryLength(1);
-          });
+          }
         }
+      } catch {
+        // A broken local draft should never prevent the studio from opening.
       }
-    } catch {
-      // A broken local draft should never prevent the studio from opening.
-    }
-    queueMicrotask(() => {
       setHydrated(true);
     });
+    return () => window.cancelAnimationFrame(frame);
   }, []);
 
   useEffect(() => {
     if (!hydrated) return;
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(project));
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(project));
+    } catch {
+      // Local drafts are best-effort in private or restricted browser contexts.
+    }
   }, [hydrated, project]);
 
   useEffect(() => {
@@ -973,41 +1069,43 @@ export function CircuitStudio() {
     else simulator.run();
   };
 
-  const submitPrompt = async (value = prompt) => {
+  const submitPrompt = async (value = prompt, retry = false, retryModel = aiModel) => {
     const clean = value.trim();
     if (!clean || generating) return;
-    setPrompt("");
     setSideTab("assistant");
     setGenerating(true);
     setGenerationError(null);
-    setChat((items) => [...items, { id: uid("user"), role: "user", text: clean }]);
+    setGenerationErrorDetails([]);
+    setGenerationStage({ stage: "planning", detail: "Preparing the circuit plan." });
+    if (!retry) {
+      setFailedGeneration(null);
+      setPrompt(clean);
+      setChat((items) => [...items, { id: uid("user"), role: "user", text: clean }]);
+    }
     try {
       const response = await fetch("/api/ai/generate", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: clean, currentProject: project, model: aiModel }),
+        headers: { "Content-Type": "application/json", Accept: "application/x-ndjson" },
+        body: JSON.stringify({ prompt: clean, currentProject: project, model: retryModel }),
       });
-      const result = await response.json() as {
-        kind?: "chat";
-
-        reply?: string;
-        project?: unknown;
-        explanation?: string;
-        warnings?: string[];
-        model?: unknown;
-        error?: { code?: string; message?: string };
-      };
-      if (!response.ok) {
-        throw new Error(
-          result.error?.message ||
-          `AI generation failed${result.error?.code ? ` (${result.error.code})` : ""}.`,
+      const result = await readGenerationResponse(response, setGenerationStage);
+      if (result.error) {
+        throw new GenerationRequestError(
+          result.error.message ?? "AI generation failed.",
+          result.error.code,
+          result.error.retryable ?? true,
+          result.error.details,
         );
       }
-
-      const responseModel = isGeminiModel(result.model) ? result.model : aiModel;
+      if (!response.ok) {
+        throw new GenerationRequestError("AI generation failed.", "AI_UNAVAILABLE", true);
+      }
+      const responseModel = isGeminiModel(result.model) ? result.model : retryModel;
       if (result.kind === "chat") {
         const reply = typeof result.reply === "string" ? result.reply.trim() : "";
         if (!reply) throw new Error("AI returned an empty response.");
+        setPrompt("");
+        setFailedGeneration(null);
         setChat((items) => [...items, {
           id: uid("assistant"),
           role: "assistant",
@@ -1045,15 +1143,21 @@ export function CircuitStudio() {
       setSelectedIds(firstGeneratedPart ? [firstGeneratedPart.id] : []);
       setChat((items) => [...items, { id: uid("assistant"), role: "assistant", text: explanation, meta }]);
       simulator.load(nextProject.code);
+      setPrompt("");
+      setFailedGeneration(null);
       announce(`${GEMINI_MODEL_LABELS[responseModel]} generated the circuit and code`);
     } catch (error) {
       const message = error instanceof Error && error.message.trim()
         ? error.message.trim()
         : "The app could not reach the AI service. Try again.";
-      setGenerationError(message);
+      const requestError = error instanceof GenerationRequestError ? error : undefined;
+      setGenerationError(requestError ? conciseGenerationError(requestError) : message);
+      setGenerationErrorDetails([...new Set(requestError?.details ?? [])].slice(0, 20));
+      setFailedGeneration({ prompt: clean, model: retryModel, retryable: requestError?.retryable ?? true });
       announce("AI generation failed — current circuit unchanged");
     } finally {
       setGenerating(false);
+      setGenerationStage(null);
     }
   };
 
@@ -1075,6 +1179,7 @@ export function CircuitStudio() {
       if (!parsed.success) throw new Error(parsed.issues[0]?.message);
       commitProject(parsed.data);
       simulator.load(parsed.data.code);
+      fitComponentsInCanvas(parsed.data.components);
       setSelectedIds([]);
       announce("Project imported");
     } catch {
@@ -1412,14 +1517,21 @@ export function CircuitStudio() {
                     <div><p>{message.text}</p>{message.meta && <small>{message.meta}</small>}</div>
                   </div>
                 ))}
-                {generating && <div className="chat-message assistant"><div className="avatar">✦</div><div className="thinking"><i></i><i></i><i></i><span>Thinking…</span></div></div>}
+                {generating && <div className="chat-message assistant"><div className="avatar">✦</div><div className="thinking"><i></i><i></i><i></i><span>{generationStage?.detail ?? "Working on your circuit…"}</span></div></div>}
               </div>
               <div className="prompt-zone">
                 {generationError && (
                   <div className="generation-error" role="alert">
-                    <strong>AI generation failed</strong>
+                    <strong>Circuit not generated</strong>
                     <span>{generationError}</span>
+                    {generationErrorDetails.length > 0 && (
+                      <details className="generation-error-diagnostics">
+                        <summary>View diagnostics ({generationErrorDetails.length})</summary>
+                        <small className="generation-error-details">{generationErrorDetails.join(" · ")}</small>
+                      </details>
+                    )}
                     <small>Your current circuit was not changed.</small>
+                    {failedGeneration?.retryable && <button type="button" onClick={() => submitPrompt(failedGeneration.prompt, true, failedGeneration.model)}>Retry this prompt</button>}
                   </div>
                 )}
                 <label className="model-selector">
@@ -1442,7 +1554,7 @@ export function CircuitStudio() {
                   {["Traffic light with 3 LEDs", "Buzzer alert every second", "Blink LED fast"].map((item) => <button key={item} onClick={() => submitPrompt(item)}>{item}</button>)}
                 </div>
                 <label className="prompt-box">
-                  <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submitPrompt(); } }} placeholder="Describe a circuit…" rows={3} />
+                  <textarea value={prompt} disabled={generating} onChange={(event) => { setPrompt(event.target.value); setGenerationError(null); setGenerationErrorDetails([]); setFailedGeneration(null); }} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submitPrompt(); } }} placeholder="Describe a circuit…" rows={3} />
                   <div><span>Enter to generate · Shift+Enter for line</span><button onClick={() => submitPrompt()} disabled={!prompt.trim() || generating} aria-label="Generate circuit">↑</button></div>
                 </label>
                 <p className="ai-disclaimer"><i></i> AI output is schema-checked before it reaches your canvas.</p>

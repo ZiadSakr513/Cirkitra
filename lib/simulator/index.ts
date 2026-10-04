@@ -1,6 +1,9 @@
 export { ArduinoSimulator } from "./engine.ts";
 export { MultiBoardSimulator } from "./multi-board.ts";
 export { compileArduinoSketch } from "./parser.ts";
+export { renderProgramExpression, renderSketchProgram, sketchProgramSchema, validateSketchProgram } from "./program.ts";
+export type { ProgramExpression, ProgramSimpleStatement, ProgramStatement, SketchProgram, SketchProgramValidation, ValidatedSketchProgram } from "./program.ts";
+export { SIMULATOR_CAPABILITY_REGISTRY } from "./capabilities.ts";
 export {
   isBuzzerActive,
   isBuzzerCircuitPowered,

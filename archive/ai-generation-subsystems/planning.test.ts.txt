@@ -1,0 +1,657 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { COMPONENT_CATALOG } from "../../../../lib/circuit/catalog.ts";
+import { selectGenerationComponents } from "../../../../lib/circuit/discovery.ts";
+import {
+  assembleGenerationPlan,
+  mergeGenerationFragment,
+  requestedComponentCounts,
+  sketchBundleSchema,
+  validateSketchBundle,
+  validateGenerationPlan,
+  validateFragment,
+  validateFragmentSetTopology,
+  type GenerationPlan,
+} from "./planning.ts";
+
+const emptyProgram = {
+  headers: [], objects: [], globals: [], functions: [
+    { name: "setup", returnType: "void", parameters: [], body: [] },
+    { name: "loop", returnType: "void", parameters: [], body: [] },
+  ],
+};
+
+const definitions = Object.values(COMPONENT_CATALOG);
+
+test("Gemini receives a compact sketch schema while local validation stays strict", () => {
+  const plan: GenerationPlan = {
+    projectId: "multi_uart",
+    name: "Multi-board UART",
+    description: "Exchange bytes between two boards.",
+    boards: [
+      { id: "mega", type: "arduino-mega-2560", label: "Mega" },
+      { id: "esp", type: "esp32-devkitc-v4", label: "ESP32" },
+    ],
+    components: [],
+    subsystems: [{ id: "uart", name: "UART", goal: "Send bytes between boards." }],
+    nets: [],
+    estimatedNetTerminals: 0,
+    requirements: [{ id: "bytes", description: "The receiver logs transmitted bytes." }],
+  };
+  const schema = sketchBundleSchema(plan, definitions);
+  assert.deepEqual(schema.properties.programs.items.properties.boardId.enum, ["mega", "esp"]);
+  const programSchema = schema.properties.programs.items.properties.program;
+  assert.deepEqual(programSchema.required, ["headers", "objects", "globals", "functions"]);
+  assert.deepEqual(programSchema.properties.functions.items.required, ["name", "returnType", "parameters", "body"]);
+  assert.deepEqual(programSchema.properties.functions.items.properties.body.items.properties.kind.enum, ["declare", "assign", "call", "if", "for", "return"]);
+  assert.deepEqual(programSchema.properties.globals.items.properties.kind.enum, ["declare"]);
+  assert.ok(programSchema.properties.globals.items.properties.type.enum.includes("uint8_t"));
+  assert.ok(!programSchema.properties.globals.items.properties.type.enum.includes("String"));
+  assert.equal(programSchema.properties.functions.items.properties.body.maxItems, 200);
+  assert.equal(programSchema.properties.functions.items.properties.body.items.properties.then.maxItems, 200);
+  assert.ok(JSON.stringify(schema).length < 6_000, "provider-facing schema retains the program contract without verbose expression descriptions");
+
+  const valid = validateSketchBundle({
+    programs: [{ boardId: "mega", program: emptyProgram }, { boardId: "esp", program: emptyProgram }],
+    explanation: "Exchange bytes over UART.", assumptions: [], warnings: [],
+  }, plan);
+  assert.equal(valid.ok, true);
+  const invalid = validateSketchBundle({
+    programs: [{ boardId: "mega", program: {} }, { boardId: "esp", program: emptyProgram }],
+    explanation: "Exchange bytes over UART.", assumptions: [], warnings: [],
+  }, plan);
+  assert.equal(invalid.ok, false, "the compact provider schema does not relax simulator validation");
+
+  const malformedProgram = {
+    ...emptyProgram,
+    globals: [{ kind: "declare", type: "String", name: "threshold" }],
+    functions: [
+      emptyProgram.functions[0],
+      { ...emptyProgram.functions[1], body: [{ kind: "if", condition: "encPos > threshold", then: [], otherwise: [] }, { kind: "while", condition: "true", body: [] }] },
+    ],
+  };
+  const rejectedProgram = validateSketchBundle({
+    programs: [{ boardId: "mega", program: malformedProgram }, { boardId: "esp", program: emptyProgram }],
+    explanation: "Exchange bytes over UART.", assumptions: [], warnings: [],
+  }, plan);
+  assert.equal(rejectedProgram.ok, false);
+  if (!rejectedProgram.ok) {
+    assert.ok(rejectedProgram.issues.some(issue => issue.includes("globals[0].type is not supported")));
+    assert.ok(rejectedProgram.issues.some(issue => issue.includes("unknown name encPos")));
+    assert.ok(rejectedProgram.issues.some(issue => issue.includes("kind is unsupported")));
+  }
+});
+
+test("explicit part quantities are counted without mistaking board model numbers for quantities", () => {
+  const counts = requestedComponentCounts(
+    "Use an Arduino Mega 2560, two LEDs, and one BME280 sensor.",
+    definitions,
+  );
+
+  assert.equal(counts.get("led"), 2);
+  assert.equal(counts.get("bme280"), 1);
+  assert.equal(counts.has("resistor"), false);
+
+  const stripCounts = requestedComponentCounts(
+    "Create a circuit using ws2812b-strip-8 and dc-supply.",
+    definitions,
+  );
+  assert.equal(stripCounts.get("dc-supply"), 1);
+  const externalSupplyPrompt = "Use a WS2812B strip with a separate regulated 5V supply and one data resistor.";
+  const externalSupplyCounts = requestedComponentCounts(externalSupplyPrompt, definitions);
+  assert.equal(externalSupplyCounts.get("dc-supply"), 1);
+  assert.equal(externalSupplyCounts.get("ws2812b-strip-8"), 1);
+  assert.equal(externalSupplyCounts.get("resistor"), 1);
+  const selectedWithSupply = new Set(selectGenerationComponents(externalSupplyPrompt, "simulation").map(part => part.id));
+  assert.ok(selectedWithSupply.has("dc-supply"), "an explicitly separate regulated 5V supply must be sent to the model");
+  const adjustableMotorSupplyPrompt = "Use a DC motor with a separate adjustable motor supply.";
+  const selectedWithMotorSupply = new Set(selectGenerationComponents(adjustableMotorSupplyPrompt, "simulation").map(part => part.id));
+  assert.ok(selectedWithMotorSupply.has("dc-supply"), "a separate adjustable motor supply must be included in the available catalog slice");
+  assert.equal(requestedComponentCounts(adjustableMotorSupplyPrompt, definitions).get("dc-supply"), 1);
+
+  const aiRegressionPrompt = "Create a fresh Arduino Uno circuit with one KY-040 rotary encoder and one 8-pixel WS2812B LED strip.";
+  const aiRegressionCounts = requestedComponentCounts(aiRegressionPrompt, definitions);
+  assert.equal(aiRegressionCounts.get("ky-040"), 1);
+  assert.equal(aiRegressionCounts.get("ws2812b-strip-8"), 1);
+  const selected = new Set(selectGenerationComponents(aiRegressionPrompt, "simulation").map(part => part.id));
+  assert.ok(selected.has("ky-040"));
+  assert.ok(selected.has("ws2812b-strip-8"));
+
+  const pixelCapacityCounts = requestedComponentCounts(
+    "Create a fresh Arduino Uno circuit with one KY-040 rotary encoder and one WS2812B LED strip with 8 LEDs.",
+    definitions,
+  );
+  assert.equal(pixelCapacityCounts.get("ws2812b-strip-8"), 1);
+  assert.equal(pixelCapacityCounts.has("led"), false, "strip pixel capacity must not require separate LED parts");
+
+  const mixedLedCounts = requestedComponentCounts(
+    "Use one LED and one WS2812B LED strip with 8 LEDs.",
+    definitions,
+  );
+  assert.equal(mixedLedCounts.get("led"), 1, "an explicitly separate LED still counts independently of strip pixels");
+
+  const groundingNotes = requestedComponentCounts(
+    "Use an Arduino Uno, connect all grounds, and share a common ground.",
+    definitions,
+  );
+  assert.equal(groundingNotes.has("ground"), false);
+
+  const groundSymbol = requestedComponentCounts("Add one Ground symbol to the circuit.", definitions);
+  assert.equal(groundSymbol.get("ground"), 1);
+});
+
+test("natural ultrasonic sensor names retrieve and require the supported HC-SR04 part", () => {
+  for (const prompt of [
+    "create esp32 robot car with ultrasonic sensor",
+    "Build a rover with two sonar sensors",
+  ]) {
+    const selected = selectGenerationComponents(prompt, "simulation");
+    const selectedIds = new Set(selected.map(part => part.id));
+    assert.ok(selectedIds.has("hc-sr04"), `catalog slice should include HC-SR04 for: ${prompt}`);
+    assert.equal(requestedComponentCounts(prompt, definitions).get("hc-sr04"), prompt.includes("two") ? 2 : 1);
+  }
+});
+
+test("the plan validator rejects missing requested instances and unsafe identifiers", () => {
+  const plan = {
+    projectId: "greenhouse",
+    name: "Greenhouse",
+    description: "Two-zone climate monitor.",
+    boards: [{ id: "uno", type: "arduino-uno", label: "Arduino Uno" }],
+    components: [{ id: "sensor-west", type: "bme280", label: "West sensor", subsystemId: "climate" }],
+    subsystems: [{ id: "climate", name: "Climate sensing", goal: "Read both greenhouse zones." }],
+    nets: [],
+    estimatedNetTerminals: 4,
+    requirements: [{ id: "read_zones", description: "Read both sensor temperatures." }],
+  };
+  const result = validateGenerationPlan(plan, {
+    prompt: "Use two BME280 sensors on one Arduino Uno.",
+    availableParts: definitions,
+    expectedBoardTypes: ["arduino-uno"],
+    multipleBoards: false,
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.ok(result.issues.some(issue => issue.includes("plan omits requested 2 bme280 components")));
+
+  const unsafe = validateGenerationPlan({ ...plan, projectId: "../outside" }, {
+    prompt: "Use one BME280 on one Arduino Uno.",
+    availableParts: definitions,
+    expectedBoardTypes: ["arduino-uno"],
+    multipleBoards: false,
+  });
+  assert.equal(unsafe.ok, false);
+  if (!unsafe.ok) assert.ok(unsafe.issues.some(issue => issue.includes("projectId is not a valid identifier")));
+});
+
+test("the plan requires a dedicated WS2812 data resistor apart from named pull-ups", () => {
+  const base = {
+    projectId: "pixel-supply",
+    name: "Pixel supply",
+    description: "A separately powered addressable strip.",
+    boards: [{ id: "uno", type: "arduino-uno", label: "Arduino Uno" }],
+    components: [
+      { id: "strip", type: "ws2812b-strip-8", label: "Pixel strip", subsystemId: "pixels" },
+      { id: "supply", type: "dc-supply", label: "External supply", subsystemId: "pixels" },
+      { id: "pullup", type: "resistor", label: "I2C pull-up resistor", subsystemId: "pixels" },
+    ],
+    subsystems: [{ id: "pixels", name: "Pixels", goal: "Power and control the strip." }],
+    nets: [],
+    estimatedNetTerminals: 4,
+    requirements: [{ id: "pixel_color", description: "Set the strip color." }],
+  };
+  const prompt = "Use a WS2812B strip with a separate regulated 5V supply and one data resistor.";
+  const missingDataResistor = validateGenerationPlan(base, {
+    prompt,
+    availableParts: definitions,
+    expectedBoardTypes: ["arduino-uno"],
+    multipleBoards: false,
+  });
+  assert.equal(missingDataResistor.ok, false);
+  if (!missingDataResistor.ok) assert.ok(missingDataResistor.issues.some(issue => issue.includes("dedicated WS2812B data-series resistor")));
+
+  const complete = validateGenerationPlan({
+    ...base,
+    components: [...base.components, { id: "data-resistor", type: "resistor", label: "WS2812 data resistor", subsystemId: "pixels" }],
+  }, {
+    prompt,
+    availableParts: definitions,
+    expectedBoardTypes: ["arduino-uno"],
+    multipleBoards: false,
+  });
+  assert.equal(complete.ok, true, complete.ok ? undefined : complete.issues.join("\n"));
+});
+
+test("the plan validator requires a dedicated LED limiter in the same subsystem", () => {
+  const base = {
+    projectId: "status_led",
+    name: "Status indicator",
+    description: "A single status LED.",
+    boards: [{ id: "uno", type: "arduino-uno", label: "Arduino Uno" }],
+    components: [
+      { id: "status", type: "led", label: "Status LED", subsystemId: "indicator" },
+      { id: "bus_pullup", type: "resistor", label: "I2C pull-up", subsystemId: "indicator" },
+    ],
+    subsystems: [{ id: "indicator", name: "Indicator", goal: "Blink the status LED while reporting I2C state." }],
+    nets: [],
+    estimatedNetTerminals: 4,
+    requirements: [{ id: "blink", description: "Blink the status LED." }],
+  };
+  const options = { prompt: "Use an Arduino Uno and one red status LED.", availableParts: definitions, expectedBoardTypes: ["arduino-uno"], multipleBoards: false };
+  const rejected = validateGenerationPlan(base, options);
+  assert.equal(rejected.ok, false);
+  if (!rejected.ok) assert.ok(rejected.issues.some(issue => issue.includes("dedicated current-limiting resistor")));
+
+  const complete = {
+    ...base,
+    components: [...base.components, { id: "status_limiter", type: "resistor", label: "Status LED series limiter", subsystemId: "indicator" }],
+  };
+  assert.equal(validateGenerationPlan(complete, options).ok, true);
+});
+
+test("a bare BME280 behind a TCA9548A requires planned upstream and channel pull-ups", () => {
+  const prompt = "Use one Arduino Uno, a TCA9548A, two BME280 sensors, three LEDs, and three 220 ohm resistors.";
+  const base = {
+    projectId: "mux_sensors",
+    name: "Muxed sensors",
+    description: "Two same-address sensors behind an I2C mux.",
+    boards: [{ id: "uno", type: "arduino-uno", label: "Arduino Uno" }],
+    components: [
+      { id: "mux", type: "tca9548a", label: "I2C multiplexer", subsystemId: "sensors" },
+      { id: "west", type: "bme280", label: "West sensor", subsystemId: "sensors" },
+      { id: "east", type: "bme280", label: "East sensor", subsystemId: "sensors" },
+      ...[1, 2, 3].map(index => ({ id: `led${index}`, type: "led", label: `LED ${index}`, subsystemId: "outputs" })),
+      ...[1, 2, 3].map(index => ({ id: `r${index}`, type: "resistor", label: `LED resistor ${index}`, subsystemId: "outputs" })),
+    ],
+    subsystems: [
+      { id: "sensors", name: "Sensors", goal: "Read both sensors over separate mux channels." },
+      { id: "outputs", name: "Outputs", goal: "Control the three LEDs." },
+    ],
+    nets: [
+      { id: "upstream_sda", name: "Upstream I2C SDA", subsystemIds: ["sensors"] },
+      { id: "upstream_scl", name: "Upstream I2C SCL", subsystemIds: ["sensors"] },
+    ],
+    estimatedNetTerminals: 40,
+    requirements: [{ id: "temperature", description: "Read both zone temperatures." }],
+  };
+  const options = { prompt, availableParts: definitions, expectedBoardTypes: ["arduino-uno"], multipleBoards: false };
+  const missingPullups = validateGenerationPlan(base, options);
+  assert.equal(missingPullups.ok, false);
+  if (!missingPullups.ok) assert.ok(missingPullups.issues.some(issue => issue.includes("needs 6 additional 4.7k resistor components")));
+
+  const complete = {
+    ...base,
+    components: [...base.components, ...Array.from({ length: 6 }, (_, index) => ({ id: `pullup${index + 1}`, type: "resistor", label: `I2C pull-up ${index + 1}`, subsystemId: "sensors" }))],
+  };
+  assert.equal(validateGenerationPlan(complete, options).ok, true);
+});
+
+test("built-in LEDs are not counted as external parts and edit plans honor a no-new-parts request", () => {
+  const prompt = "Edit this existing two-board circuit. Use the ESP32 built-in LED on GPIO2 when a P arrives. Do not add parts.";
+  assert.equal(requestedComponentCounts(prompt, definitions).has("led"), false);
+
+  const currentProject = { components: [
+    { id: "mega", type: "arduino-mega-2560" },
+    { id: "esp", type: "esp32-devkitc-v4" },
+    { id: "common-ground", type: "ground", properties: {} },
+    { id: "automatic-ground", type: "ground", properties: { automatic: true } },
+  ] };
+  const basePlan: GenerationPlan = {
+    projectId: "uart_edit",
+    name: "UART edit",
+    description: "Preserve a two-board UART circuit.",
+    boards: [
+      { id: "mega", type: "arduino-mega-2560", label: "Mega" },
+      { id: "esp", type: "esp32-devkitc-v4", label: "ESP32" },
+    ],
+    components: [{ id: "common-ground", type: "ground", label: "Common Ground", subsystemId: "uart" }],
+    subsystems: [{ id: "uart", name: "UART link", goal: "Preserve communication and use the ESP32 built-in LED." }],
+    nets: [],
+    estimatedNetTerminals: 4,
+    requirements: [{ id: "led", description: "Toggle the integrated LED when a byte arrives." }],
+  };
+  const options = {
+    prompt,
+    availableParts: definitions,
+    expectedBoardTypes: ["arduino-mega-2560", "esp32-devkitc-v4"],
+    multipleBoards: true,
+    mode: "edit" as const,
+    currentProject,
+  };
+  assert.equal(validateGenerationPlan(basePlan, options).ok, true);
+
+  const withExtraLed = {
+    ...basePlan,
+    components: [...basePlan.components, { id: "status-led", type: "led", label: "Status LED", subsystemId: "uart" }],
+  };
+  const rejected = validateGenerationPlan(withExtraLed, options);
+  assert.equal(rejected.ok, false);
+  if (!rejected.ok) assert.ok(rejected.issues.some(issue => issue.includes("request forbids adding parts")));
+});
+
+test("staged assembly keeps v1 projects and produces one sketch per connected board", () => {
+  const plan: GenerationPlan = {
+    projectId: "wired_uart",
+    name: "Wired UART",
+    description: "Two boards exchange bytes over UART.",
+    boards: [
+      { id: "mega", type: "arduino-mega-2560", label: "Mega" },
+      { id: "esp", type: "esp32-devkitc-v4", label: "ESP32" },
+    ],
+    components: [],
+    subsystems: [{ id: "uart", name: "UART link", goal: "Exchange bytes over crossed TX and RX wires." }],
+    nets: [{ id: "uart_tx", name: "Crossed UART and common ground", subsystemIds: ["uart"] }],
+    estimatedNetTerminals: 6,
+    requirements: [{ id: "exchange", description: "The receiver prints bytes sent by the Mega." }],
+  };
+  const fragment = {
+    subsystemId: "uart",
+    placements: [],
+    nets: [{
+      id: "uart_tx",
+      endpoints: [
+        { componentId: "mega", pin: "D18" },
+        { componentId: "esp", pin: "GPIO16" },
+        { componentId: "esp", pin: "GPIO17" },
+        { componentId: "mega", pin: "D19" },
+        { componentId: "mega", pin: "GND" },
+        { componentId: "esp", pin: "GND" },
+      ],
+    }],
+  };
+  const sketches = {
+    programs: [
+      { boardId: "mega", program: { ...emptyProgram, functions: [...emptyProgram.functions.slice(0, 1), { ...emptyProgram.functions[1], body: [{ kind: "call" as const, callee: "delay", arguments: ["10"] }] }] }, code: "void setup(){} void loop(){ delay(10); }" },
+      { boardId: "esp", program: { ...emptyProgram, functions: [...emptyProgram.functions.slice(0, 1), { ...emptyProgram.functions.slice(0, 1)[0], name: "loop", body: [{ kind: "call" as const, callee: "delay", arguments: ["10"] }] }] }, code: "void setup(){} void loop(){ delay(10); }" },
+    ],
+    explanation: "Two boards exchange UART data.",
+    assumptions: [],
+    warnings: [],
+  };
+
+  const assembled = assembleGenerationPlan(plan, [fragment], sketches) as { project: { schemaVersion: number; components: unknown[]; connections: unknown[]; boardPrograms: unknown[]; code: string } };
+  assert.equal(assembled.project.schemaVersion, 1);
+  assert.equal(assembled.project.components.length, 2);
+  assert.equal(assembled.project.connections.length, 5);
+  assert.equal(assembled.project.boardPrograms.length, 2);
+  assert.equal(assembled.project.code, sketches.programs[0].code);
+});
+
+test("staged fragments merge only explicit ground-return nets that share a physical ground pin", () => {
+  const plan: GenerationPlan = {
+    projectId: "ground_nets",
+    name: "Ground nets",
+    description: "Common ground returns.",
+    boards: [{ id: "uno", type: "arduino-uno", label: "Arduino Uno" }],
+    components: [
+      { id: "ground1", type: "ground", label: "Ground", subsystemId: "motor" },
+      { id: "led1", type: "led", label: "LED", subsystemId: "motor" },
+    ],
+    subsystems: [{ id: "motor", name: "Motor power", goal: "Use a common ground return." }],
+    nets: [
+      { id: "logic_ground", name: "Logic Ground", subsystemIds: ["motor"] },
+      { id: "load_return", name: "Load Return", subsystemIds: ["motor"] },
+    ],
+    estimatedNetTerminals: 4,
+    requirements: [{ id: "ground", description: "Share ground." }],
+  };
+  const fragment = {
+    subsystemId: "motor",
+    placements: [
+      { id: "ground1", x: 0, y: 0 },
+      { id: "led1", x: 100, y: 0 },
+    ],
+    nets: [
+      { id: "logic_ground", endpoints: [{ componentId: "uno", pin: "GND" }, { componentId: "ground1", pin: "GND" }] },
+      { id: "load_return", endpoints: [{ componentId: "ground1", pin: "GND" }, { componentId: "led1", pin: "K" }] },
+    ],
+  };
+  const merged = validateFragment(fragment, plan, "motor", definitions);
+  assert.equal(merged.ok, true);
+  if (merged.ok) {
+    assert.deepEqual(merged.value.nets, [
+      { id: "logic_ground", endpoints: [
+        { componentId: "uno", pin: "GND" },
+        { componentId: "ground1", pin: "GND" },
+        { componentId: "led1", pin: "K" },
+      ] },
+      { id: "load_return", endpoints: [] },
+    ]);
+  }
+
+  const sharedSignalPin = structuredClone(fragment);
+  sharedSignalPin.nets[1] = {
+    id: "load_return",
+    endpoints: [{ componentId: "uno", pin: "D3" }, { componentId: "led1", pin: "A" }],
+  };
+  sharedSignalPin.nets[0]!.endpoints.push({ componentId: "led1", pin: "A" });
+  const normalized = validateFragment(sharedSignalPin, plan, "motor", definitions);
+  assert.equal(normalized.ok, false);
+  if (!normalized.ok) assert.ok(normalized.issues.some(issue => issue.includes("led1.A") && issue.includes("Keep signal and power nets separate")));
+
+  const groundBridgesSignal = structuredClone(fragment);
+  groundBridgesSignal.nets[1] = {
+    id: "load_return",
+    endpoints: [{ componentId: "uno", pin: "D3" }, { componentId: "ground1", pin: "GND" }],
+  };
+  const signalPlan = structuredClone(plan);
+  signalPlan.nets[1]!.name = "LED signal";
+  const unsafeGroundBridge = validateFragment(groundBridgesSignal, signalPlan, "motor", definitions);
+  assert.equal(unsafeGroundBridge.ok, false);
+  if (!unsafeGroundBridge.ok) assert.ok(unsafeGroundBridge.issues.some(issue => issue.includes("ground1.GND") && issue.includes("Keep signal and power nets separate")));
+
+  const passivePlan = structuredClone(plan);
+  passivePlan.components.push({ id: "resistor1", type: "resistor", label: "Series resistor", subsystemId: "motor" });
+  const passiveBridge = structuredClone(fragment);
+  passiveBridge.placements.push({ id: "resistor1", x: 200, y: 0 });
+  passiveBridge.nets[0]!.endpoints.push({ componentId: "resistor1", pin: "1" });
+  passiveBridge.nets[1]!.endpoints.push({ componentId: "resistor1", pin: "1" });
+  const unsafePassiveBridge = validateFragment(passiveBridge, passivePlan, "motor", definitions);
+  assert.equal(unsafePassiveBridge.ok, false, "a passive resistor terminal is not a ground pin even though its electrical capabilities include ground");
+  if (!unsafePassiveBridge.ok) assert.ok(unsafePassiveBridge.issues.some(issue => issue.includes("resistor1.1") && issue.includes("Keep signal and power nets separate")));
+});
+
+test("cross-subsystem topology validation catches a board GPIO reused by independent nets", () => {
+  const plan: GenerationPlan = {
+    projectId: "fragment_gpio_ownership",
+    name: "Sensor and encoder",
+    description: "Keep independent signals on separate GPIOs.",
+    boards: [{ id: "uno", type: "arduino-uno", label: "Arduino Uno" }],
+    components: [
+      { id: "climate", type: "dht22", label: "Climate sensor", subsystemId: "sensors" },
+      { id: "knob", type: "ky-040", label: "Encoder", subsystemId: "controls" },
+    ],
+    subsystems: [
+      { id: "sensors", name: "Sensors", goal: "Read temperature and humidity." },
+      { id: "controls", name: "Controls", goal: "Read the rotary encoder." },
+    ],
+    nets: [
+      { id: "dht_data", name: "DHT data", subsystemIds: ["sensors"] },
+      { id: "encoder_clock", name: "Encoder clock", subsystemIds: ["controls"] },
+      { id: "sensor_ground", name: "Sensor ground return", subsystemIds: ["sensors"] },
+      { id: "control_ground", name: "Control ground return", subsystemIds: ["controls"] },
+    ],
+    estimatedNetTerminals: 8,
+    requirements: [{ id: "read", description: "Read both devices." }],
+  };
+  const fragments = [
+    {
+      subsystemId: "sensors",
+      placements: [{ id: "climate", x: 0, y: 0 }],
+      nets: [
+        { id: "dht_data", endpoints: [{ componentId: "uno", pin: "D2" }, { componentId: "climate", pin: "DATA" }] },
+        { id: "sensor_ground", endpoints: [{ componentId: "uno", pin: "GND" }, { componentId: "climate", pin: "GND" }] },
+      ],
+    },
+    {
+      subsystemId: "controls",
+      placements: [{ id: "knob", x: 0, y: 0 }],
+      nets: [
+        { id: "encoder_clock", endpoints: [{ componentId: "uno", pin: "D2" }, { componentId: "knob", pin: "CLK" }] },
+        { id: "control_ground", endpoints: [{ componentId: "uno", pin: "GND" }, { componentId: "knob", pin: "GND" }] },
+      ],
+    },
+  ];
+  assert.equal(validateFragment(fragments[0], plan, "sensors", definitions).ok, true, "each fragment is locally valid");
+  assert.equal(validateFragment(fragments[1], plan, "controls", definitions).ok, true, "each fragment is locally valid");
+  const issues = validateFragmentSetTopology(plan, fragments, definitions);
+  assert.equal(issues.length, 1);
+  assert.equal(issues[0]?.code, "NET_ENDPOINT_OWNERSHIP");
+  assert.deepEqual(issues[0]?.endpoints, [{ componentId: "uno", pin: "D2" }]);
+  assert.deepEqual(issues[0]?.netIds, ["dht_data", "encoder_clock"]);
+  assert.deepEqual(issues[0]?.subsystemIds, ["controls", "sensors"]);
+});
+
+test("cross-subsystem topology validation allows shared ground and rejects a direct rail short", () => {
+  const plan: GenerationPlan = {
+    projectId: "fragment_ground_ownership",
+    name: "Three indicators",
+    description: "Separate driven LED branches with a shared return.",
+    boards: [{ id: "uno", type: "arduino-uno", label: "Arduino Uno" }],
+    components: [1, 2, 3].flatMap(index => [
+      { id: `led${index}`, type: "led", label: `LED ${index}`, subsystemId: `indicator${index}` },
+      { id: `resistor${index}`, type: "resistor", label: `220 ohm limiter ${index}`, subsystemId: `indicator${index}` },
+    ]),
+    subsystems: [1, 2, 3].map(index => ({ id: `indicator${index}`, name: `Indicator ${index}`, goal: "Drive one LED through its own resistor." })),
+    nets: [
+      ...[1, 2, 3].map(index => ({ id: `signal${index}`, name: `LED ${index} signal`, subsystemIds: [`indicator${index}`] })),
+      { id: "shared_ground", name: "Shared ground return", subsystemIds: ["indicator1", "indicator2", "indicator3"] },
+    ],
+    estimatedNetTerminals: 15,
+    requirements: [{ id: "indicators", description: "Control all three LEDs independently." }],
+  };
+  const fragments = [1, 2, 3].map(index => ({
+    subsystemId: `indicator${index}`,
+    placements: [
+      { id: `led${index}`, x: 0, y: 0 },
+      { id: `resistor${index}`, x: 100, y: 0 },
+    ],
+    nets: [
+      { id: `signal${index}`, endpoints: [{ componentId: "uno", pin: `D${index + 2}` }, { componentId: `resistor${index}`, pin: "1" }] },
+      { id: "shared_ground", endpoints: [{ componentId: "uno", pin: "GND" }, { componentId: `led${index}`, pin: "K" }] },
+    ],
+  }));
+  assert.deepEqual(validateFragmentSetTopology(plan, fragments, definitions), [], "three distinct signal nets may share one declared ground net");
+
+  const shorted = structuredClone(plan);
+  shorted.nets = [{ id: "short", name: "Power", subsystemIds: ["indicator1"] }];
+  const shortIssues = validateFragmentSetTopology(shorted, [{
+    subsystemId: "indicator1",
+    placements: [],
+    nets: [{ id: "short", endpoints: [{ componentId: "uno", pin: "5V" }, { componentId: "uno", pin: "GND" }] }],
+  }], definitions);
+  assert.equal(shortIssues[0]?.code, "NET_POWER_GROUND_SHORT");
+});
+
+test("net validation rejects GPIO-to-return collisions and shorted component terminals", () => {
+  const plan: GenerationPlan = {
+    projectId: "same-net-contention",
+    name: "Alarm indicator",
+    description: "A current-limited alarm LED.",
+    boards: [{ id: "uno", type: "arduino-uno", label: "Arduino Uno" }],
+    components: [
+      { id: "led", type: "led", label: "Alarm LED", subsystemId: "indicator" },
+      { id: "resistor", type: "resistor", label: "LED resistor", subsystemId: "indicator" },
+    ],
+    subsystems: [{ id: "indicator", name: "Indicator", goal: "Drive an alarm LED through its resistor." }],
+    nets: [{ id: "collapsed", name: "Alarm LED node", subsystemIds: ["indicator"] }],
+    estimatedNetTerminals: 5,
+    requirements: [{ id: "alarm", description: "Illuminate the alarm LED." }],
+  };
+  const issues = validateFragmentSetTopology(plan, [{
+    subsystemId: "indicator",
+    placements: [{ id: "led", x: 0, y: 0 }, { id: "resistor", x: 100, y: 0 }],
+    nets: [{ id: "collapsed", endpoints: [
+      { componentId: "uno", pin: "D8" },
+      { componentId: "uno", pin: "GND" },
+      { componentId: "led", pin: "A" },
+      { componentId: "led", pin: "K" },
+      { componentId: "resistor", pin: "2" },
+    ] }],
+  }], definitions);
+  assert.ok(issues.some(issue => issue.code === "NET_PIN_CONTENTION" && /uno\.D8.*uno\.GND/.test(issue.message)), JSON.stringify(issues));
+  assert.ok(issues.some(issue => issue.code === "NET_COMPONENT_SHORT" && /Alarm LED\.A.*Alarm LED\.K/.test(issue.message)), JSON.stringify(issues));
+});
+
+test("partial fragment repairs preserve untouched placements and nets before final validation", () => {
+  const plan: GenerationPlan = {
+    projectId: "partial_repair",
+    name: "LED circuit",
+    description: "An LED and resistor on an Uno.",
+    boards: [{ id: "uno", type: "arduino-uno", label: "Arduino Uno" }],
+    components: [
+      { id: "resistor1", type: "resistor", label: "220 ohm resistor", subsystemId: "indicator" },
+      { id: "led1", type: "led", label: "Red LED", subsystemId: "indicator" },
+    ],
+    subsystems: [{ id: "indicator", name: "Indicator", goal: "Wire an LED through its current-limiting resistor." }],
+    nets: [
+      { id: "signal", name: "LED signal", subsystemIds: ["indicator"] },
+      { id: "led_input", name: "LED input", subsystemIds: ["indicator"] },
+      { id: "return", name: "Ground return", subsystemIds: ["indicator"] },
+    ],
+    estimatedNetTerminals: 6,
+    requirements: [{ id: "blink", description: "Blink the LED." }],
+  };
+  const repairCandidate = {
+    subsystemId: "indicator",
+    placements: [{ id: "led1", x: 100, y: 0 }],
+    nets: [
+      { id: "signal", endpoints: [{ componentId: "uno", pin: "D13" }, { componentId: "resistor1", pin: "1" }] },
+    ],
+  };
+  const incompleteRepair = validateFragment(repairCandidate, plan, "indicator", definitions);
+
+  assert.equal(incompleteRepair.ok, false);
+  if (!incompleteRepair.ok) {
+    assert.ok(incompleteRepair.issues.some(issue => issue.includes("omits planned component resistor1")));
+    assert.ok(incompleteRepair.issues.some(issue => issue.includes("resistor1 without a placement")));
+  }
+
+  const previous = validateFragment({
+    subsystemId: "indicator",
+    placements: [{ id: "resistor1", x: 0, y: 0 }, { id: "led1", x: 100, y: 0 }],
+    nets: [
+      { id: "signal", endpoints: [{ componentId: "uno", pin: "D13" }, { componentId: "resistor1", pin: "1" }] },
+      { id: "led_input", endpoints: [{ componentId: "resistor1", pin: "2" }, { componentId: "led1", pin: "A" }] },
+      { id: "return", endpoints: [{ componentId: "led1", pin: "K" }, { componentId: "uno", pin: "GND" }] },
+    ],
+  }, plan, "indicator", definitions);
+  assert.equal(previous.ok, true);
+  if (!previous.ok || !incompleteRepair.ok) return;
+  const partialRepair = validateFragment(repairCandidate, plan, "indicator", definitions, {
+    allowMissingPlacements: true,
+    allowMissingNets: true,
+    allowEmptyNets: true,
+  });
+  assert.equal(partialRepair.ok, true);
+  if (!partialRepair.ok) return;
+  const merged = validateFragment(mergeGenerationFragment(previous.value, partialRepair.value), plan, "indicator", definitions);
+  assert.equal(merged.ok, true);
+  if (merged.ok) {
+    assert.ok(merged.value.placements.some(placement => placement.id === "resistor1"));
+    assert.deepEqual(merged.value.nets.map(net => net.id), ["signal", "led_input", "return"]);
+  }
+});
+
+test("staged fragments discard model-only properties while retaining supported settings", () => {
+  const plan: GenerationPlan = {
+    projectId: "motor_props",
+    name: "Motor",
+    description: "Motor settings.",
+    boards: [{ id: "uno", type: "arduino-uno", label: "Arduino Uno" }],
+    components: [{ id: "motor1", type: "dc-motor", label: "Fan Motor", subsystemId: "drive" }],
+    subsystems: [{ id: "drive", name: "Drive", goal: "Set up a fan motor." }],
+    nets: [],
+    estimatedNetTerminals: 0,
+    requirements: [{ id: "fan", description: "Run the motor." }],
+  };
+  const result = validateFragment({
+    subsystemId: "drive",
+    placements: [{ id: "motor1", x: 0, y: 0, properties: { voltage: 9, rpm: 3200 } }],
+    nets: [],
+  }, plan, "drive", definitions);
+
+  assert.equal(result.ok, true);
+  if (result.ok) assert.deepEqual(result.value.placements[0]?.properties, { rpm: 3200 });
+});

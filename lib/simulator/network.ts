@@ -83,5 +83,75 @@ export function solveNetwork(project: CircuitProject, snapshot: SimulatorSnapsho
     if (stable) break;
     dynamicEdges = nextEdges; outputs = nextOutputs;
   }
-  return { reading, results, stable, conflict: [...readings.values()].some(item => item.conflict) };
+  const componentById = new Map(project.components.map(component => [component.id, component]));
+  const wireIdsByEdge = new Map<string, string[]>();
+  const edgeKey = (left: string, right: string) => JSON.stringify(left < right ? [left, right] : [right, left]);
+  for (const wire of project.connections) {
+    const wireKey = edgeKey(key(wire.from.componentId, wire.from.pin), key(wire.to.componentId, wire.to.pin));
+    const wireIds = wireIdsByEdge.get(wireKey) ?? [];
+    wireIds.push(wire.id);
+    wireIdsByEdge.set(wireKey, wireIds);
+  }
+  const findDrivePath = (start: string, target: string): string[] => {
+    if (start === target) return [start];
+    const adjacent = new Map<string, string[]>();
+    for (const [left, right] of edges) {
+      const from = adjacent.get(left) ?? []; from.push(right); adjacent.set(left, from);
+      const to = adjacent.get(right) ?? []; to.push(left); adjacent.set(right, to);
+    }
+    const previous = new Map<string, { endpoint: string; label: string }>();
+    const pending = [start];
+    previous.set(start, { endpoint: "", label: "" });
+    while (pending.length) {
+      const current = pending.shift()!;
+      for (const next of adjacent.get(current) ?? []) {
+        if (previous.has(next)) continue;
+        const wires = wireIdsByEdge.get(edgeKey(current, next));
+        previous.set(next, { endpoint: current, label: wires?.length ? `wire ${wires.join("/")}` : "internal component link" });
+        if (next === target) {
+          const path = [target];
+          let cursor = target;
+          while (cursor !== start) {
+            const step = previous.get(cursor)!;
+            path.push(step.label, step.endpoint);
+            cursor = step.endpoint;
+          }
+          return path.reverse();
+        }
+        pending.push(next);
+      }
+    }
+    return [];
+  };
+  const conflictingDrives = new Map<string, Array<{ endpoint: string; value: number }>>();
+  for (const [endpoint, value] of [...base, ...outputs]) {
+    const root = nets.find(endpoint);
+    if (!readings.get(root)?.conflict) continue;
+    const group = conflictingDrives.get(root) ?? [];
+    if (!group.some(drive => drive.endpoint === endpoint && drive.value === value)) group.push({ endpoint, value });
+    conflictingDrives.set(root, group);
+  }
+  const describeDrive = ({ endpoint, value }: { endpoint: string; value: number }) => {
+    const separator = endpoint.lastIndexOf(":");
+    const id = endpoint.slice(0, separator); const pin = endpoint.slice(separator + 1);
+    return `${componentById.get(id)?.label ?? id} ${pin}=${value >= 0.5 ? "HIGH" : "LOW"} (${Number(value.toFixed(3))})`;
+  };
+  const describeTerminal = (endpoint: string) => {
+    const separator = endpoint.lastIndexOf(":");
+    const id = endpoint.slice(0, separator); const pin = endpoint.slice(separator + 1);
+    return `${componentById.get(id)?.label ?? id} ${pin}`;
+  };
+  const conflicts = [...conflictingDrives].map(([root, drives]) => {
+    const terminals = [...new Set(edges.flatMap(([a, b]) => [a, b]).filter(endpoint => nets.find(endpoint) === root))];
+    const orderedTerminals = [...new Set([...drives.map(drive => drive.endpoint), ...terminals])];
+    const pins = orderedTerminals.slice(0, 20).map(describeTerminal);
+    const opposing = drives.flatMap((left, index) => drives.slice(index + 1).filter(right => (left.value >= 0.5) !== (right.value >= 0.5)).map(right => [left, right] as const));
+    const paths = opposing.slice(0, 2).flatMap(([left, right]) => {
+      const path = findDrivePath(left.endpoint, right.endpoint);
+      if (!path.length) return [];
+      return [`source path ${path.map((part, index) => index % 2 === 0 ? describeTerminal(part) : `[${part}]`).join(" → ")}`];
+    });
+    return `${pins.length ? `connected pins ${pins.join(", ")}; ` : ""}${paths.length ? `${paths.join("; ")}; ` : ""}drives ${drives.map(describeDrive).join(", ")}`;
+  });
+  return { reading, results, stable, conflict: [...readings.values()].some(item => item.conflict), conflicts };
 }

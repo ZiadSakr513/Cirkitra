@@ -737,7 +737,13 @@ select:focus-visible {
 .generation-error { display: grid; gap: 3px; margin-bottom: 8px; padding: 8px 9px; border: 1px solid #65333a; border-radius: 6px; background: #29161a; }
 .generation-error strong { color: #ff9da5; font-size: 9px; }
 .generation-error span { color: #d3a3a7; font-size: 8px; line-height: 1.4; }
+.generation-error-diagnostics { margin-top: 2px; }
+.generation-error-diagnostics summary { width: fit-content; color: #c18b91; font-size: 7px; cursor: pointer; }
+.generation-error .generation-error-details { color: #e3b8bd; font-size: 7px; line-height: 1.4; overflow-wrap: anywhere; }
 .generation-error small { color: #82676a; font-size: 7px; }
+.generation-error button { justify-self: start; margin-top: 3px; padding: 5px 8px; border: 1px solid #79515a; border-radius: 5px; background: #392127; color: #ffd8dc; font-size: 8px; }
+.generation-error button:hover { border-color: #bd7883; background: #482831; }
+.generation-error button:focus-visible { outline: 2px solid #ff9da5; outline-offset: 2px; }
 .model-selector { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; color: #697987; font: 8px var(--font-mono); }
 .model-selector select { min-width: 155px; height: 27px; border: 1px solid #2d3e4c; border-radius: 5px; outline: 0; background: #101923; color: #b6c4ce; font: 8px var(--font-mono); }
 .model-selector select:focus-visible { border-color: var(--teal); box-shadow: 0 0 0 2px #42d7bd18; }

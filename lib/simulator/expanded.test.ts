@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { ArduinoSimulator, solveCircuit, compileArduinoSketch } from "./index.ts";
 import { createDefaultBlinkProject, type CircuitProject } from "../circuit/index.ts";
 import { BOARD_IDS, BOARD_PROFILES } from "../circuit/boards.ts";
-import { COMPONENT_EXAMPLES } from "../circuit/component-examples.ts";
+import { COMPONENT_EXAMPLES, KY040_CONTROL_EXAMPLE_CODE } from "../circuit/component-examples.ts";
 
 function fixture(type: string) {
   const project: CircuitProject = { ...createDefaultBlinkProject(), components: [
@@ -45,6 +45,60 @@ for (const [type, count, prefix] of [["cd74hc4067", 16, "I"], ["cd74hc4051", 8, 
   });
 }
 
+test("power-short diagnostics identify the exact wire path between opposing board rails", () => {
+  const project: CircuitProject = {
+    ...createDefaultBlinkProject(),
+    code: "void setup(){} void loop(){ delay(10); }",
+    components: [
+      { id: "uno", type: "arduino-uno", label: "Arduino Uno", x: 0, y: 0 },
+      { id: "ground", type: "ground", label: "System Ground", x: 300, y: 0 },
+    ],
+    connections: [
+      { id: "wrong-5v-to-ground", from: { componentId: "uno", pin: "5V" }, to: { componentId: "ground", pin: "GND" } },
+      { id: "ground-return", from: { componentId: "uno", pin: "GND" }, to: { componentId: "ground", pin: "GND" } },
+    ],
+  };
+  const simulator = new ArduinoSimulator(project.code);
+  simulator.attachProject(project); simulator.run(); simulator.advance(0);
+  const diagnostic = solveCircuit(project, simulator.getSnapshot()).diagnostics.find(item => item.code === "output-contention");
+  assert.ok(diagnostic);
+  assert.match(diagnostic.message, /Arduino Uno 5V/);
+  assert.match(diagnostic.message, /System Ground GND/);
+  assert.match(diagnostic.message, /source path .*\[wire wrong-5v-to-ground\]/i);
+});
+
+test("ESP32 drives a 5 V WS2812B strip through a powered AHCT buffer", () => {
+  const project: CircuitProject = {
+    ...createDefaultBlinkProject(),
+    board: "esp32-devkitc-v4",
+    code: `#include <Adafruit_NeoPixel.h>\nAdafruit_NeoPixel strip(8, 5, NEO_GRB + NEO_KHZ800);\nvoid setup(){ pinMode(5,OUTPUT); strip.begin(); strip.setPixelColor(0,strip.Color(255,0,0)); strip.show(); }\nvoid loop(){ delay(100); }`,
+    components: [
+      { id: "esp32", type: "esp32-devkitc-v4", label: "ESP32", x: 0, y: 0 },
+      { id: "supply", type: "dc-supply", label: "5 V supply", x: 0, y: 0, properties: { voltage: 5, enabled: true } },
+      { id: "buffer", type: "sn74ahct1g125", label: "AHCT buffer", x: 0, y: 0 },
+      { id: "strip", type: "ws2812b-strip-8", label: "WS2812B", x: 0, y: 0 },
+    ],
+    connections: [],
+  };
+  const wire = (from: string, pin: string, to: string, other: string) => project.connections.push({
+    id: `wire-${project.connections.length}`,
+    from: { componentId: from, pin }, to: { componentId: to, pin: other },
+  });
+  wire("esp32", "GPIO5", "buffer", "A"); wire("buffer", "Y", "strip", "DIN");
+  wire("buffer", "OE", "esp32", "GND"); wire("buffer", "GND", "esp32", "GND"); wire("strip", "GND", "esp32", "GND");
+  wire("supply", "+", "buffer", "VCC"); wire("supply", "+", "strip", "VDD"); wire("supply", "-", "esp32", "GND");
+
+  const simulator = new ArduinoSimulator(project.code, { boardId: "esp32-devkitc-v4", boardComponentId: "esp32" });
+  simulator.attachProject(project); simulator.run(); simulator.advance(0);
+  const snapshot = simulator.getSnapshot();
+  assert.equal(simulator.getCompiledSketch().valid, true, JSON.stringify(simulator.getCompiledSketch().diagnostics));
+  assert.equal(snapshot.componentStates.buffer.powered, true);
+  assert.equal(snapshot.componentStates.buffer.status, "Enabled");
+  assert.equal(snapshot.componentStates.strip.powered, true);
+  assert.equal(snapshot.componentStates.strip.pixels?.[0]?.r, 255);
+  assert.equal(snapshot.diagnostics.some(diagnostic => diagnostic.severity === "error"), false, JSON.stringify(snapshot.diagnostics));
+});
+
 test("mux passes fractional signals, without joining unselected channels", () => {
   const f = fixture("cd74hc4051"); f.rail("VCC"); f.rail("GND", false); f.rail("VEE", false); f.rail("E", false);
   [0, 1, 2].forEach(bit => f.rail(`S${bit}`, false));
@@ -54,7 +108,10 @@ test("mux passes fractional signals, without joining unselected channels", () =>
   assert.equal(f.solve().analogInputs[14], 1023);
   assert.ok(!f.solve().diagnostics.some(d => d.code === "output-contention"));
   f.rail("COM", false);
-  assert.ok(f.solve().diagnostics.some(d => d.code === "output-contention"));
+  const contention = f.solve().diagnostics.find(d => d.code === "output-contention");
+  assert.ok(contention);
+  assert.match(contention.message, /D2|GND/);
+  assert.match(contention.message, /HIGH|LOW/);
 });
 
 test("74HC138 implements the complete enable and active-low decoding table", () => {
@@ -125,6 +182,37 @@ test("Serial reports changing runtime variables and both branches of string cond
   assert.deepEqual(simulator.getSnapshot().serial.map(entry => entry.text), ["74", "OFF", "ON"]);
   simulator.advance(10);
   assert.deepEqual(simulator.getSnapshot().serial.slice(-3).map(entry => entry.text), ["84", "ON", "OFF"]);
+});
+
+test("KY-040 reference sketch adjusts a retained setpoint and keeps its SW reset after release", () => {
+  const project = COMPONENT_EXAMPLES["ky-040"]();
+  project.components.find(component => component.id === "device")!.properties = { position: 0, pressed: false };
+  project.code = KY040_CONTROL_EXAMPLE_CODE;
+  const simulator = new ArduinoSimulator(project.code);
+  simulator.attachProject(project);
+  assert.equal(simulator.getCompiledSketch().valid, true, JSON.stringify(simulator.getCompiledSketch().diagnostics));
+  simulator.run(); simulator.advance(0);
+  const serialTail = () => simulator.getSnapshot().serial.slice(-2).map(entry => entry.text).join("");
+  assert.equal(serialTail(), "Threshold: 35");
+
+  const rotated = { ...project, components: project.components.map(component => component.id === "device"
+    ? { ...component, properties: { ...component.properties, position: 20 } }
+    : component) };
+  simulator.attachProject(rotated); simulator.advance(20);
+  assert.equal(serialTail(), "Threshold: 60", "raw count deltas become bounded 5-point detent steps");
+
+  const pressed = { ...rotated, components: rotated.components.map(component => component.id === "device"
+    ? { ...component, properties: { ...component.properties, pressed: true } }
+    : component) };
+  simulator.attachProject(pressed); simulator.advance(20);
+  assert.equal(serialTail(), "Threshold: 35", "the active-low SW edge restores the default");
+
+  const released = { ...pressed, components: pressed.components.map(component => component.id === "device"
+    ? { ...component, properties: { ...component.properties, pressed: false } }
+    : component) };
+  simulator.attachProject(released); simulator.advance(20);
+  assert.equal(serialTail(), "Threshold: 35", "release does not remap the unchanged absolute count");
+  assert.equal(simulator.getSnapshot().diagnostics.some(diagnostic => diagnostic.severity === "error"), false);
 });
 
 test("generated-style KY-040 and NeoPixel sketch changes brightness and strip state", () => {
@@ -232,6 +320,133 @@ test("generated-style KY-040 and NeoPixel sketch changes brightness and strip st
   assert.equal(snapshot.diagnostics.some(diagnostic => diagnostic.severity === "error"), false);
 });
 
+test("NeoPixel simulation recognizes a dedicated series data resistor and encoder control", () => {
+  const project = COMPONENT_EXAMPLES["ky-040"]();
+  const stripExample = COMPONENT_EXAMPLES["ws2812b-strip-8"]();
+  project.components.push(...stripExample.components.filter(component => component.id !== "uno").map(component => ({
+    ...component,
+    id: component.id === "device" ? "strip" : component.id,
+  })));
+  project.connections.push(...stripExample.connections.map(connection => ({
+    ...connection,
+    id: "strip-" + connection.id,
+    from: { ...connection.from, componentId: connection.from.componentId === "device" ? "strip" : connection.from.componentId },
+    to: { ...connection.to, componentId: connection.to.componentId === "device" ? "strip" : connection.to.componentId },
+  })).filter(connection => !(
+    (connection.from.componentId === "uno" && connection.from.pin === "D6" && connection.to.componentId === "strip" && connection.to.pin === "DIN")
+    || (connection.to.componentId === "uno" && connection.to.pin === "D6" && connection.from.componentId === "strip" && connection.from.pin === "DIN")
+  )));
+  project.components.find(component => component.id === "device")!.properties = { position: 0, pressed: false };
+  project.components.push({ id: "data-resistor", type: "resistor", label: "330 ohm data resistor", x: 450, y: 0, properties: { resistance: 330 } });
+  project.connections.push(
+    { id: "gpio-to-data-resistor", from: { componentId: "uno", pin: "D6" }, to: { componentId: "data-resistor", pin: "1" } },
+    { id: "data-resistor-to-din", from: { componentId: "data-resistor", pin: "2" }, to: { componentId: "strip", pin: "DIN" } },
+  );
+  project.code = [
+    "#include <Encoder.h>",
+    "#include <Adafruit_NeoPixel.h>",
+    "Encoder knob(2, 3);",
+    "Adafruit_NeoPixel strip(8, 6, NEO_GRB + NEO_KHZ800);",
+    "void setup() { strip.begin(); }",
+    "void loop() {",
+    "  int brightness = map(knob.read(), 0, 15, 24, 192);",
+    "  strip.setBrightness(brightness);",
+    "  strip.setPixelColor(0, strip.Color(255, 0, 0));",
+    "  strip.show();",
+    "  delay(10);",
+    "}",
+  ].join("\n");
+
+  const simulator = new ArduinoSimulator(project.code);
+  simulator.attachProject(project);
+  assert.equal(simulator.getCompiledSketch().valid, true, JSON.stringify(simulator.getCompiledSketch().diagnostics));
+  simulator.run(); simulator.advance(0);
+  let snapshot = simulator.getSnapshot();
+  assert.equal(snapshot.componentStates.strip.readings?.litPixels, 1, "the resistor-connected strip initializes and displays its pixel");
+  assert.equal(snapshot.componentStates.strip.pixels?.[0]?.r, 24, "the minimum encoder position applies the mapped brightness");
+  assert.equal(snapshot.diagnostics.some(diagnostic => diagnostic.severity === "error"), false);
+
+  const rotated = { ...project, components: project.components.map(component => component.id === "device"
+    ? { ...component, properties: { ...component.properties, position: 15 } }
+    : component) };
+  simulator.attachProject(rotated); simulator.advance(20);
+  snapshot = simulator.getSnapshot();
+  assert.equal(snapshot.componentStates.strip.pixels?.[0]?.r, 192, "encoder rotation updates visible strip brightness through the series resistor");
+  assert.equal(snapshot.diagnostics.some(diagnostic => diagnostic.severity === "error"), false);
+});
+
+test("NeoPixel sketches can store Color results in fixed-width integer variables", () => {
+  const project = COMPONENT_EXAMPLES["ws2812b-strip-8"]();
+  project.code = `
+    #include <Adafruit_NeoPixel.h>
+    Adafruit_NeoPixel strip(8, 6, NEO_GRB + NEO_KHZ800);
+    uint32_t color = 0;
+    void setup() { strip.begin(); }
+    void loop() {
+      color = strip.Color(255, 0, 0);
+      strip.setPixelColor(0, color);
+      strip.show();
+      delay(10);
+    }
+  `;
+  const simulator = new ArduinoSimulator(project.code);
+  simulator.attachProject(project);
+  assert.equal(simulator.getCompiledSketch().valid, true, JSON.stringify(simulator.getCompiledSketch().diagnostics));
+  simulator.run();
+  simulator.advance(0);
+  assert.equal(simulator.getSnapshot().componentStates.device.readings?.litPixels, 1);
+  assert.equal(simulator.getSnapshot().componentStates.device.pixels?.[0]?.r, 255);
+  assert.equal(simulator.getSnapshot().diagnostics.some(diagnostic => diagnostic.severity === "error"), false);
+});
+
+test("generated encoder-to-NeoPixel color selection supports C-style integer casts", () => {
+  const project = COMPONENT_EXAMPLES["ky-040"]();
+  const stripExample = COMPONENT_EXAMPLES["ws2812b-strip-8"]();
+  project.components.push(...stripExample.components.filter(component => component.id !== "uno").map(component => ({
+    ...component,
+    id: component.id === "device" ? "strip" : component.id,
+  })));
+  project.connections.push(...stripExample.connections.map(connection => ({
+    ...connection,
+    id: `strip-${connection.id}`,
+    from: { ...connection.from, componentId: connection.from.componentId === "device" ? "strip" : connection.from.componentId },
+    to: { ...connection.to, componentId: connection.to.componentId === "device" ? "strip" : connection.to.componentId },
+  })));
+  project.components = project.components.map(component => component.id === "device"
+    ? { ...component, properties: { ...component.properties, position: 1 } }
+    : component);
+  project.code = `
+    #include <Encoder.h>
+    #include <Adafruit_NeoPixel.h>
+    Encoder myEnc(2, 3);
+    Adafruit_NeoPixel strip(8, 6, NEO_GRB + NEO_KHZ800);
+    int brightnessLevels[] = {30, 100, 255};
+    int brightnessIndex = 0;
+    void setup() { strip.begin(); strip.setBrightness(brightnessLevels[brightnessIndex]); strip.show(); }
+    void loop() {
+      long position = myEnc.read();
+      int colorIndex = (int)(position % 6);
+      uint32_t color = strip.Color(255, 0, 0);
+      if (colorIndex == 1) color = strip.Color(0, 255, 0);
+      for (int i = 0; i < 8; i++) strip.setPixelColor(i, color);
+      strip.setBrightness(brightnessLevels[brightnessIndex]);
+      strip.show();
+      delay(10);
+    }
+  `;
+
+  const simulator = new ArduinoSimulator(project.code);
+  simulator.attachProject(project);
+  assert.equal(simulator.getCompiledSketch().valid, true, JSON.stringify(simulator.getCompiledSketch().diagnostics));
+  simulator.run();
+  simulator.advance(0);
+  const snapshot = simulator.getSnapshot();
+  assert.equal(snapshot.componentStates.strip.readings?.litPixels, 8);
+  assert.equal(snapshot.componentStates.strip.pixels?.[0]?.g, 30, "the integer brightness array scales encoder-selected green pixels");
+  assert.equal(snapshot.componentStates.strip.pixels?.[0]?.r, 0);
+  assert.equal(snapshot.diagnostics.some(diagnostic => diagnostic.severity === "error"), false);
+});
+
 test("capacitive soil sensor changes wired ADC results on all published boards", () => {
   const analogPins: Record<string, string> = {
     "arduino-uno": "A0", "arduino-mega-2560": "A0", "arduino-nano-classic": "A0",
@@ -299,6 +514,22 @@ test("BH1750 library and raw Wire transactions share powered, addressed sensor s
   assert.ok(noBus.getSnapshot().diagnostics.some(d => d.code === "DEVICE_NOT_CONNECTED"), "a broken SDA wire prevents initialization");
 });
 
+test("simulator resolves namespaced C++ library constants in device calls", () => {
+  const sensor = COMPONENT_EXAMPLES["bh1750-sen0097"]();
+  sensor.code = sensor.code.replace("lightMeter.begin()", "lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)");
+  const lightMeter = new ArduinoSimulator(sensor.code);
+  lightMeter.attachProject(sensor); lightMeter.run(); lightMeter.advance(0); lightMeter.advance(1_000);
+  assert.equal(lightMeter.getSnapshot().diagnostics.some(diagnostic => diagnostic.code === "BH1750_COMMAND"), false);
+  assert.ok(lightMeter.getSnapshot().serial.some(entry => entry.text === "485"), "the scoped mode initializes the connected sensor and its reading reaches Serial");
+
+  const displayProject = COMPONENT_EXAMPLES["ssd1306-oled-128x64"]();
+  displayProject.code = `#include <Wire.h>\n#include <Adafruit_SSD1306.h>\nAdafruit_SSD1306 display(128,64,&Wire,-1);\nvoid setup(){ Wire.begin(); display.begin(Adafruit_SSD1306::SSD1306_SWITCHCAPVCC,0x3c); display.clearDisplay(); display.setTextColor(Adafruit_SSD1306::SSD1306_WHITE); display.setCursor(0,0); display.println("READY"); display.display(); }\nvoid loop(){ delay(100); }`;
+  const display = new ArduinoSimulator(displayProject.code);
+  display.attachProject(displayProject); display.run(); display.advance(0);
+  assert.equal(display.getSnapshot().diagnostics.some(diagnostic => diagnostic.code === "DEVICE_NOT_CONNECTED"), false);
+  assert.match(display.getSnapshot().componentStates.device?.display?.[0] ?? "", /READY/);
+});
+
 for (const config of configurations) test(`${config.type} runs two independent bridges and rejects conflicting output drives`, () => {
   const f = fixture(config.type); config.supply.forEach(pin => f.rail(pin)); config.ground.forEach(pin => f.rail(pin, false));
   if (config.awake) f.rail(config.awake);
@@ -315,7 +546,10 @@ for (const config of configurations) test(`${config.type} runs two independent b
   assert.equal(f.solve().componentStates.second.speed, 1);
   f.rail(config.outputs[0], false);
   assert.equal(f.solve().componentStates.motor.powered, false);
-  assert.ok(f.solve().diagnostics.some(d => d.code === "output-contention"));
+  const contention = f.solve().diagnostics.find(d => d.code === "output-contention");
+  assert.ok(contention);
+  assert.match(contention.message, new RegExp(config.outputs[0]));
+  assert.match(contention.message, /HIGH|LOW/);
 });
 
 test("DRV8833 brakes low on 11, coasts on 00, sleeps, and requires the used sense return", () => {

@@ -23,6 +23,21 @@ import {
   solveCircuit,
 } from "./index.ts";
 
+test("bounds no-delay sketch work per frame so a tight loop yields to the UI", () => {
+  const simulator = new ArduinoSimulator(`
+    unsigned long count = 0;
+    void setup() { Serial.begin(9600); }
+    void loop() { count++; Serial.println(count); }
+  `);
+
+  simulator.run();
+  simulator.advance(16.67);
+  const state = simulator.getSnapshot();
+  assert.equal(state.status, "running");
+  assert.ok(state.serial.length > 0);
+  assert.ok(state.serial.length <= 64, `expected a bounded instruction slice, got ${state.serial.length} serial lines`);
+});
+
 const blinkSketch = `
 const int LED_PIN = LED_BUILTIN;
 
@@ -53,6 +68,45 @@ test("compiles constants and the supported Arduino call subset", () => {
     ["digitalWrite", "delay", "digitalWrite", "delay"],
   );
   assert.equal(program.diagnostics.length, 0);
+});
+
+test("compiles and executes pure numeric helpers with nested early returns", () => {
+  const code = `
+    uint8_t bcdToDec(uint8_t value) {
+      if ((value & 0xF0) != 0) { return ((value >> 4) * 10) + (value & 0x0F); }
+      return value;
+    }
+    int addOffset(int value, int offset) { return bcdToDec(value) + offset; }
+    int bcdToDecByDivision(int value) { return ((value / 16) * 10) + (value % 16); }
+    float halve(float value) { return value / 2; }
+    void setup() { Serial.begin(9600); Serial.println(addOffset(0x42, 1)); Serial.println(bcdToDecByDivision(0x12)); Serial.println(halve(13.5)); }
+    void loop() { delay(100); }
+  `;
+  const simulator = new ArduinoSimulator(code);
+  assert.equal(simulator.getCompiledSketch().valid, true, JSON.stringify(simulator.getCompiledSketch().diagnostics));
+  simulator.run(); simulator.advance(0);
+  assert.equal(simulator.getSnapshot().serial[0]?.text, "43");
+  assert.equal(simulator.getSnapshot().serial[1]?.text, "12", "integer helper parameters use C++ integer division for BCD decoding");
+  assert.equal(simulator.getSnapshot().serial[2]?.text, "6.75", "floating point helper parameters preserve fractional division");
+});
+
+test("Arduino integer variables truncate fractional assignments while floating variables preserve them", () => {
+  const simulator = new ArduinoSimulator(`
+    int result = 0;
+    float ratio = 0;
+    void setup() {
+      int partialDetent = 3 / 4;
+      int fullDetent = 4 / 4;
+      result = partialDetent * 10 + fullDetent;
+      ratio = 3.0 / 4.0;
+      Serial.println(result);
+      Serial.println(ratio);
+    }
+    void loop() { delay(20); }
+  `);
+  assert.equal(simulator.getCompiledSketch().valid, true, JSON.stringify(simulator.getCompiledSketch().diagnostics));
+  simulator.run(); simulator.advance(0);
+  assert.deepEqual(simulator.getSnapshot().serial.map(entry => entry.text), ["1", "0.75"]);
 });
 
 test("advances a blink sketch on a deterministic virtual clock", () => {
@@ -99,6 +153,19 @@ test("step consumes one instruction and treats delay as one complete step", () =
   simulator.step();
   assert.equal(simulator.getSnapshot().timeMs, 20);
   assert.equal(simulator.getSnapshot().loopCount, 1);
+});
+
+test("supports standard Arduino delayMicroseconds calls with sub-millisecond simulator timing", () => {
+  const simulator = new ArduinoSimulator("void setup(){ pinMode(9,OUTPUT); digitalWrite(9,HIGH); delayMicroseconds(10); digitalWrite(9,LOW); } void loop(){ delay(100); }");
+  assert.equal(simulator.getSnapshot().diagnostics.some(diagnostic => diagnostic.severity === "error"), false);
+  simulator.run();
+  simulator.advance(0);
+  let snapshot = simulator.getSnapshot();
+  assert.equal(snapshot.pins[9].digitalValue, 1, "the trigger output remains high during the 10 μs pulse");
+  assert.equal(snapshot.waitRemainingMs, 0.01);
+  simulator.advance(0.01);
+  snapshot = simulator.getSnapshot();
+  assert.equal(snapshot.pins[9].digitalValue, 0, "the pin goes low when the microsecond pulse completes");
 });
 
 test("executes if statements with digitalRead conditions", () => {
@@ -485,6 +552,28 @@ test("legacy analog, motion, and ultrasonic sensors require real power and wired
   assert.equal(unpowered.digitalInputs[2], undefined);
   assert.equal(unpowered.analogInputs[14], undefined);
   assert.equal(simulator.getSnapshot().componentStates.temperature.readings?.temperatureC, undefined);
+});
+
+test("a powered HC-SR04 distance drives pulseIn after a standard trigger pulse", () => {
+  const project = electricalProject([
+    { id: "uno", type: "arduino-uno", label: "Uno", x: 0, y: 0 },
+    { id: "ultrasonic", type: "hc-sr04", label: "Distance", x: 300, y: 0, properties: { distanceCm: 42 } },
+  ], [
+    { id: "ultrasonic-power", from: { componentId: "uno", pin: "5V" }, to: { componentId: "ultrasonic", pin: "VCC" } },
+    { id: "ultrasonic-ground", from: { componentId: "uno", pin: "GND" }, to: { componentId: "ultrasonic", pin: "GND" } },
+    { id: "ultrasonic-trigger", from: { componentId: "uno", pin: "D3" }, to: { componentId: "ultrasonic", pin: "TRIG" } },
+    { id: "ultrasonic-echo", from: { componentId: "ultrasonic", pin: "ECHO" }, to: { componentId: "uno", pin: "D4" } },
+  ]);
+  const simulator = new ArduinoSimulator("void setup(){ Serial.begin(9600); pinMode(3,OUTPUT); pinMode(4,INPUT); } void loop(){ digitalWrite(3,LOW); delayMicroseconds(2); digitalWrite(3,HIGH); delayMicroseconds(10); digitalWrite(3,LOW); Serial.println(pulseIn(4,HIGH,30000)/58.3); delay(10); }");
+  simulator.attachProject(project);
+  simulator.run();
+  simulator.advance(20);
+  const measuredPulse = Number(simulator.getSnapshot().serial.at(-1)?.text);
+  assert.ok(Math.abs(measuredPulse - 42) < 0.1, `expected the 42 cm sensor property to become an echo pulse with timeout, got ${measuredPulse}`);
+
+  simulator.setPulseInput(4, 1234);
+  simulator.advance(10);
+  assert.ok(Math.abs(Number(simulator.getSnapshot().serial.at(-1)?.text) - 1234 / 58.3) < 0.001, "an explicit test pulse overrides the sensor's default distance");
 });
 
 test("solves all powered logic-gate truth tables and feeds the result into Uno inputs", () => {

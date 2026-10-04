@@ -1,0 +1,208 @@
+import type { ProgramStatement, SketchProgram } from "../../../../lib/simulator/program.ts";
+
+type FixtureBoard = { id: string; type: string };
+type FixturePlan = { boards: FixtureBoard[] };
+type FixtureCircuit = { project: Record<string, unknown>; explanation?: unknown; assumptions?: unknown; warnings?: unknown };
+
+const primitiveTypes = new Set(["int", "long", "short", "byte", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "size_t", "bool", "float", "double", "char", "DeviceAddress", "sensors_event_t", "File"]);
+const classTypes = new Set([
+  "Servo", "LiquidCrystal", "TwoWire", "SPIClass", "SDClass", "MFRC522", "HardwareSerial", "WiFiClass", "WiFiUDP", "SoftwareSerial",
+  "Adafruit_BME280", "Adafruit_BMP280", "Adafruit_SHT31", "DHT", "OneWire", "DallasTemperature", "Adafruit_MPU6050", "BH1750",
+  "Adafruit_SSD1306", "Adafruit_NeoPixel", "Encoder", "Keypad", "Adafruit_MCP23X17", "TCA9548", "LoRaClass", "XBee", "XBeeAddress64",
+  "ZBTxRequest", "ZBTxStatusResponse", "ZBRxResponse", "XBeeResponse", "BQ27441", "bq769x0", "SPISettings",
+]);
+
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, "");
+}
+
+function matching(source: string, start: number, left: string, right: string): number {
+  let depth = 0;
+  let quote = "";
+  for (let index = start; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) { if (character === "\\") index += 1; else if (character === quote) quote = ""; continue; }
+    if (character === "\"" || character === "'") quote = character;
+    else if (character === left) depth += 1;
+    else if (character === right && --depth === 0) return index;
+  }
+  return -1;
+}
+
+function splitTopLevel(source: string, delimiter = ","): string[] {
+  const output: string[] = [];
+  let start = 0, parens = 0, brackets = 0, braces = 0, quote = "";
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) { if (character === "\\") index += 1; else if (character === quote) quote = ""; continue; }
+    if (character === "\"" || character === "'") quote = character;
+    else if (character === "(") parens += 1;
+    else if (character === ")") parens -= 1;
+    else if (character === "[") brackets += 1;
+    else if (character === "]") brackets -= 1;
+    else if (character === "{") braces += 1;
+    else if (character === "}") braces -= 1;
+    else if (character === delimiter && parens === 0 && brackets === 0 && braces === 0) { output.push(source.slice(start, index).trim()); start = index + 1; }
+  }
+  const tail = source.slice(start).trim();
+  if (tail) output.push(tail);
+  return output;
+}
+
+function readSimple(source: string, start: number): { text: string; end: number } {
+  let parens = 0, brackets = 0, braces = 0, quote = "";
+  for (let index = start; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) { if (character === "\\") index += 1; else if (character === quote) quote = ""; continue; }
+    if (character === "\"" || character === "'") quote = character;
+    else if (character === "(") parens += 1;
+    else if (character === ")") parens -= 1;
+    else if (character === "[") brackets += 1;
+    else if (character === "]") brackets -= 1;
+    else if (character === "{") braces += 1;
+    else if (character === "}") braces -= 1;
+    else if (character === ";" && parens === 0 && brackets === 0 && braces === 0) return { text: source.slice(start, index).trim(), end: index + 1 };
+  }
+  return { text: source.slice(start).trim(), end: source.length };
+}
+
+function parseSimple(text: string): ProgramStatement {
+  const declaration = /^(const\s+)?(?:unsigned\s+)?([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*((?:\[[^\]]*\]\s*)*)(?:=\s*([\s\S]*))?$/.exec(text.trim());
+  if (declaration && (primitiveTypes.has(declaration[2]) || declaration[2] === "String")) {
+    const dimensions = [...declaration[4].matchAll(/\[([^\]]*)\]/g)].map(match => match[1]);
+    const initializer = declaration[5]?.trim();
+    if (dimensions.length) {
+      const flattenedSize = dimensions.reduce((size, expression) => size * Math.max(1, Number(expression) || 1), 1);
+      const flatInitializer = initializer?.replace(/[{}]/g, "");
+      const values = flatInitializer ? splitTopLevel(flatInitializer) : undefined;
+      return { kind: "declare", type: declaration[2], name: declaration[3], arraySize: String(flattenedSize), ...(values?.length ? { values } : {}), constant: !!declaration[1] };
+    }
+    return { kind: "declare", type: declaration[2], name: declaration[3], ...(initializer ? { initializer } : {}), constant: !!declaration[1] };
+  }
+  const increment = /^(.*?)\s*(\+\+|--)$/.exec(text.trim());
+  if (increment) return { kind: "assign", target: increment[1].trim(), operator: increment[2] };
+  const assignment = /^(.*?)\s*(\+=|-=|\*=|\/=|%=|=(?!=))\s*([\s\S]+)$/.exec(text.trim());
+  if (assignment) return { kind: "assign", target: assignment[1].trim(), operator: assignment[2], value: assignment[3].trim() };
+  const call = /^([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\(\)\.[A-Za-z_]\w*)?)\s*\(([\s\S]*)\)$/.exec(text.trim());
+  if (call) return { kind: "call", callee: call[1], arguments: splitTopLevel(call[2]) };
+  throw new Error(`Test fixture contains a statement outside the structured-program subset: ${text}`);
+}
+
+function parseStatements(source: string): ProgramStatement[] {
+  const statements: ProgramStatement[] = [];
+  let cursor = 0;
+  const spaces = () => { while (/\s/.test(source[cursor] ?? "")) cursor += 1; };
+  const one = (): ProgramStatement => {
+    spaces();
+    if (source[cursor] === "{") {
+      const end = matching(source, cursor, "{", "}");
+      if (end < 0) throw new Error("Unclosed fixture block");
+      const nested = parseStatements(source.slice(cursor + 1, end)); cursor = end + 1;
+      return { kind: "if", condition: "true", then: nested };
+    }
+    if (/^if\b/.test(source.slice(cursor))) {
+      cursor += 2; spaces();
+      if (source[cursor] !== "(") throw new Error("Malformed fixture if condition");
+      const close = matching(source, cursor, "(", ")"); if (close < 0) throw new Error("Unclosed fixture if condition");
+      const condition = source.slice(cursor + 1, close); cursor = close + 1;
+      const thenStatement = one();
+      const then = thenStatement.kind === "if" && thenStatement.condition === "true" ? thenStatement.then : [thenStatement];
+      spaces(); let otherwise: ProgramStatement[] | undefined;
+      if (/^else\b/.test(source.slice(cursor))) { cursor += 4; const item = one(); otherwise = item.kind === "if" && item.condition === "true" ? item.then : [item]; }
+      return { kind: "if", condition, then, ...(otherwise ? { otherwise } : {}) };
+    }
+    if (/^for\b/.test(source.slice(cursor))) {
+      cursor += 3; spaces();
+      const close = matching(source, cursor, "(", ")"); if (close < 0) throw new Error("Unclosed fixture for header");
+      const clauses = source.slice(cursor + 1, close).split(";"); cursor = close + 1;
+      const body = one();
+      const bodyStatements = body.kind === "if" && body.condition === "true" ? body.then : [body];
+      return { kind: "for", init: clauses[0]?.trim() ? parseSimple(clauses[0].trim()) as Extract<ProgramStatement, { kind: "declare" | "assign" | "call" }> : undefined, condition: clauses[1]?.trim() || undefined, update: clauses[2]?.trim() ? parseSimple(clauses[2].trim()) as Extract<ProgramStatement, { kind: "declare" | "assign" | "call" }> : undefined, body: bodyStatements };
+    }
+    if (/^return\b/.test(source.slice(cursor))) {
+      cursor += 6; const raw = readSimple(source, cursor); cursor = raw.end;
+      return { kind: "return", ...(raw.text ? { value: raw.text } : {}) };
+    }
+    const raw = readSimple(source, cursor); cursor = raw.end;
+    if (!raw.text) throw new Error("Empty fixture statement");
+    return parseSimple(raw.text);
+  };
+  while (cursor < source.length) { spaces(); if (cursor >= source.length) break; statements.push(one()); }
+  return statements;
+}
+
+export function parseFixtureProgram(source: string): SketchProgram {
+  const cleaned = stripComments(source);
+  const headers = [...cleaned.matchAll(/^\s*#\s*include\s*[<"]([^>"]+)[>"]/gm)].map(match => match[1]);
+  const definitions = [...cleaned.matchAll(/^\s*#\s*define\s+([A-Za-z_]\w*)\s+([^\r\n]+)/gm)].map(match => ({ name: match[1], value: match[2].trim() }));
+  const withoutDirectives = cleaned.replace(/^\s*#.*$/gm, "");
+  const functions: SketchProgram["functions"] = [];
+  const occupied: Array<[number, number]> = [];
+  const matcher = /\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*\{/g;
+  for (const match of withoutDirectives.matchAll(matcher)) {
+    if (["if", "for", "while", "switch"].includes(match[2])) continue;
+    const open = match.index! + match[0].lastIndexOf("{"); const close = matching(withoutDirectives, open, "{", "}");
+    if (close < 0) throw new Error(`Unclosed function ${match[2]}`);
+    const params = match[3].trim() ? splitTopLevel(match[3]).map(parameter => {
+      const parsed = /^(?:(?:const|unsigned)\s+)?([A-Za-z_]\w*)\s+([A-Za-z_]\w*)$/.exec(parameter.trim());
+      if (!parsed) throw new Error(`Unsupported fixture function parameter: ${parameter}`);
+      return { type: parsed[1], name: parsed[2] };
+    }) : [];
+    functions.push({ name: match[2], returnType: match[1], parameters: params, body: parseStatements(withoutDirectives.slice(open + 1, close)) });
+    occupied.push([match.index!, close + 1]);
+  }
+  let prefix = withoutDirectives;
+  for (const [start, end] of occupied.sort((a, b) => b[0] - a[0])) prefix = prefix.slice(0, start) + " ".repeat(end - start) + prefix.slice(end);
+  const globals: SketchProgram["globals"] = definitions.map(item => ({ kind: "declare", type: "int", name: item.name, initializer: item.value, constant: true }));
+  const objects: SketchProgram["objects"] = [];
+  const symbols = new Map<string, number>(definitions.map(item => [item.name, Number(item.value) || 0]));
+  for (const declaration of splitTopLevel(prefix.replace(/\r?\n/g, " "), ";")) {
+    const object = /^(?:const\s+)?([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*(?:=\s*([A-Za-z_]\w*)\s*)?\(([\s\S]*)\)$/.exec(declaration);
+    const plainObject = /^(?:const\s+)?([A-Za-z_]\w*)\s+([A-Za-z_]\w*)$/.exec(declaration);
+    if (object && classTypes.has(object[1])) {
+      objects.push({ type: object[1], name: object[2], arguments: splitTopLevel(object[4]) });
+      continue;
+    }
+    if (plainObject && classTypes.has(plainObject[1])) { objects.push({ type: plainObject[1], name: plainObject[2], arguments: [] }); continue; }
+    const typed = /^(const\s+)?(?:unsigned\s+)?([A-Za-z_]\w*)\s+([\s\S]+)$/.exec(declaration);
+    if (!typed || (!primitiveTypes.has(typed[2]) && typed[2] !== "String")) continue;
+    for (const declarator of splitTopLevel(typed[3])) {
+      const variable = /^([A-Za-z_]\w*)\s*((?:\[[^\]]*\]\s*)*)(?:=\s*([\s\S]*))?$/.exec(declarator);
+      if (!variable) continue;
+      const dimensions = [...variable[2].matchAll(/\[([^\]]*)\]/g)].map(match => match[1]);
+      const size = dimensions.reduce((product, dimension) => product * (Number(dimension) || symbols.get(dimension.trim()) || 1), 1);
+      const init = variable[3]?.trim();
+      const flat = init?.replace(/[{}]/g, "");
+      const values = dimensions.length && flat ? splitTopLevel(flat) : undefined;
+      const initializer = init && !dimensions.length ? init : undefined;
+      globals.push({ kind: "declare", type: typed[2], name: variable[1], ...(dimensions.length ? { arraySize: String(size) } : {}), ...(values?.length ? { values } : {}), ...(initializer ? { initializer } : {}), constant: !!typed[1] });
+      if (initializer && /^[\w]+$/.test(initializer)) symbols.set(variable[1], Number(initializer) || symbols.get(initializer) || 0);
+    }
+  }
+  return { headers: [...new Set(headers)], objects, globals, functions };
+}
+
+export function structuredFixtureResponse(envelope: FixtureCircuit, plan: FixturePlan): Record<string, unknown> {
+  const sourceByBoard = new Map<string, string>();
+  if (Array.isArray(envelope.project.boardPrograms)) {
+    for (const item of envelope.project.boardPrograms) if (item && typeof item === "object" && "boardId" in item && "code" in item && typeof item.boardId === "string" && typeof item.code === "string") sourceByBoard.set(item.boardId, item.code);
+  }
+  if (envelope.project.programs && typeof envelope.project.programs === "object") {
+    for (const [boardId, code] of Object.entries(envelope.project.programs)) if (typeof code === "string") sourceByBoard.set(boardId, code);
+  }
+  if (typeof envelope.project.code === "string" && plan.boards[0]) sourceByBoard.set(plan.boards[0].id, envelope.project.code);
+  const project = { ...envelope.project };
+  delete project.code; delete project.boardPrograms; delete project.programs;
+  return {
+    project,
+    programs: plan.boards.map(board => ({ boardId: board.id, program: parseFixtureProgram(sourceByBoard.get(board.id) ?? "void setup(){} void loop(){}") })),
+    explanation: typeof envelope.explanation === "string" ? envelope.explanation : "Fixture response.",
+    assumptions: Array.isArray(envelope.assumptions) ? envelope.assumptions : [],
+    warnings: Array.isArray(envelope.warnings) ? envelope.warnings : [],
+  };
+}
+
+export function structuredFixturePrograms(envelope: FixtureCircuit, plan: FixturePlan) {
+  const response = structuredFixtureResponse(envelope, plan);
+  return { programs: response.programs, explanation: response.explanation, assumptions: response.assumptions, warnings: response.warnings };
+}

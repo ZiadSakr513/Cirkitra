@@ -125,14 +125,27 @@ test("AI-generated layouts are centered on origin and fitted immediately", async
   assert.match(submitPrompt, /setPendingPin\(null\)/);
 });
 
-test("Gemini model selection defaults, persists, and is sent with prompts", async () => {
+test("imported projects fit their components into the visible canvas", async () => {
+  const source = (await readFile(studioUrl, "utf8")).replace(/\r\n/g, "\n");
+  const importProject = source.match(
+    /const importProject = async[\s\S]*?\n  };\n\n  return \(/,
+  )?.[0];
+
+  assert.ok(importProject, "importProject implementation should be present");
+  assert.match(importProject, /commitProject\(parsed\.data\)/);
+  assert.match(importProject, /fitComponentsInCanvas\(parsed\.data\.components\)/);
+});
+
+test("Gemini generation defaults to supported Flash-Lite and is sent with prompts", async () => {
   const source = (await readFile(studioUrl, "utf8")).replace(/\r\n/g, "\n");
 
   assert.match(source, /const DEFAULT_GEMINI_MODEL[^=]*=\s*"gemini-3\.5-flash-lite"/);
+  assert.match(source, /const GEMINI_MODELS = \["gemini-3\.5-flash-lite"\] as const/);
+  assert.doesNotMatch(source, /"gemini-3\.5-flash"\s*:/);
   assert.match(source, /"gemini-3\.5-flash-lite"/);
   assert.match(source, /localStorage\.getItem\(MODEL_STORAGE_KEY\)/);
   assert.match(source, /localStorage\.setItem\(MODEL_STORAGE_KEY, nextModel\)/);
-  assert.match(source, /JSON\.stringify\(\{ prompt: clean, currentProject: project, model: aiModel \}\)/);
+  assert.match(source, /JSON\.stringify\(\{ prompt: clean, currentProject: project, model: retryModel \}\)/);
   assert.match(source, /aria-label="Circuit generation model"/);
   assert.doesNotMatch(source, /generationTarget|Design only/);
   assert.match(source, /AI CIRCUIT PLANNER/);
@@ -140,6 +153,20 @@ test("Gemini model selection defaults, persists, and is sent with prompts", asyn
   assert.doesNotMatch(source, />\s*GEMINI CIRCUIT PLANNER/);
   assert.doesNotMatch(source, /sent to Gemini|Gemini generation failed/);
   assert.doesNotMatch(source, /AI-generated circuits only/);
+});
+
+test("AI generation streams progress and keeps failed prompts available for retry", async () => {
+  const source = (await readFile(studioUrl, "utf8")).replace(/\r\n/g, "\n");
+  const submitPrompt = source.match(
+    /const submitPrompt = async[\s\S]*?\n  };\n\n  const exportProject/,
+  )?.[0];
+
+  assert.ok(submitPrompt, "submitPrompt implementation should be present");
+  assert.match(submitPrompt, /Accept: "application\/x-ndjson"/);
+  assert.match(submitPrompt, /readGenerationResponse\(response, setGenerationStage\)/);
+  assert.match(submitPrompt, /setFailedGeneration\(\{ prompt: clean, model: retryModel, retryable:/);
+  assert.match(source, /submitPrompt\(failedGeneration\.prompt, true, failedGeneration\.model\)/);
+  assert.match(source, /Your current circuit was not changed\./);
 });
 
 test("canvas marquee selects and deletes multiple components", async () => {

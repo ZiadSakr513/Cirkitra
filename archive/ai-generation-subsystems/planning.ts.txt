@@ -1,0 +1,938 @@
+import { BOARD_IDS, getBoardProfile, isBoardType } from "../../../../lib/circuit/boards.ts";
+import { getComponentDefinition, type ComponentDefinition } from "../../../../lib/circuit/catalog.ts";
+import { normalizeSketchProgramForSimulator, sketchProgramHeaders, sketchProgramSchema, validateSketchProgram, type SketchProgram } from "../../../../lib/simulator/program.ts";
+
+export type GenerationPlan = {
+  projectId: string;
+  name: string;
+  description: string;
+  boards: Array<{ id: string; type: string; label: string }>;
+  components: Array<{ id: string; type: string; label: string; subsystemId: string }>;
+  subsystems: Array<{ id: string; name: string; goal: string }>;
+  nets: Array<{ id: string; name: string; subsystemIds: string[] }>;
+  estimatedNetTerminals: number;
+  requirements: Array<{ id: string; description: string }>;
+};
+
+export type GenerationFragment = {
+  subsystemId: string;
+  placements: Array<{
+    id: string;
+    x: number;
+    y: number;
+    rotation?: number;
+    properties?: Record<string, string | number | boolean>;
+  }>;
+  nets: Array<{ id: string; endpoints: Array<{ componentId: string; pin: string }> }>;
+};
+
+export type SketchBundle = {
+  programs: Array<{ boardId: string; program: SketchProgram; code: string }>;
+  explanation: string;
+  assumptions: string[];
+  warnings: string[];
+};
+
+export type PlanValidation = { ok: true; value: GenerationPlan } | { ok: false; issues: string[] };
+export type FragmentValidation = { ok: true; value: GenerationFragment } | { ok: false; issues: string[] };
+
+export type FragmentTopologyIssue = {
+  code: "NET_ENDPOINT_OWNERSHIP" | "NET_POWER_GROUND_SHORT" | "NET_PIN_CONTENTION" | "NET_COMPONENT_SHORT";
+  message: string;
+  endpoints: Array<{ componentId: string; pin: string }>;
+  netIds: string[];
+  subsystemIds: string[];
+  wireIds?: string[];
+  expectedTopology?: string;
+};
+
+type ElectricalNetGroup = {
+  id: string;
+  endpoints: readonly { componentId: string; pin: string }[];
+  wireIds?: readonly string[];
+  subsystemIds?: readonly string[];
+};
+
+/** Validate conflicts hidden inside a net as well as duplicate endpoint
+ * ownership across net IDs. A merged net must not tie a board return or rail
+ * to a GPIO, short a board's independent GPIOs together, or collapse the two
+ * terminals of a polarized device. */
+export function validateNetEndpointCompatibility(
+  components: readonly { id: string; type: string; label?: string }[],
+  nets: readonly ElectricalNetGroup[],
+  availableParts: readonly ComponentDefinition[],
+): FragmentTopologyIssue[] {
+  const componentById = new Map(components.map(component => [component.id, component] as const));
+  const definitionByType = new Map(availableParts.map(definition => [definition.id, definition] as const));
+  const issues: FragmentTopologyIssue[] = [];
+  const terminalPairs: Readonly<Record<string, readonly (readonly [string, string])[]>> = {
+    led: [["A", "K"]],
+    buzzer: [["+", "-"]],
+    "dc-supply": [["+", "-"]],
+    "battery-cell": [["+", "-"]],
+    "dc-motor": [["+", "-"]],
+  };
+
+  for (const net of nets) {
+    const unique = new Map(net.endpoints.map(endpoint => [`${endpoint.componentId}:${endpoint.pin}`, endpoint] as const));
+    const endpoints = [...unique.values()];
+    if (endpoints.length < 2) continue;
+    const boardGrounds: Array<{ componentId: string; pin: string }> = [];
+    const boardRails: Array<{ componentId: string; pin: string }> = [];
+    const boardGpios: Array<{ componentId: string; pin: string; runtimePin: number }> = [];
+    const componentPins = new Map<string, Set<string>>();
+    const trueGrounds: Array<{ componentId: string; pin: string }> = [];
+    const positiveSupplies: Array<{ componentId: string; pin: string }> = [];
+
+    for (const endpoint of endpoints) {
+      const component = componentById.get(endpoint.componentId);
+      if (!component) continue;
+      const pins = componentPins.get(component.id) ?? new Set<string>();
+      pins.add(endpoint.pin);
+      componentPins.set(component.id, pins);
+      if (isBoardType(component.type)) {
+        const profile = getBoardProfile(component.type);
+        if (!profile) continue;
+        if (profile.groundPins.includes(endpoint.pin)) {
+          boardGrounds.push(endpoint);
+          trueGrounds.push(endpoint);
+        } else if (Object.hasOwn(profile.rails, endpoint.pin)) {
+          boardRails.push(endpoint);
+          positiveSupplies.push(endpoint);
+        } else {
+          const ioPin = profile.ioPins.find(pin => pin.id === endpoint.pin);
+          if (ioPin) boardGpios.push({ ...endpoint, runtimePin: ioPin.runtimePin });
+        }
+        continue;
+      }
+
+      if (component.type === "ground" && endpoint.pin === "GND") {
+        trueGrounds.push(endpoint);
+        continue;
+      }
+      const definition = definitionByType.get(component.type) ?? getComponentDefinition(component.type);
+      const pin = definition?.pins.find(candidate => candidate.id === endpoint.pin);
+      if (!pin) continue;
+      if (definition?.metadata?.groundPins.includes(endpoint.pin)
+        || (pin.direction === "power" && pin.signals.includes("ground"))) trueGrounds.push(endpoint);
+      if (definition?.metadata?.supplies.some(supply => supply.pins.includes(endpoint.pin))
+        || (pin.direction === "power" && pin.signals.includes("power"))) positiveSupplies.push(endpoint);
+    }
+
+    const issue = (code: FragmentTopologyIssue["code"], message: string, implicated: readonly { componentId: string; pin: string }[], expectedTopology: string) => {
+      const relevant = implicated.length > 1 ? implicated : endpoints;
+      const involvedComponents = new Set(relevant.map(endpoint => endpoint.componentId));
+      const subsystemIds = [...new Set([
+        ...(net.subsystemIds ?? []),
+        ...components.filter(component => involvedComponents.has(component.id) && "subsystemId" in component)
+          .map(component => (component as { subsystemId?: string }).subsystemId)
+          .filter((subsystemId): subsystemId is string => !!subsystemId),
+      ])].sort();
+      issues.push({
+        code,
+        message,
+        endpoints: [...relevant],
+        netIds: [net.id],
+        subsystemIds,
+        ...(net.wireIds ? { wireIds: [...net.wireIds] } : {}),
+        expectedTopology,
+      });
+    };
+
+    if (trueGrounds.length && positiveSupplies.length) {
+      issue(
+        "NET_POWER_GROUND_SHORT",
+        `Net ${net.id} directly joins positive supply endpoints ${positiveSupplies.map(endpoint => `${endpoint.componentId}.${endpoint.pin}`).join(", ")} to ground/return endpoints ${trueGrounds.map(endpoint => `${endpoint.componentId}.${endpoint.pin}`).join(", ")}.`,
+        [...positiveSupplies, ...trueGrounds],
+        "Keep positive supply and ground/return endpoints on separate nets; connect loads between them through their intended terminals.",
+      );
+    }
+
+    const gpioConflict = (boardGpios.length > 0 && (trueGrounds.length > 0 || positiveSupplies.length > 0))
+      || [...new Set(boardGpios.map(gpio => gpio.componentId))].some(boardId =>
+        new Set(boardGpios.filter(gpio => gpio.componentId === boardId).map(gpio => gpio.runtimePin)).size > 1);
+    if (gpioConflict) {
+      const implicated = [...boardGpios, ...boardGrounds, ...boardRails, ...trueGrounds, ...positiveSupplies]
+        .filter((endpoint, index, all) => all.findIndex(other => other.componentId === endpoint.componentId && other.pin === endpoint.pin) === index);
+      issue(
+        "NET_PIN_CONTENTION",
+        `Net ${net.id} merges incompatible board pins: ${implicated.map(endpoint => `${endpoint.componentId}.${endpoint.pin}`).join(", ")}. A net may not join GPIO to a supply/return or join distinct GPIOs on the same board.`,
+        implicated,
+        "Separate board GPIO signals, supply rails, and ground returns onto distinct nets. A board-to-board signal may connect one GPIO from each board, with grounds on their own shared return net.",
+      );
+    }
+
+    for (const [componentId, pins] of componentPins) {
+      const component = componentById.get(componentId)!;
+      const pairs = [...(terminalPairs[component.type] ?? [])];
+      const definition = definitionByType.get(component.type) ?? getComponentDefinition(component.type);
+      const metadata = definition?.metadata;
+      if (metadata?.groundPins.length && metadata.supplies.length) {
+        for (const supply of metadata.supplies) for (const groundPin of metadata.groundPins) {
+          if (supply.pins.includes(groundPin)) continue;
+          if (pins.has(groundPin) && supply.pins.some(pin => pins.has(pin))) pairs.push([groundPin, supply.pins.find(pin => pins.has(pin))!] as const);
+        }
+      }
+      for (const [left, right] of pairs) {
+        if (!pins.has(left) || !pins.has(right)) continue;
+        issue(
+          "NET_COMPONENT_SHORT",
+          `Net ${net.id} shorts the opposing terminals ${component.label ?? component.id}.${left} and ${component.label ?? component.id}.${right}.`,
+          [{ componentId, pin: left }, { componentId, pin: right }],
+          `Keep ${component.label ?? component.id}.${left} and ${component.label ?? component.id}.${right} on separate nets, with the requested load or current-limiting path between them.`,
+        );
+      }
+    }
+  }
+  return issues;
+}
+
+/** Group physical wires and validate each completed project net using the same
+ * rules applied to staged fragment nets. */
+export function validateProjectNetEndpointCompatibility(
+  components: readonly { id: string; type: string; label?: string; subsystemId?: string }[],
+  connections: readonly { id: string; from: { componentId: string; pin: string }; to: { componentId: string; pin: string } }[],
+  availableParts: readonly ComponentDefinition[],
+): FragmentTopologyIssue[] {
+  const parent = new Map<string, string>();
+  const find = (value: string): string => {
+    const current = parent.get(value);
+    if (!current || current === value) { parent.set(value, value); return value; }
+    const root = find(current); parent.set(value, root); return root;
+  };
+  const join = (left: string, right: string) => {
+    const a = find(left); const b = find(right);
+    if (a !== b) parent.set(b, a);
+  };
+  const key = (endpoint: { componentId: string; pin: string }) => `${endpoint.componentId}:${endpoint.pin}`;
+  for (const connection of connections) join(key(connection.from), key(connection.to));
+  const nets = new Map<string, ElectricalNetGroup & { endpoints: { componentId: string; pin: string }[]; wireIds: string[]; subsystemIds: string[] }>();
+  for (const connection of connections) {
+    const root = find(key(connection.from));
+    const net = nets.get(root) ?? { id: `wire-net:${root}`, endpoints: [], wireIds: [], subsystemIds: [] };
+    for (const endpoint of [connection.from, connection.to]) {
+      if (!net.endpoints.some(item => item.componentId === endpoint.componentId && item.pin === endpoint.pin)) net.endpoints.push(endpoint);
+      const owner = components.find(component => component.id === endpoint.componentId)?.subsystemId;
+      if (owner && !net.subsystemIds.includes(owner)) net.subsystemIds.push(owner);
+    }
+    net.wireIds.push(connection.id);
+    nets.set(root, net);
+  }
+  return validateNetEndpointCompatibility(components, [...nets.values()], availableParts);
+}
+
+const SAFE_KEY = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+const GENERIC_ALIASES = new Set(["sensor", "sensors", "pressure", "temperature", "humidity", "mux", "multiplexer", "wireless", "radio", "i2c", "spi", "uart", "module", "chip", "driver", "motor driver", "motor drivers", "h bridge", "h bridges", "battery", "power"]);
+const NUMBER_WORDS: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+
+const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+
+export function requestedComponentCounts(prompt: string, definitions: readonly ComponentDefinition[]): Map<string, number> {
+  const normalizedPrompt = ` ${normalize(prompt)} `;
+  const counts = new Map<string, number>();
+  for (const definition of definitions) {
+    if (isBoardType(definition.id)) continue;
+    // “Ground” is frequently used to describe a required electrical net, not
+    // a separately placed Ground symbol. Only count it when the prompt asks
+    // for a symbol/component/part or explicitly says to add/place/include it.
+    if (definition.id === "ground" && !/(?:\b(?:ground|gnd)\s+(?:symbol|component|part)\b|\b(?:add|include|place)\s+(?:(?:a|an|one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+)?(?:ground|gnd)\b)/i.test(normalizedPrompt)) continue;
+    const names = [definition.id, definition.displayName, ...(definition.requestAliases ?? []), ...(definition.metadata?.aliases ?? [])]
+      .map(normalize)
+      .filter(name => name.length > 2 && !GENERIC_ALIASES.has(name));
+    // An onboard/integrated LED is part of the board profile, not a separately
+    // placed LED component. Counting it here would make the plan require an
+    // extra physical LED even when the request explicitly says to use GPIO2's
+    // built-in indicator.
+    if (definition.id === "led" && /\b(?:built in|on board|onboard|integrated)\s+(?:status\s+)?led\b/.test(normalizedPrompt)) continue;
+    let matchedName: string | undefined;
+    for (const name of names.sort((a, b) => b.length - a.length)) {
+      if (normalizedPrompt.includes(` ${name} `) || normalizedPrompt.includes(` ${name}s `)) { matchedName = name; break; }
+    }
+    if (!matchedName) continue;
+    const escapedName = escapeRegex(matchedName).replace(/\ /g, "\\s+");
+    const quantity = new RegExp(`(?:^|\\s)(\\d+|${Object.keys(NUMBER_WORDS).join("|")})\\s+(?:x\\s+)?${escapedName}s?(?:\\s|$)`, "i").exec(normalizedPrompt);
+    const parsedQuantity = quantity ? Number(quantity[1]) || NUMBER_WORDS[quantity[1].toLowerCase()] || 1 : 1;
+    const quantityPosition = quantity
+      ? normalizedPrompt.indexOf(quantity[1], quantity.index + 1)
+      : -1;
+    if (definition.id === "led" && quantityPosition >= 0) {
+      const clauseStart = Math.max(
+        normalizedPrompt.lastIndexOf(",", quantityPosition),
+        normalizedPrompt.lastIndexOf(" and ", quantityPosition),
+        normalizedPrompt.lastIndexOf(";", quantityPosition),
+      ) + 1;
+      const precedingClause = normalizedPrompt.slice(clauseStart, quantityPosition);
+      // A pixel count inside an addressable strip describes the strip's
+      // capacity, not separate through-hole LED components for the plan.
+      if (/\b(?:ws2812[a-z0-9]*|neopixel|addressable|led|pixel)\b[\s\S]{0,50}\b(?:led\s+)?strip\b/.test(precedingClause)) continue;
+    }
+    const appearsInsideModelNumber = quantityPosition >= 0 && definitions.some(part => {
+      const digitNames = [part.id, part.displayName, ...(part.metadata?.aliases ?? [])]
+        .map(normalize)
+        .filter(name => /\d/.test(name));
+      return digitNames.some(name => {
+        let searchFrom = 0;
+        while (true) {
+          const namePosition = normalizedPrompt.indexOf(name, searchFrom);
+          if (namePosition < 0) return false;
+          if (quantityPosition >= namePosition && quantityPosition < namePosition + name.length) return true;
+          searchFrom = namePosition + name.length;
+        }
+      });
+    });
+    // A catalog name may contain model digits immediately before a later part
+    // name (for example “Arduino Mega 2560, resistor”). Such digits are not a
+    // requested quantity, so only treat supported quantities as counts.
+    const value = appearsInsideModelNumber || parsedQuantity > 100 ? 1 : parsedQuantity;
+    counts.set(definition.id, Math.max(counts.get(definition.id) ?? 0, value));
+  }
+  // People commonly say “separate regulated 5V supply” without the catalog
+  // name “DC Supply”. Treat that explicit external source as the supported
+  // dc-supply primitive so planning and final coverage both require it.
+  const explicitStandaloneMotorSupply = /\b(?:(?:separate|external|regulated|bench|adjustable|dedicated)\s+){1,3}(?:(?:dc|motor|fan|actuator|power)\s+){0,3}(?:power\s+)?supply\b|\b(?:motor|fan|actuator)\s+(?:power\s+)?supply\b/.test(normalizedPrompt);
+  if (definitions.some(definition => definition.id === "dc-supply")
+    && (/\b(?:(?:separate|external|regulated|bench)\s+)*(?:5v|5\s+v|five\s+volt)(?:\s+dc)?\s+(?:power\s+)?supply\b|\b(?:separate|external|bench)\s+(?:dc|regulated)\s+power\s+supply\b/.test(normalizedPrompt)
+      || explicitStandaloneMotorSupply)) {
+    counts.set("dc-supply", Math.max(counts.get("dc-supply") ?? 0, 1));
+  }
+  return counts;
+}
+
+export function generationPlanSchema() {
+  return {
+    type: "object",
+    properties: {
+      projectId: { type: "string" },
+      name: { type: "string" },
+      description: { type: "string" },
+      boards: { type: "array", items: { type: "object", properties: {
+        id: { type: "string" }, type: { type: "string" }, label: { type: "string" },
+      }, required: ["id", "type", "label"] } },
+      components: { type: "array", items: { type: "object", properties: {
+        id: { type: "string" }, type: { type: "string" }, label: { type: "string" }, subsystemId: { type: "string" },
+      }, required: ["id", "type", "label", "subsystemId"] } },
+      subsystems: { type: "array", items: { type: "object", properties: {
+        id: { type: "string" }, name: { type: "string" }, goal: { type: "string" },
+      }, required: ["id", "name", "goal"] } },
+      nets: { type: "array", items: { type: "object", properties: {
+        id: { type: "string" }, name: { type: "string" }, subsystemIds: { type: "array", items: { type: "string" } },
+      }, required: ["id", "name", "subsystemIds"] } },
+      estimatedNetTerminals: { type: "integer" },
+      requirements: { type: "array", items: { type: "object", properties: {
+        id: { type: "string" }, description: { type: "string" },
+      }, required: ["id", "description"] } },
+    },
+    required: ["projectId", "name", "description", "boards", "components", "subsystems", "nets", "estimatedNetTerminals", "requirements"],
+  };
+}
+
+export function validateGenerationPlan(
+  value: unknown,
+  options: {
+    prompt: string;
+    availableParts: readonly ComponentDefinition[];
+    expectedBoardTypes: readonly string[];
+    multipleBoards: boolean;
+    mode?: "create" | "edit";
+    currentProject?: unknown;
+  },
+): PlanValidation {
+  const issues: string[] = [];
+  if (!isRecord(value)) return { ok: false, issues: ["plan must be an object"] };
+  const text = (input: unknown, path: string, max: number) => {
+    if (typeof input !== "string" || !input.trim() || input.length > max) { issues.push(`${path} must be a non-empty string up to ${max} characters`); return ""; }
+    return input.trim();
+  };
+  const uniqueIds = <T extends { id: string }>(items: T[], path: string) => {
+    const seen = new Set<string>();
+    for (const item of items) {
+      if (!SAFE_KEY.test(item.id)) issues.push(`${path}.${item.id} is not a valid identifier`);
+      if (seen.has(item.id)) issues.push(`${path}.${item.id} is duplicated`);
+      seen.add(item.id);
+    }
+  };
+  const rawBoards = Array.isArray(value.boards) ? value.boards : [];
+  if (!Array.isArray(value.boards) || rawBoards.length < 1 || rawBoards.length > BOARD_IDS.length) issues.push("boards must contain between one and six boards");
+  const boards = rawBoards.filter(isRecord).slice(0, BOARD_IDS.length).map((board, index) => ({
+    id: text(board.id, `boards[${index}].id`, 64),
+    type: text(board.type, `boards[${index}].type`, 64),
+    label: text(board.label, `boards[${index}].label`, 80),
+  }));
+  uniqueIds(boards, "boards");
+  for (const board of boards) if (!isBoardType(board.type) || !options.availableParts.some(part => part.id === board.type)) issues.push(`boards.${board.id} uses an unsupported board`);
+  const actualBoardTypes = boards.map(board => board.type);
+  for (const expected of options.expectedBoardTypes) if (!actualBoardTypes.includes(expected)) issues.push(`plan omits requested board ${expected}`);
+  if (!options.multipleBoards && boards.length !== 1) issues.push("plan must include exactly one board unless multiple boards were requested");
+  if (options.multipleBoards && boards.length < 2) issues.push("plan must include at least two boards for this request");
+
+  const availableTypes = new Set(options.availableParts.filter(part => !isBoardType(part.id)).map(part => part.id));
+  const rawComponents = Array.isArray(value.components) ? value.components : [];
+  if (!Array.isArray(value.components) || rawComponents.length > 100) issues.push("components must be an array of at most 100 component instances");
+  const components = rawComponents.filter(isRecord).slice(0, 100).map((component, index) => ({
+    id: text(component.id, `components[${index}].id`, 64),
+    type: text(component.type, `components[${index}].type`, 64),
+    label: text(component.label, `components[${index}].label`, 80),
+    subsystemId: text(component.subsystemId, `components[${index}].subsystemId`, 64),
+  }));
+  uniqueIds(components, "components");
+  if (components.some(component => boards.some(board => board.id === component.id))) issues.push("board and component instance IDs must be unique across the whole plan");
+  for (const component of components) if (!availableTypes.has(component.type)) issues.push(`components.${component.id} uses an unavailable component type`);
+
+  const normalizedPrompt = normalize(options.prompt);
+  const forbidsNewParts = options.mode === "edit" && /\b(?:do not|dont|never)\s+(?:add|include|place|introduce)\s+(?:any\s+)?(?:new\s+|extra\s+|additional\s+)?(?:parts?|components?)\b/.test(normalizedPrompt);
+  if (forbidsNewParts && isRecord(options.currentProject) && Array.isArray(options.currentProject.components)) {
+    const existing = options.currentProject.components.filter(isRecord).filter(component =>
+      typeof component.id === "string" && typeof component.type === "string" &&
+      !(component.type === "ground" && isRecord(component.properties) && component.properties.automatic === true),
+    ) as Array<{ id: string; type: string }>;
+    const planned = new Map<string, string>([
+      ...boards.map(board => [board.id, board.type] as [string, string]),
+      ...components.map(component => [component.id, component.type] as [string, string]),
+    ]);
+    const existingIds = new Set(existing.map(component => component.id));
+    for (const component of existing) {
+      if (planned.get(component.id) !== component.type) {
+        issues.push(`edit plan must preserve existing component ${component.id} (${component.type}) because the request forbids adding parts and does not request removing it`);
+      }
+    }
+    for (const component of [...boards, ...components]) {
+      if (!existingIds.has(component.id)) {
+        issues.push(`edit plan adds ${component.type} component ${component.id} even though the request forbids adding parts`);
+      }
+    }
+  }
+
+  const rawSubsystems = Array.isArray(value.subsystems) ? value.subsystems : [];
+  if (!Array.isArray(value.subsystems) || rawSubsystems.length < 1 || rawSubsystems.length > 16) issues.push("subsystems must contain between one and sixteen groups");
+  const subsystems = rawSubsystems.filter(isRecord).slice(0, 16).map((subsystem, index) => ({
+    id: text(subsystem.id, `subsystems[${index}].id`, 64),
+    name: text(subsystem.name, `subsystems[${index}].name`, 80),
+    goal: text(subsystem.goal, `subsystems[${index}].goal`, 300),
+  }));
+  uniqueIds(subsystems, "subsystems");
+  const subsystemIds = new Set(subsystems.map(subsystem => subsystem.id));
+  for (const component of components) if (!subsystemIds.has(component.subsystemId)) issues.push(`components.${component.id} references an unknown subsystem`);
+
+  const rawNets = Array.isArray(value.nets) ? value.nets : [];
+  if (!Array.isArray(value.nets) || rawNets.length > 250) issues.push("nets must contain at most 250 named connections");
+  const nets = rawNets.filter(isRecord).slice(0, 250).map((net, index) => ({
+    id: text(net.id, `nets[${index}].id`, 64),
+    name: text(net.name, `nets[${index}].name`, 80),
+    subsystemIds: Array.isArray(net.subsystemIds) ? net.subsystemIds.filter((id): id is string => typeof id === "string").slice(0, 16) : [],
+  }));
+  uniqueIds(nets, "nets");
+  for (const net of nets) {
+    if (!net.subsystemIds.length) issues.push(`nets.${net.id} must be assigned to at least one subsystem`);
+    if (net.subsystemIds.some(id => !subsystemIds.has(id))) issues.push(`nets.${net.id} references an unknown subsystem`);
+  }
+
+  const rawRequirements = Array.isArray(value.requirements) ? value.requirements : [];
+  if (!Array.isArray(value.requirements) || rawRequirements.length < 1 || rawRequirements.length > 20) issues.push("requirements must contain between one and twenty behaviors");
+  const requirements = rawRequirements.filter(isRecord).slice(0, 20).map((requirement, index) => ({
+    id: text(requirement.id, `requirements[${index}].id`, 64),
+    description: text(requirement.description, `requirements[${index}].description`, 300),
+  }));
+  uniqueIds(requirements, "requirements");
+  const estimatedNetTerminals = value.estimatedNetTerminals;
+  if (typeof estimatedNetTerminals !== "number" || !Number.isInteger(estimatedNetTerminals) || estimatedNetTerminals < 0 || estimatedNetTerminals > 500) issues.push("estimatedNetTerminals must be an integer between zero and 500");
+  const projectId = text(value.projectId, "projectId", 64);
+  if (!SAFE_KEY.test(projectId)) issues.push("projectId is not a valid identifier");
+
+  const expectedCounts = requestedComponentCounts(options.prompt, options.availableParts);
+  const actualCounts = new Map<string, number>();
+  for (const component of components) actualCounts.set(component.type, (actualCounts.get(component.type) ?? 0) + 1);
+  for (const [type, count] of expectedCounts) if ((actualCounts.get(type) ?? 0) < count) issues.push(`plan omits requested ${count} ${type} component${count === 1 ? "" : "s"}`);
+  const explicitlyRequestsDataResistor = /\b(?:data|series)\s+resistor\b/.test(normalize(options.prompt))
+    && expectedCounts.has("ws2812b-strip-8");
+  if (explicitlyRequestsDataResistor) {
+    const plannedDataLimiters = components.filter(component => component.type === "resistor"
+      && /(?:data|din|ws2812|neo.?pixel|strip|series)/i.test(component.label)
+      && !/pull.?up|i2c|sda|scl/i.test(component.label));
+    if (!plannedDataLimiters.length) issues.push("plan must include a dedicated WS2812B data-series resistor, separate from the I2C pull-up resistors");
+  }
+  for (const subsystem of subsystems) {
+    const leds = components.filter(component => component.type === "led" && component.subsystemId === subsystem.id);
+    if (!leds.length) continue;
+    const limiters = components.filter(component => component.type === "resistor"
+      && component.subsystemId === subsystem.id
+      && !/pull.?up|i2c|sda|scl/i.test(component.label));
+    if (limiters.length < leds.length) {
+      issues.push(`subsystem ${subsystem.name} must plan a separate dedicated current-limiting resistor for each of its ${leds.length} discrete LEDs; found ${limiters.length} eligible resistors in that subsystem`);
+    }
+  }
+  const bmeCount = actualCounts.get("bme280") ?? 0;
+  if ((actualCounts.get("tca9548a") ?? 0) > 0 && bmeCount > 0) {
+    const requestedResistors = expectedCounts.get("resistor") ?? 0;
+    const requiredPullups = 2 + 2 * bmeCount;
+    const requiredResistors = requestedResistors + requiredPullups;
+    if ((actualCounts.get("resistor") ?? 0) < requiredResistors) {
+      issues.push(`plan needs ${requiredPullups} additional 4.7k resistor components for TCA9548A upstream and BME280 downstream I2C pull-ups, beyond the ${requestedResistors} explicitly requested resistor${requestedResistors === 1 ? "" : "s"}`);
+    }
+  }
+
+  if (issues.length) return { ok: false, issues: [...new Set(issues)].slice(0, 30) };
+  return { ok: true, value: {
+    projectId,
+    name: text(value.name, "name", 100),
+    description: text(value.description, "description", 500),
+    boards,
+    components,
+    subsystems,
+    nets,
+    estimatedNetTerminals: estimatedNetTerminals as number,
+    requirements,
+  } };
+}
+
+export function fragmentSchema(plan: GenerationPlan, subsystemId: string, availableParts: readonly ComponentDefinition[], options: { allowPartial?: boolean } = {}) {
+  const componentIds = plan.components.filter(component => component.subsystemId === subsystemId).map(component => component.id);
+  const moduleNetIds = plan.nets.filter(net => net.subsystemIds.includes(subsystemId)).map(net => net.id);
+  const definitions = plan.components.filter(component => componentIds.includes(component.id)).map(component => availableParts.find(part => part.id === component.type)).filter((part): part is ComponentDefinition => !!part);
+  const propertyFields = Object.fromEntries([...new Set(definitions.flatMap(part => Object.keys(part.properties)))].map(key => {
+    const values = definitions.map(part => part.properties[key]).filter(Boolean);
+    const definition = values[0];
+    return [key, {
+      type: definition.kind === "number" ? "number" : definition.kind === "boolean" ? "boolean" : "string",
+      ...(definition.kind === "number" && definition.min !== undefined ? { minimum: definition.min } : {}),
+      ...(definition.kind === "number" && definition.max !== undefined ? { maximum: definition.max } : {}),
+    }];
+  }));
+  const endpointKeys = [...componentIds, ...plan.boards.map(board => board.id)];
+  const pinIds = [...new Set([...definitions, ...plan.boards.map(board => availableParts.find(part => part.id === board.type)).filter((part): part is ComponentDefinition => !!part)].flatMap(part => part.pins.map(pin => pin.id)))];
+  return {
+    type: "object",
+    properties: {
+      subsystemId: { type: "string", enum: [subsystemId] },
+      placements: { type: "array", minItems: options.allowPartial ? 0 : componentIds.length, maxItems: componentIds.length, items: { type: "object", properties: {
+        id: { type: "string", enum: componentIds },
+        x: { type: "number", minimum: -1_000, maximum: 1_000 },
+        y: { type: "number", minimum: -1_000, maximum: 1_000 },
+        rotation: { type: "integer", enum: [0, 90, 180, 270] },
+        properties: { type: "object", properties: propertyFields },
+      }, required: ["id", "x", "y", "rotation", "properties"] } },
+      nets: { type: "array", minItems: options.allowPartial ? 0 : moduleNetIds.length, maxItems: moduleNetIds.length, items: { type: "object", properties: {
+        id: { type: "string", enum: moduleNetIds },
+        endpoints: { type: "array", minItems: options.allowPartial ? 0 : 1, items: { type: "object", properties: {
+          componentId: { type: "string", enum: endpointKeys },
+          pin: { type: "string", enum: pinIds },
+        }, required: ["componentId", "pin"] } },
+      }, required: ["id", "endpoints"] } },
+    },
+    required: ["subsystemId", "placements", "nets"],
+  };
+}
+
+export function validateFragment(
+  value: unknown,
+  plan: GenerationPlan,
+  subsystemId: string,
+  availableParts: readonly ComponentDefinition[],
+  options: { allowMissingPlacements?: boolean; allowMissingNets?: boolean; allowEmptyNets?: boolean } = {},
+): FragmentValidation {
+  const issues: string[] = [];
+  if (!isRecord(value)) return { ok: false, issues: ["fragment must be an object"] };
+  if (value.subsystemId !== subsystemId) issues.push("fragment.subsystemId does not match the requested subsystem");
+  const planned = plan.components.filter(component => component.subsystemId === subsystemId);
+  const allowed = new Map<string, ComponentDefinition | undefined>([
+    ...planned.map(component => [component.id, availableParts.find(part => part.id === component.type)] as const),
+    ...plan.boards.map(board => [board.id, availableParts.find(part => part.id === board.type)] as const),
+  ]);
+  const placements: GenerationFragment["placements"] = [];
+  const placementIds = new Set<string>();
+  if (!Array.isArray(value.placements)) issues.push("fragment.placements must be an array");
+  for (const [index, raw] of (Array.isArray(value.placements) ? value.placements : []).slice(0, 100).entries()) {
+    if (!isRecord(raw)) { issues.push(`fragment.placements[${index}] must be an object`); continue; }
+    const id = typeof raw.id === "string" ? raw.id : "";
+    const spec = planned.find(component => component.id === id);
+    if (!spec) { issues.push(`fragment.placements[${index}].id is not assigned to this subsystem`); continue; }
+    if (placements.some(placement => placement.id === id)) issues.push(`fragment.placements.${id} is duplicated`);
+    const x = raw.x; const y = raw.y; const rotation = raw.rotation ?? 0;
+    if (typeof x !== "number" || !Number.isFinite(x) || x < -1_000 || x > 1_000) issues.push(`fragment.placements.${id}.x must be between -1000 and 1000`);
+    if (typeof y !== "number" || !Number.isFinite(y) || y < -1_000 || y > 1_000) issues.push(`fragment.placements.${id}.y must be between -1000 and 1000`);
+    if (![0, 90, 180, 270].includes(rotation as number)) issues.push(`fragment.placements.${id}.rotation must be 0, 90, 180, or 270`);
+    const definition = allowed.get(id);
+    const properties: GenerationFragment["placements"][number]["properties"] = {};
+    if (raw.properties !== undefined && raw.properties !== null && !isRecord(raw.properties)) issues.push(`fragment.placements.${id}.properties must be an object`);
+    if (isRecord(raw.properties)) for (const [key, property] of Object.entries(raw.properties)) {
+      const propertyDefinition = definition?.properties[key];
+      // Unknown model properties have no simulator meaning. Drop these safely;
+      // still reject malformed values for properties that are in the catalog.
+      if (!propertyDefinition) continue;
+      const validType = propertyDefinition.kind === "number" ? typeof property === "number" && Number.isFinite(property)
+        : propertyDefinition.kind === "boolean" ? typeof property === "boolean" : typeof property === "string";
+      if (!validType) { issues.push(`fragment.placements.${id}.properties.${key} has the wrong type`); continue; }
+      if (typeof property === "number" && ((propertyDefinition.min !== undefined && property < propertyDefinition.min) || (propertyDefinition.max !== undefined && property > propertyDefinition.max))) issues.push(`fragment.placements.${id}.properties.${key} is out of range`);
+      else properties[key] = property as string | number | boolean;
+    }
+    if (typeof x === "number" && Number.isFinite(x) && typeof y === "number" && Number.isFinite(y)) {
+      placements.push({ id, x, y, rotation: rotation as number, properties });
+      placementIds.add(id);
+    }
+  }
+  if (!options.allowMissingPlacements) for (const component of planned) if (!placementIds.has(component.id)) issues.push(`fragment omits planned component ${component.id}`);
+
+  const allowedNets = plan.nets.filter(net => net.subsystemIds.includes(subsystemId));
+  const allowedNetById = new Map(allowedNets.map(net => [net.id, net] as const));
+  const isGroundReturnNet = (netId: string) => /\b(?:ground|gnd|return|negative|earth|0v)\b/i.test(allowedNetById.get(netId)?.name ?? "");
+  const isGroundEndpoint = (componentId: string, pinId: string) => {
+    const definition = allowed.get(componentId);
+    const pin = definition?.pins.find(candidate => candidate.id === pinId);
+    return !!pin && (definition?.metadata?.groundPins?.includes(pinId)
+      || (pin.direction === "power" && pin.signals.includes("ground")));
+  };
+  const endpointsByNet = new Map<string, Array<{ componentId: string; pin: string }>>();
+  const endpointOwner = new Map<string, string>();
+  const netParent = new Map(allowedNets.map(net => [net.id, net.id] as const));
+  const netRank = new Map(allowedNets.map((net, index) => [net.id, index] as const));
+  const findNet = (id: string): string => {
+    const parent = netParent.get(id) ?? id;
+    if (parent === id) return id;
+    const root = findNet(parent);
+    netParent.set(id, root);
+    return root;
+  };
+  const mergeNets = (left: string, right: string) => {
+    const leftRoot = findNet(left);
+    const rightRoot = findNet(right);
+    if (leftRoot === rightRoot) return;
+    if ((netRank.get(leftRoot) ?? Number.MAX_SAFE_INTEGER) <= (netRank.get(rightRoot) ?? Number.MAX_SAFE_INTEGER)) netParent.set(rightRoot, leftRoot);
+    else netParent.set(leftRoot, rightRoot);
+  };
+  if (!Array.isArray(value.nets)) issues.push("fragment.nets must be an array");
+  for (const [index, raw] of (Array.isArray(value.nets) ? value.nets : []).slice(0, 250).entries()) {
+    if (!isRecord(raw) || typeof raw.id !== "string" || !Array.isArray(raw.endpoints)) { issues.push(`fragment.nets[${index}] has an invalid shape`); continue; }
+    const plannedNet = allowedNets.find(net => net.id === raw.id);
+    if (!plannedNet) { issues.push(`fragment.nets.${raw.id} is not assigned to this subsystem`); continue; }
+    const endpoints: Array<{ componentId: string; pin: string }> = [];
+    for (const [endpointIndex, endpoint] of raw.endpoints.slice(0, 100).entries()) {
+      if (!isRecord(endpoint) || typeof endpoint.componentId !== "string" || typeof endpoint.pin !== "string") { issues.push(`fragment.nets.${raw.id}.endpoints[${endpointIndex}] is invalid`); continue; }
+      const definition = allowed.get(endpoint.componentId);
+      if (!definition) { issues.push(`fragment.nets.${raw.id} references unavailable component ${endpoint.componentId} pin ${endpoint.pin} outside this subsystem`); continue; }
+      if (!options.allowMissingPlacements && !plan.boards.some(board => board.id === endpoint.componentId) && !placementIds.has(endpoint.componentId)) {
+        issues.push(`fragment.nets.${raw.id} references component ${endpoint.componentId} without a placement in this fragment`);
+        continue;
+      }
+      const pinDefinition = definition.pins.find(pin => pin.id === endpoint.pin);
+      if (!pinDefinition) { issues.push(`fragment.nets.${raw.id} uses invalid pin ${endpoint.pin} on ${endpoint.componentId}`); continue; }
+      if (pinDefinition.noConnect) { issues.push(`fragment.nets.${raw.id} connects ${endpoint.componentId}.${endpoint.pin}, which is marked no-connect in the component catalog`); continue; }
+      const endpointKey = `${endpoint.componentId}:${endpoint.pin}`;
+      const previousNetId = endpointOwner.get(endpointKey);
+      if (previousNetId === raw.id) continue;
+      if (previousNetId !== undefined) {
+        // Ground symbols and board ground pins may intentionally join two
+        // separately named ground-return nets across subsystem fragments.
+        // Other repeated pins are conflicting assignments: collapsing those
+        // logical nets here can short power rails, bus lines, and sensor pins
+        // together before the subsystem repair stage can correct the actual
+        // endpoint assignment.
+        const sharedGroundReturn = isGroundEndpoint(endpoint.componentId, endpoint.pin)
+          && isGroundReturnNet(previousNetId)
+          && isGroundReturnNet(raw.id);
+        if (!sharedGroundReturn) {
+          issues.push(`fragment assigns ${endpoint.componentId}.${endpoint.pin} to both ${previousNetId} and ${raw.id}; only ground pins may join explicitly named ground-return nets. Keep signal and power nets separate`);
+          continue;
+        }
+        mergeNets(previousNetId, raw.id);
+      } else endpointOwner.set(endpointKey, raw.id);
+      endpoints.push({ componentId: endpoint.componentId, pin: endpoint.pin });
+    }
+    endpointsByNet.set(raw.id, endpoints);
+  }
+  for (const net of allowedNets) {
+    if (!endpointsByNet.has(net.id)) {
+      if (!options.allowMissingNets) issues.push(`fragment omits shared net ${net.id}`);
+    } else if (!(endpointsByNet.get(net.id)?.length) && !options.allowEmptyNets) issues.push(`fragment net ${net.id} has no endpoints`);
+  }
+  const mergedEndpoints = new Map<string, Array<{ componentId: string; pin: string }>>();
+  for (const net of allowedNets) {
+    const root = findNet(net.id);
+    const endpoints = mergedEndpoints.get(root) ?? [];
+    for (const endpoint of endpointsByNet.get(net.id) ?? []) {
+      if (!endpoints.some(item => item.componentId === endpoint.componentId && item.pin === endpoint.pin)) endpoints.push(endpoint);
+    }
+    mergedEndpoints.set(root, endpoints);
+  }
+  const normalizedNets = allowedNets.flatMap(net => {
+    if (options.allowMissingNets && !endpointsByNet.has(net.id)) return [];
+    const root = findNet(net.id);
+    const endpoints = root === net.id ? mergedEndpoints.get(root) ?? [] : [];
+    return [{ id: net.id, endpoints }];
+  });
+  if (issues.length) return { ok: false, issues: [...new Set(issues)].slice(0, 30) };
+  return { ok: true, value: {
+    subsystemId,
+    placements,
+    nets: normalizedNets,
+  } };
+}
+
+/** Validate electrical endpoint ownership after independently generated
+ * subsystem fragments are combined. A board pin may be repeated across
+ * fragments when every occurrence belongs to the same named net. Ground pins
+ * are the only exception for differently named nets, and both net names must
+ * explicitly describe a ground/return. */
+export function validateFragmentSetTopology(
+  plan: GenerationPlan,
+  fragments: readonly GenerationFragment[],
+  availableParts: readonly ComponentDefinition[],
+): FragmentTopologyIssue[] {
+  const definitionByType = new Map(availableParts.map(definition => [definition.id, definition] as const));
+  const componentTypeById = new Map([
+    ...plan.boards.map(board => [board.id, board.type] as const),
+    ...plan.components.map(component => [component.id, component.type] as const),
+  ]);
+  const plannedNets = new Map(plan.nets.map(net => [net.id, net] as const));
+  const ownersByEndpoint = new Map<string, Map<string, Set<string>>>();
+  const endpointsByNet = new Map<string, Map<string, { componentId: string; pin: string }>>();
+  const keyOf = (endpoint: { componentId: string; pin: string }) => `${endpoint.componentId}:${endpoint.pin}`;
+  const isGroundNet = (netId: string) => /\b(?:ground|gnd|return|negative|earth|0v)\b/i.test(plannedNets.get(netId)?.name ?? "");
+  const isGroundEndpoint = (endpoint: { componentId: string; pin: string }) => {
+    const type = componentTypeById.get(endpoint.componentId);
+    const definition = type ? definitionByType.get(type) : undefined;
+    const pin = definition?.pins.find(candidate => candidate.id === endpoint.pin);
+    return !!pin && (definition?.metadata?.groundPins.includes(endpoint.pin)
+      || (pin.direction === "power" && pin.signals.includes("ground")));
+  };
+
+  for (const fragment of fragments) for (const net of fragment.nets) {
+    if (!plannedNets.has(net.id)) continue;
+    const netEndpoints = endpointsByNet.get(net.id) ?? new Map<string, { componentId: string; pin: string }>();
+    for (const endpoint of net.endpoints) {
+      const endpointKey = keyOf(endpoint);
+      netEndpoints.set(endpointKey, endpoint);
+      const netOwners = ownersByEndpoint.get(endpointKey) ?? new Map<string, Set<string>>();
+      const subsystemOwners = netOwners.get(net.id) ?? new Set<string>();
+      subsystemOwners.add(fragment.subsystemId);
+      netOwners.set(net.id, subsystemOwners);
+      ownersByEndpoint.set(endpointKey, netOwners);
+    }
+    endpointsByNet.set(net.id, netEndpoints);
+  }
+
+  const result: FragmentTopologyIssue[] = [];
+  for (const [endpointKey, netOwners] of ownersByEndpoint) {
+    if (netOwners.size <= 1) continue;
+    const endpoint = [...netOwners.keys()].flatMap(netId => endpointsByNet.get(netId)?.get(endpointKey) ?? [])[0];
+    if (!endpoint) continue;
+    const netIds = [...netOwners.keys()].sort();
+    const explicitGroundBridge = isGroundEndpoint(endpoint) && netIds.every(isGroundNet);
+    if (explicitGroundBridge) continue;
+    const subsystemIds = [...new Set([...netOwners.values()].flatMap(owners => [...owners]))].sort();
+    result.push({
+      code: "NET_ENDPOINT_OWNERSHIP",
+      message: `${endpoint.componentId}.${endpoint.pin} is assigned to distinct nets ${netIds.join(" and ")} by subsystem fragments ${subsystemIds.join(", ")}. Assign this physical pin to one net only; only a ground pin may join explicitly named ground/return nets.`,
+      endpoints: [endpoint],
+      netIds,
+      subsystemIds,
+    });
+  }
+
+  const topologyComponents = [
+    ...plan.boards.map(board => ({ id: board.id, type: board.type, label: board.label })),
+    ...plan.components.map(component => ({ ...component })),
+  ];
+  const compatibilityIssues = validateNetEndpointCompatibility(
+    topologyComponents,
+    [...endpointsByNet].map(([id, endpoints]) => ({
+      id,
+      endpoints: [...endpoints.values()],
+      subsystemIds: [...new Set(fragments.filter(fragment => fragment.nets.some(net => net.id === id)).map(fragment => fragment.subsystemId))],
+    })),
+    availableParts,
+  );
+  result.push(...compatibilityIssues);
+
+  return result;
+}
+
+/** Apply a targeted model repair without deleting untouched parts or nets. */
+export function mergeGenerationFragment(previous: GenerationFragment, repair: GenerationFragment): GenerationFragment {
+  const placements = new Map(previous.placements.map(placement => [placement.id, placement]));
+  for (const placement of repair.placements) placements.set(placement.id, placement);
+  const nets = new Map(previous.nets.map(net => [net.id, net]));
+  for (const net of repair.nets) nets.set(net.id, net);
+  return { subsystemId: repair.subsystemId, placements: [...placements.values()], nets: [...nets.values()] };
+}
+
+export function sketchBundleSchema(plan: GenerationPlan, availableParts?: readonly ComponentDefinition[]) {
+  const headers = availableParts
+    ? [...new Set(plan.boards.flatMap(board => sketchProgramHeaders(board.type, availableParts)))]
+    : undefined;
+  const program = sketchProgramSchema("all", headers, { compact: true });
+  return {
+    type: "object",
+    properties: {
+      programs: { type: "array", minItems: plan.boards.length, maxItems: plan.boards.length, items: { type: "object", properties: {
+        boardId: { type: "string", enum: plan.boards.map(board => board.id) },
+        // Keep expressions compact but preserve the required program structure;
+        // local board/API/simulator validation remains authoritative.
+        program,
+      }, required: ["boardId", "program"] } },
+      explanation: { type: "string" },
+      assumptions: { type: "array", items: { type: "string" } },
+      warnings: { type: "array", items: { type: "string" } },
+    },
+    required: ["programs", "explanation", "assumptions", "warnings"],
+  };
+}
+
+export function validateSketchBundle(value: unknown, plan: GenerationPlan): { ok: true; value: SketchBundle } | { ok: false; issues: string[] } {
+  if (!isRecord(value) || !Array.isArray(value.programs)) return { ok: false, issues: ["sketch bundle must contain programs"] };
+  const issues: string[] = [];
+  const programs: SketchBundle["programs"] = [];
+  const warningsForPrograms: string[] = [];
+  for (const raw of value.programs) {
+    if (!isRecord(raw) || typeof raw.boardId !== "string" || !isRecord(raw.program)) { issues.push("each sketch must have a boardId and structured program"); continue; }
+    if (!plan.boards.some(board => board.id === raw.boardId)) issues.push(`sketch references unknown board ${raw.boardId}`);
+    if (programs.some(program => program.boardId === raw.boardId)) issues.push(`duplicate sketch for board ${raw.boardId}`);
+    const board = plan.boards.find(item => item.id === raw.boardId);
+    if (!board) continue;
+    const normalized = normalizeSketchProgramForSimulator(raw.program as unknown as SketchProgram, board.type);
+    const validated = validateSketchProgram(normalized.program, board.type);
+    if (!validated.ok) issues.push(...validated.issues.map(issue => `sketch ${raw.boardId}: ${issue}`));
+    else if (validated.value.code.length > 30_000) issues.push(`sketch for ${raw.boardId} is too large`);
+    else {
+      programs.push({ boardId: raw.boardId, program: validated.value.program, code: validated.value.code });
+      warningsForPrograms.push(...normalized.warnings);
+    }
+  }
+  for (const board of plan.boards) if (!programs.some(program => program.boardId === board.id)) issues.push(`missing sketch for board ${board.id}`);
+  const strings = (key: "assumptions" | "warnings") => {
+    const items = value[key];
+    if (!Array.isArray(items) || items.length > 12 || items.some(item => typeof item !== "string" || item.length > 240)) { issues.push(`${key} must be an array of up to twelve short strings`); return []; }
+    return items as string[];
+  };
+  if (typeof value.explanation !== "string" || !value.explanation.trim() || value.explanation.length > 2_000) issues.push("explanation must be a short non-empty string");
+  const assumptions = strings("assumptions");
+  const warnings = [...new Set([...strings("warnings"), ...warningsForPrograms])];
+  return issues.length ? { ok: false, issues } : { ok: true, value: { programs, explanation: value.explanation as string, assumptions, warnings } };
+}
+
+export function assembleGenerationPlan(plan: GenerationPlan, fragments: readonly GenerationFragment[], sketches: SketchBundle): unknown {
+  const boardX = -420;
+  const subsystemGap = 72;
+  const rowWidthLimit = 1_080;
+  const plannedById = new Map(plan.components.map(component => [component.id, component] as const));
+  const fragmentGroups = fragments.map((fragment, fragmentIndex) => {
+    const positioned = fragment.placements.flatMap(placement => {
+      const component = plannedById.get(placement.id);
+      const definition = component && getComponentDefinition(component.type);
+      if (!component || !definition) return [];
+      const width = definition.width;
+      const height = definition.height;
+      const rotated = (placement.rotation ?? 0) % 180 !== 0;
+      const boundsWidth = rotated ? height : width;
+      const boundsHeight = rotated ? width : height;
+      return [{
+        placement,
+        left: placement.x + (width - boundsWidth) / 2,
+        top: placement.y + (height - boundsHeight) / 2,
+        right: placement.x + (width + boundsWidth) / 2,
+        bottom: placement.y + (height + boundsHeight) / 2,
+      }];
+    });
+    const connectedBoards = new Set(fragment.nets.flatMap(net => net.endpoints.map(endpoint => endpoint.componentId)));
+    const connectedBoardIndex = plan.boards.findIndex(board => connectedBoards.has(board.id));
+    const bounds = positioned.length ? {
+      left: Math.min(...positioned.map(item => item.left)),
+      top: Math.min(...positioned.map(item => item.top)),
+      right: Math.max(...positioned.map(item => item.right)),
+      bottom: Math.max(...positioned.map(item => item.bottom)),
+    } : { left: 0, top: 0, right: 0, bottom: 0 };
+    return {
+      fragment,
+      fragmentIndex,
+      boardIndex: connectedBoardIndex < 0 ? 0 : connectedBoardIndex,
+      positioned,
+      bounds,
+      width: bounds.right - bounds.left,
+      height: bounds.bottom - bounds.top,
+      offsetX: 0,
+      offsetY: 0,
+    };
+  });
+
+  const boardComponents = [] as Array<{ id: string; type: string; label: string; x: number; y: number; rotation: number; properties: Record<string, never> }>;
+  const placements: Array<{ id: string; type: string; label: string; x: number; y: number; rotation: number; properties: Record<string, string | number | boolean> }> = [];
+  let boardRowTop = 0;
+  plan.boards.forEach((board, boardIndex) => {
+    const groups = fragmentGroups.filter(group => group.boardIndex === boardIndex && group.positioned.length > 0);
+    let cursorX = 0;
+    let rowTop = 0;
+    let rowHeight = 0;
+    let rowHasGroups = false;
+    for (const group of groups) {
+      if (rowHasGroups && cursorX + group.width > rowWidthLimit) {
+        rowTop += rowHeight + subsystemGap;
+        cursorX = 0;
+        rowHeight = 0;
+        rowHasGroups = false;
+      }
+      group.offsetX = cursorX - group.bounds.left;
+      group.offsetY = rowTop - group.bounds.top;
+      cursorX += group.width + subsystemGap;
+      rowHeight = Math.max(rowHeight, group.height);
+      rowHasGroups = true;
+    }
+    const groupHeight = groups.length ? rowTop + rowHeight : 0;
+    const boardDefinition = getComponentDefinition(board.type);
+    const boardHeight = boardDefinition?.height ?? 180;
+    const rowHeightWithBoard = Math.max(groupHeight, boardHeight);
+    const groupTop = boardRowTop + (rowHeightWithBoard - groupHeight) / 2;
+    const boardY = boardRowTop + (rowHeightWithBoard - boardHeight) / 2;
+    boardComponents.push({ id: board.id, type: board.type, label: board.label, x: boardX, y: boardY, rotation: 0, properties: {} });
+    const boardWidth = getComponentDefinition(board.type)?.width ?? 240;
+    const groupOriginX = boardX + boardWidth + subsystemGap;
+    for (const group of groups) {
+      for (const { placement } of group.positioned) {
+        const component = plannedById.get(placement.id)!;
+        placements.push({
+          id: placement.id,
+          type: component.type,
+          label: component.label,
+          x: groupOriginX + group.offsetX + placement.x,
+          y: groupTop + group.offsetY + placement.y,
+          rotation: placement.rotation ?? 0,
+          properties: placement.properties ?? {},
+        });
+      }
+    }
+    boardRowTop += rowHeightWithBoard + 160;
+  });
+  const netEndpoints = new Map<string, Array<{ componentId: string; pin: string }>>();
+  for (const fragment of fragments) for (const net of fragment.nets) {
+    const endpoints = netEndpoints.get(net.id) ?? [];
+    for (const endpoint of net.endpoints) if (!endpoints.some(item => item.componentId === endpoint.componentId && item.pin === endpoint.pin)) endpoints.push(endpoint);
+    netEndpoints.set(net.id, endpoints);
+  }
+  const connectionColors = ["#42d7bd", "#f59e0b", "#ef4444", "#68a7ff"];
+  const connections: Array<{ id: string; from: { componentId: string; pin: string }; to: { componentId: string; pin: string }; color: string }> = [];
+  for (const [netIndex, net] of plan.nets.entries()) {
+    const endpoints = netEndpoints.get(net.id) ?? [];
+    if (endpoints.length < 2) continue;
+    endpoints.slice(1).forEach((endpoint, endpointIndex) => connections.push({
+      id: `wire_${net.id}_${endpointIndex + 1}`,
+      from: endpoints[0]!, to: endpoint, color: connectionColors[netIndex % connectionColors.length]!,
+    }));
+  }
+  const programs = Object.fromEntries(sketches.programs.map(program => [program.boardId, program.code]));
+  const primaryBoard = plan.boards[0]!;
+  return {
+    project: {
+      schemaVersion: 1,
+      id: plan.projectId,
+      name: plan.name,
+      description: plan.description,
+      board: primaryBoard.type,
+      components: [...boardComponents, ...placements],
+      connections,
+      code: programs[primaryBoard.id],
+      ...(plan.boards.length > 1 ? { boardPrograms: sketches.programs.map(program => ({ boardId: program.boardId, code: program.code })) } : {}),
+    },
+    explanation: sketches.explanation,
+    assumptions: sketches.assumptions,
+    warnings: sketches.warnings,
+  };
+}

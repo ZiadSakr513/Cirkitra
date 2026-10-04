@@ -48,6 +48,11 @@ for (const [id, make] of Object.entries(COMPONENT_EXAMPLES)) test(`${id} publica
   } else if (fixture === "onewire-conversion-readback") {
     simulator.advance(1000);
     assert.ok(simulator.getSnapshot().serial.some(entry => entry.text === "25"), "blocking conversion reports the wired sensor temperature");
+  } else if (fixture === "hc-sr04-trigger-echo-distance") {
+    simulator.advance(20);
+    const distance = Number(simulator.getSnapshot().serial.at(-1)?.text);
+    assert.ok(Math.abs(distance - 42) < 0.1, `a wired trigger pulse reports the configured 42 cm distance, got ${distance}`);
+    assert.equal(solveCircuit(project, simulator.getSnapshot()).componentStates.device.readings?.distanceCm, 42);
   } else if (fixture === "dht-timed-sampling") {
     simulator.advance(0);
     assert.ok(simulator.getSnapshot().serial.some(entry => entry.text === "25"));
@@ -105,6 +110,23 @@ for (const [id, make] of Object.entries(COMPONENT_EXAMPLES)) test(`${id} publica
     const lowVoltageBoard = { ...project, board: "esp32-devkitc-v4" as const, code: project.code.replaceAll("LED_PIN 6", "LED_PIN 18"), components: project.components.map(component => component.id === "uno" ? { ...component, type: "esp32-devkitc-v4" } : component), connections: project.connections.map(wire => wire.from.componentId === "device" && wire.from.pin === "DIN" ? { ...wire, to: { ...wire.to, pin: "GPIO18" } } : wire) };
     const esp = new ArduinoSimulator(lowVoltageBoard.code, { boardId: lowVoltageBoard.board, boardComponentId: "uno" }); esp.attachProject(lowVoltageBoard); esp.run(); esp.advance(0);
     assert.ok(esp.getSnapshot().diagnostics.some(diagnostic => diagnostic.code === "NEOPIXEL_LOGIC_LEVEL"), "3.3V MCU output cannot be treated as a valid high at a 5V WS2812B DIN");
+  } else if (fixture === "level-shifter-translates-esp32-to-5v-ws2812b") {
+    const buffer = simulator.getSnapshot().componentStates.buffer;
+    const strip = simulator.getSnapshot().componentStates.strip;
+    assert.equal(buffer.status, "Enabled");
+    assert.equal(buffer.readings?.supplyVoltage, 5);
+    assert.equal(strip.status, "Displaying");
+    assert.deepEqual(strip.pixels?.[0], { r: 255, g: 0, b: 0 });
+    assert.equal(simulator.getSnapshot().diagnostics.some(diagnostic => diagnostic.severity === "error"), false);
+    const disconnectedEnable = { ...project, connections: project.connections.filter(wire => ![wire.from, wire.to].some(endpoint => endpoint.componentId === "buffer" && endpoint.pin === "OE")) };
+    const disabled = new ArduinoSimulator(disconnectedEnable.code, { boardId: disconnectedEnable.board, boardComponentId: "esp32" });
+    disabled.attachProject(disconnectedEnable); disabled.run(); disabled.advance(0);
+    assert.ok(disabled.getSnapshot().diagnostics.some(diagnostic => diagnostic.code === "LEVEL_SHIFTER_ENABLE_FLOATING"));
+    const directDrive = { ...project, connections: project.connections.filter(wire => !(wire.from.componentId === "buffer" && wire.from.pin === "Y" && wire.to.componentId === "strip" && wire.to.pin === "DIN")) };
+    directDrive.connections.push({ id: "unsafe-direct-drive", from: { componentId: "esp32", pin: "GPIO5" }, to: { componentId: "strip", pin: "DIN" } });
+    const direct = new ArduinoSimulator(directDrive.code, { boardId: directDrive.board, boardComponentId: "esp32" });
+    direct.attachProject(directDrive); direct.run(); direct.advance(0);
+    assert.ok(direct.getSnapshot().diagnostics.some(diagnostic => diagnostic.code === "NEOPIXEL_LOGIC_LEVEL"), "the unsafe direct 3.3 V connection remains a clear fault");
   } else if (fixture === "ky040-encoder-and-button-follow-live-inputs") {
     simulator.advance(0);
     assert.equal(simulator.getSnapshot().componentStates.device.readings?.position, 3);

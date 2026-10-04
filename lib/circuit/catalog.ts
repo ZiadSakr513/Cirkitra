@@ -80,6 +80,7 @@ export interface ComponentDefinition {
   displayName: string;
   category: ComponentCategory;
   description: string;
+  requestAliases?: readonly string[];
   width: number;
   height: number;
   accent: string;
@@ -908,6 +909,7 @@ const LEGACY_COMPONENTS = {
     displayName: "HC-SR04",
     category: "sensors",
     description: "Ultrasonic distance sensor module.",
+    requestAliases: ["ultrasonic sensor", "ultrasonic distance sensor", "sonar sensor", "sonar", "range sensor"],
     width: 152,
     height: 80,
     accent: "#06b6d4",
@@ -957,6 +959,12 @@ const LEGACY_COMPONENTS = {
       },
     },
     defaultProperties: { distanceCm: 100 },
+    simulation: {
+      capability: "simulated",
+      model: "hc-sr04",
+      behavior: "Requires wired power and ground; a standard TRIG pulse produces an ECHO pulse based on the configured distance.",
+      limitations: "Distance is a configured simulator input; acoustic propagation, beam shape, and multiple targets are not modeled.",
+    },
   },
   "temperature-sensor": {
     id: "temperature-sensor",
@@ -1069,6 +1077,7 @@ export const CAPABILITY_LABELS: Record<SimulationCapability, string> = { "unavai
 export function componentMatchesSearch(definition: ComponentDefinition, search: string): boolean {
   const metadata = definition.metadata;
   const text = [definition.id, definition.displayName, definition.description, definition.category,
+    ...(definition.requestAliases ?? []),
     metadata?.manufacturer, metadata?.variant, ...(metadata?.aliases ?? []), ...(metadata?.interfaces ?? []),
     ...(metadata?.libraries.map(library => `${library.name} ${library.headers.join(" ")}`) ?? [])].join(" ").toLowerCase();
   return search.toLowerCase().trim().split(/\s+/).every(token => text.includes(token));
