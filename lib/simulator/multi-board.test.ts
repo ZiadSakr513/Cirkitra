@@ -135,6 +135,80 @@ test("hardware UART delivers bytes only across connected RX/TX pins at a matchin
   assert.ok(wrongBaud.getSnapshot().diagnostics.some(diagnostic => diagnostic.code === "UART_RECEIVER_NOT_READY"), "a receiver with a mismatched baud reports why bytes were dropped");
 });
 
+test("reloaded Gemini-style UART sketches exchange P/A and toggle the ESP32 built-in LED", () => {
+  const mega = `unsigned long lastSend = 0;
+
+void setup() {
+  Serial1.begin(9600);
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastSend >= 2000) {
+    lastSend = currentMillis;
+    Serial1.print("P");
+  }
+  if (Serial1.available() > 0) {
+    int incoming = Serial1.read();
+    if (incoming == 65) {
+      // Handshake acknowledgment received
+    }
+  }
+}`;
+  const esp = `int ledState = 0;
+
+void setup() {
+  pinMode(2, OUTPUT);
+  digitalWrite(2, LOW);
+  Serial.begin(9600);
+  Serial1.begin(9600);
+}
+
+void loop() {
+  if (Serial1.available() > 0) {
+    int incomingByte = Serial1.read();
+    Serial.println(incomingByte);
+    if (incomingByte == 80) {
+      if (ledState == 0) {
+        ledState = 1;
+        digitalWrite(2, HIGH);
+      } else {
+        ledState = 0;
+        digitalWrite(2, LOW);
+      }
+      Serial1.print("A");
+    }
+  }
+}`;
+  const project: CircuitProject = {
+    ...mixedBoardProject(),
+    code: mega,
+    components: [
+      { id: "mega", type: "arduino-mega-2560", label: "Arduino Mega 2560", x: 0, y: 0 },
+      { id: "esp", type: "esp32-devkitc-v4", label: "ESP32 DevKitC V4", x: 480, y: 0 },
+      { id: "common-ground", type: "ground", label: "Common Ground", x: 240, y: 300 },
+    ],
+    connections: [
+      { id: "w1", from: { componentId: "mega", pin: "D18" }, to: { componentId: "esp", pin: "GPIO16" } },
+      { id: "w2", from: { componentId: "esp", pin: "GPIO17" }, to: { componentId: "mega", pin: "D19" } },
+      { id: "w3", from: { componentId: "common-ground", pin: "GND" }, to: { componentId: "mega", pin: "GND" } },
+      { id: "w4", from: { componentId: "common-ground", pin: "GND" }, to: { componentId: "esp", pin: "GND" } },
+    ],
+    programs: { mega, esp },
+  };
+  const simulator = new MultiBoardSimulator();
+  simulator.attachProject(project);
+  simulator.run();
+  simulator.advance(0);
+  simulator.advance(2100);
+  simulator.advance(100);
+  const snapshot = simulator.getSnapshot();
+  assert.ok(snapshot.boardSerial?.esp?.some(entry => entry.text === "80"), "ESP32 Serial Monitor receives the ASCII P byte (80)");
+  assert.ok(snapshot.boardSerial?.mega?.some(entry => entry.text === "P"), "Mega sends P over its connected hardware UART");
+  assert.equal(snapshot.boardPins?.esp?.[2]?.digitalValue, 1, "receiving P toggles the built-in LED GPIO2 high");
+  assert.equal(snapshot.diagnostics.some(item => item.severity === "error" || item.code.startsWith("UART_")), false, JSON.stringify(snapshot.diagnostics));
+});
+
 test("generated Mega and ESP32 UART echo sketches exchange A and B over crossed wires", () => {
   const mega = `void setup() {
   Serial.begin(9600);
@@ -160,7 +234,9 @@ void loop() {
     int incoming = Serial1.read();
     Serial.print("ESP32 received numeric: ");
     Serial.println(incoming);
-    Serial1.write('B');
+    if (incoming == 'A') {
+      Serial1.write('B');
+    }
   }
   delay(100);
 }`;

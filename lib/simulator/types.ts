@@ -76,6 +76,7 @@ export type SketchInstruction =
       kind: "declare";
       name: string;
       expression: string;
+      integer?: boolean;
     })
   | (InstructionSource & {
       kind: "assign";
@@ -129,11 +130,28 @@ export type SketchInstruction =
       frequencyExpression?: string;
     });
 
+export type SketchHelperStatement =
+  | { kind: "return"; expression: string }
+  | { kind: "if"; condition: string; then: readonly SketchHelperStatement[]; otherwise: readonly SketchHelperStatement[] };
+
+export interface SketchHelperFunction {
+  name: string;
+  returnType: string;
+  parameters: readonly string[];
+  parameterTypes: readonly string[];
+  body: readonly SketchHelperStatement[];
+  line: number;
+}
+
 export interface CompiledArduinoSketch {
   source: string;
   setup: ReadonlyArray<SketchInstruction>;
   loop: ReadonlyArray<SketchInstruction>;
   globals: Readonly<Record<string, number>>;
+  /** Names whose declared Arduino type stores integral values. */
+  integerVariables?: readonly string[];
+  /** Pure numeric helpers, evaluated with bounded call depth by the browser interpreter. */
+  helpers: Readonly<Record<string, SketchHelperFunction>>;
   i2cCallbacks?: Readonly<{ onReceive?: ReadonlyArray<SketchInstruction>; onRequest?: ReadonlyArray<SketchInstruction>; receiveParameter?: string }>;
   diagnostics: ReadonlyArray<SimulatorDiagnostic>;
   valid: boolean;

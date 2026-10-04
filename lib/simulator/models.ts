@@ -126,6 +126,9 @@ const soilMoistureSensor: ElectricalModel = { evaluate(c) {
   }
   return r;
 } };
+const ultrasonicSensor: ElectricalModel = { evaluate(c) {
+  return result(c, ["VCC"], ["GND"]);
+} };
 function gate(operation: (a: boolean, b: boolean) => boolean, unary = false): ElectricalModel {
   return { evaluate(c) {
     const r = result(c, ["VCC"], ["GND"]);
@@ -139,6 +142,7 @@ export const ELECTRICAL_MODELS: Readonly<Record<string, ElectricalModel>> = {
   "mux-4067": mux(16, "I", ["GND"]), "mux-4051": mux(8, "A", ["GND", "VEE"]),
   "decoder-138": decoder, "driver-tb6612": tb6612, "driver-drv8833": drv8833, "driver-l298": l298, l293d,
   "temperature-sensor": analogTemperatureSensor, "pir-sensor": pirSensor,
+  "hc-sr04": ultrasonicSensor,
   "soil-moisture-sen0193": soilMoistureSensor,
   "logic-and": gate((a, b) => a && b), "logic-or": gate((a, b) => a || b), "logic-xor": gate((a, b) => a !== b),
   "logic-nand": gate((a, b) => !(a && b)), "logic-nor": gate((a, b) => !(a || b)), "logic-not": gate(a => !a, true),

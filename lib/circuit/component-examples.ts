@@ -215,6 +215,15 @@ function bh1750Example(): CircuitProject {
   p.code = `#include <Wire.h>\n#include <BH1750.h>\nBH1750 lightMeter;\nvoid setup(){ Serial.begin(9600); Wire.begin(); lightMeter.begin(); }\nvoid loop(){ float lux = lightMeter.readLightLevel(); Serial.println(lux); delay(1000); }`;
   return p;
 }
+function ultrasonicExample(): CircuitProject {
+  const p = example("hc-sr04"), { wire, rail } = wiring(p);
+  p.components[1].properties = { distanceCm: 42 };
+  rail("VCC"); rail("GND", "GND");
+  wire("device", "TRIG", "uno", "D3"); wire("device", "ECHO", "uno", "D4");
+  p.code = `void setup(){ Serial.begin(9600); pinMode(3,OUTPUT); pinMode(4,INPUT); }
+void loop(){ digitalWrite(3,LOW); delayMicroseconds(2); digitalWrite(3,HIGH); delayMicroseconds(10); digitalWrite(3,LOW); long duration=pulseIn(4,HIGH,30000); float distanceCm=duration/58.3; Serial.println(distanceCm); delay(100); }`;
+  return p;
+}
 function ssd1306Example(): CircuitProject {
   const p = example("ssd1306-oled-128x64"), { wire } = wiring(p);
   wire("device", "VCC", "uno", "3V3"); wire("device", "GND", "uno", "GND");
@@ -234,6 +243,43 @@ function ws2812bExample(): CircuitProject {
   p.code = `#include <Adafruit_NeoPixel.h>\n#define LED_PIN 6\n#define LED_COUNT 8\nAdafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);\nvoid setup(){ strip.begin(); strip.setBrightness(96); strip.setPixelColor(0, strip.Color(255,0,0)); strip.setPixelColor(1, strip.Color(0,255,0)); strip.setPixelColor(2, strip.Color(0,0,255)); strip.show(); }\nvoid loop(){ delay(250); }`;
   return p;
 }
+function ahctLevelShifterExample(): CircuitProject {
+  const p: CircuitProject = {
+    schemaVersion: 1, id: "example-sn74ahct1g125", name: "ESP32 to 5 V LED strip level shifting",
+    description: "A 3.3 V ESP32 signal drives a 5 V WS2812B through a powered AHCT buffer.",
+    board: "esp32-devkitc-v4",
+    code: `#include <Adafruit_NeoPixel.h>\nAdafruit_NeoPixel strip(8, 5, NEO_GRB + NEO_KHZ800);\nvoid setup(){ pinMode(5,OUTPUT); strip.begin(); strip.setPixelColor(0,strip.Color(255,0,0)); strip.show(); }\nvoid loop(){ delay(100); }`,
+    components: [
+      { id: "esp32", type: "esp32-devkitc-v4", label: "ESP32 DevKitC", x: 0, y: 0 },
+      { id: "supply", type: "dc-supply", label: "5 V LED supply", x: 0, y: 260, properties: { voltage: 5, enabled: true } },
+      { id: "buffer", type: "sn74ahct1g125", label: "AHCT level shifter", x: 360, y: 0 },
+      { id: "strip", type: "ws2812b-strip-8", label: "WS2812B strip", x: 700, y: 0 },
+    ],
+    connections: [],
+  };
+  const wire = (from: string, pin: string, to: string, other: string) => p.connections.push({ id: `wire-${p.connections.length}`, from: { componentId: from, pin }, to: { componentId: to, pin: other } });
+  wire("esp32", "GPIO5", "buffer", "A"); wire("buffer", "Y", "strip", "DIN");
+  wire("buffer", "OE", "esp32", "GND"); wire("buffer", "GND", "esp32", "GND"); wire("strip", "GND", "esp32", "GND");
+  wire("supply", "+", "buffer", "VCC"); wire("supply", "+", "strip", "VDD"); wire("supply", "-", "esp32", "GND");
+  return p;
+}
+export const KY040_CONTROL_EXAMPLE_CODE = `#include <Encoder.h>
+Encoder knob(2,3);
+long previousPosition=0;
+int setpoint=35;
+int previousSwitch=HIGH;
+void setup(){ Serial.begin(9600); pinMode(4,INPUT_PULLUP); previousPosition=knob.read(); previousSwitch=digitalRead(4); }
+void loop(){
+  long position=knob.read();
+  int detents=(position-previousPosition)/4;
+  if(detents!=0){ setpoint=constrain(setpoint+detents*5,20,70); previousPosition=previousPosition+detents*4; }
+  int switchState=digitalRead(4);
+  if(switchState==LOW && previousSwitch==HIGH){ setpoint=35; }
+  previousSwitch=switchState;
+  Serial.print("Threshold: "); Serial.println(setpoint);
+  delay(20);
+}`;
+
 function ky040Example(): CircuitProject {
   const p = example("ky-040"), { wire } = wiring(p);
   wire("device", "VCC", "uno", "5V"); wire("device", "GND", "uno", "GND");
@@ -382,8 +428,10 @@ export const COMPONENT_EXAMPLES: Readonly<Record<string, () => CircuitProject>> 
   "xbee-s2c-zigbee-th": xbeeExample,
   "soil-moisture-sen0193": soilMoistureExample,
   "bh1750-sen0097": bh1750Example,
+  "hc-sr04": ultrasonicExample,
   "ssd1306-oled-128x64": ssd1306Example,
   "ws2812b-strip-8": ws2812bExample,
+  sn74ahct1g125: ahctLevelShifterExample,
   "ky-040": ky040Example,
   "keypad-4x4": keypadExample,
   "relay-module-1ch-active-low": relayExample,

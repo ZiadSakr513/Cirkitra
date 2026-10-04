@@ -17,11 +17,19 @@ export function selectGenerationComponents(prompt: string, target: GenerationTar
   // Explicit hardware names must survive scoring, including "DC supply" in a
   // long prompt dominated by sensor and bus keywords.
   for (const part of Object.values(COMPONENT_CATALOG)) {
-    const names = [part.id, part.displayName, ...(part.metadata?.aliases ?? []).filter(alias => !genericAliases.has(normalize(alias)))];
+    const names = [part.id, part.displayName, ...(part.requestAliases ?? []), ...(part.metadata?.aliases ?? []).filter(alias => !genericAliases.has(normalize(alias)))];
     if (names.some(name => requested.includes(` ${normalize(name)} `))) {
       explicitlyRequested.add(part.id);
       ids.add(part.id);
     }
+  }
+  const normalizedPrompt = normalize(prompt);
+  const explicitStandaloneMotorSupply = /\b(?:(?:separate|external|regulated|bench|adjustable|dedicated)\s+){1,3}(?:(?:dc|motor|fan|actuator|power)\s+){0,3}(?:power\s+)?supply\b|\b(?:motor|fan|actuator)\s+(?:power\s+)?supply\b/.test(normalizedPrompt);
+  if (COMPONENT_CATALOG["dc-supply"]
+    && (/\b(?:(?:separate|external|regulated|bench)\s+)*(?:5v|5\s+v|five\s+volt)(?:\s+dc)?\s+(?:power\s+)?supply\b|\b(?:separate|external|bench)\s+(?:dc|regulated)\s+power\s+supply\b/.test(normalizedPrompt)
+      || explicitStandaloneMotorSupply)) {
+    explicitlyRequested.add("dc-supply");
+    ids.add("dc-supply");
   }
   const explicitlyNamedHardware = [...explicitlyRequested].filter(id => !essentials.includes(id));
   // Keep broad discovery for open-ended prompts, but when a user names actual
