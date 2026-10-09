@@ -35,6 +35,7 @@ function explicitlyRequestsLogicGate(componentId: string, prompt: string): boole
  * addressable-strip pixel numbers as separate hardware. */
 export function requestedComponentCounts(prompt: string, definitions: readonly ComponentDefinition[]): Map<string, number> {
   const normalizedPrompt = ` ${normalize(prompt)} `;
+  const mentionsAddressableLedStrip = /\b(?:ws2812[a-z0-9]*|neopixel|addressable|pixel)\b[\s\S]{0,48}\bstrip\b/.test(normalizedPrompt);
   const counts = new Map<string, number>();
   for (const definition of definitions) {
     if (isBoardType(definition.id)) continue;
@@ -49,10 +50,14 @@ export function requestedComponentCounts(prompt: string, definitions: readonly C
       if (normalizedPrompt.includes(` ${name} `) || normalizedPrompt.includes(` ${name}s `)) { matchedName = name; break; }
     }
     if (!matchedName) continue;
+    if (definition.id === "led" && /\brgb\s+led\b/.test(normalizedPrompt)
+      && !/\b(?:separate|additional|discrete|another)\b[\s\S]{0,24}\bled\b/.test(normalizedPrompt)) continue;
     const escapedName = escapeRegex(matchedName).replace(/\ /g, "\\s+");
     const quantity = new RegExp(`(?:^|\\s)(\\d+|${Object.keys(NUMBER_WORDS).join("|")})\\s+(?:x\\s+)?${escapedName}s?(?:\\s|$)`, "i").exec(normalizedPrompt);
     const parsedQuantity = quantity ? Number(quantity[1]) || NUMBER_WORDS[quantity[1].toLowerCase()] || 1 : 1;
     const quantityPosition = quantity ? normalizedPrompt.indexOf(quantity[1], quantity.index + 1) : -1;
+    if (definition.id === "led" && mentionsAddressableLedStrip && quantityPosition < 0
+      && !/\b(?:status|indicator|standalone|discrete|separate|additional)\s+leds?\b/.test(normalizedPrompt)) continue;
     if (definition.id === "led" && quantityPosition >= 0) {
       const clauseStart = Math.max(
         normalizedPrompt.lastIndexOf(",", quantityPosition),

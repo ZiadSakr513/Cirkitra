@@ -76,6 +76,29 @@ export function normalizeGroundReturns(project: CircuitProject): CircuitProject 
   return { ...project, components: [...project.components, ...additions], connections };
 }
 
+/** True when the only changed project data is component canvas position. */
+export function isPositionOnlyProjectChange(previous: CircuitProject, next: CircuitProject): boolean {
+  if (previous === next) return false;
+  const previousKeys = Object.keys(previous).filter((key) => key !== "components");
+  const nextKeys = Object.keys(next).filter((key) => key !== "components");
+  if (previousKeys.length !== nextKeys.length || previousKeys.some((key) => !nextKeys.includes(key))) return false;
+  if (previousKeys.some((key) => previous[key as keyof CircuitProject] !== next[key as keyof CircuitProject])) return false;
+  if (previous.components.length !== next.components.length) return false;
+
+  let positionChanged = false;
+  for (let index = 0; index < previous.components.length; index += 1) {
+    const before = previous.components[index];
+    const after = next.components[index];
+    if (before === after) continue;
+    const beforeKeys = Object.keys(before).filter((key) => key !== "x" && key !== "y");
+    const afterKeys = Object.keys(after).filter((key) => key !== "x" && key !== "y");
+    if (beforeKeys.length !== afterKeys.length || beforeKeys.some((key) => !afterKeys.includes(key))) return false;
+    if (beforeKeys.some((key) => before[key as keyof typeof before] !== after[key as keyof typeof after])) return false;
+    if (before.x !== after.x || before.y !== after.y) positionChanged = true;
+  }
+  return positionChanged;
+}
+
 /** Tie active, unmanaged motor-driver standby/enable pins to a valid high rail. */
 export function connectFloatingMotorDriverEnables(
   project: CircuitProject,

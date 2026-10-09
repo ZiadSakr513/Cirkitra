@@ -2,6 +2,7 @@
 
 # dependencies
 /node_modules
+/functions/node_modules/
 /.pnp
 .pnp.*
 .yarn/*
@@ -33,6 +34,7 @@ dev-server-error.log
 # env files (can opt-in for committing if needed)
 .env*
 !.env.example
+paypal-live-production.env
 /.npm-cache/
 .dev-server.*
 .dev-server-*
@@ -40,6 +42,9 @@ dev-server-error.log
 
 # vercel
 .vercel
+.firebase/
+firebase-debug.log
+firebase-debug.*.log
 
 # typescript
 next-env.d.ts

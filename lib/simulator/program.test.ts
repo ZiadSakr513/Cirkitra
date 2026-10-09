@@ -83,6 +83,23 @@ test("renders an editable sketch and simulates its requested output", () => {
   assert.equal(simulator.getSnapshot().pins.find(pin => pin.number === 13)?.digitalValue, 1);
 });
 
+test("char declarations and character comparisons execute in the Arduino subset", () => {
+  const code = `
+    char expectedKey = 'A';
+    void setup() { pinMode(13, OUTPUT); }
+    void loop() {
+      char key = 'A';
+      if (key == expectedKey) digitalWrite(13, HIGH);
+      else digitalWrite(13, LOW);
+      delay(10);
+    }
+  `;
+  const simulator = new ArduinoSimulator(code);
+  assert.equal(simulator.getCompiledSketch().valid, true, JSON.stringify(simulator.getCompiledSketch().diagnostics));
+  simulator.run(); simulator.advance(0);
+  assert.equal(simulator.getSnapshot().pins.find(pin => pin.number === 13)?.digitalValue, 1);
+});
+
 test("rejects statement injection, unknown names, unsupported calls, and wrong argument counts", () => {
   const injected = baseProgram();
   injected.globals.push({ kind: "declare", type: "int", name: "value", initializer: "1; digitalWrite(13, HIGH)" } as SketchProgram["globals"][number]);

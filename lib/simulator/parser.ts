@@ -731,7 +731,7 @@ function collectConstants(source: string, boardId = "arduino-uno"): Map<string, 
     pending.push([match[1], match[2].trim()]);
   }
 
-  const declaration = /\b(?:const\s+)?(?:unsigned\s+)?(?:int|long|short|byte|u?int(?:8|16|32|64)_t|size_t)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g;
+  const declaration = /\b(?:const\s+)?(?:unsigned\s+)?(?:int|long|short|byte|char|u?int(?:8|16|32|64)_t|size_t)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g;
   for (const match of source.matchAll(declaration)) {
     pending.push([match[1], match[2].trim()]);
   }
@@ -862,7 +862,7 @@ function compileBody(
     const line = lineAt(source, statement.startIndex);
     if (statement.nestingDepth > 0) continue;
 
-    if (/^(?:const\s+)?(?:unsigned\s+)?(?:int|long|short|byte|u?int(?:8|16|32|64)_t|size_t)\b/.test(statement.text)) {
+    if (/^(?:const\s+)?(?:unsigned\s+)?(?:int|long|short|byte|char|u?int(?:8|16|32|64)_t|size_t)\b/.test(statement.text)) {
       continue;
     }
 
@@ -1103,7 +1103,7 @@ function compileExecutableBody(
     }
     const bufferWrite = /^([A-Za-z_]\w*)\s*\[([^\]]+)\]\s*=\s*([^;]+);$/.exec(trimmed);
     if (bufferWrite) { instructions.push({ kind: "bufferWrite", name: bufferWrite[1], index: bufferWrite[2], expression: bufferWrite[3], ...sourceInfo }); return; }
-    const declaration = /^(?:(?:const\s+)?(?:unsigned\s+)?(int|long|short|byte|u?int(?:8|16|32|64)_t|size_t|bool|float|double))\s+([A-Za-z_]\w*)(?:\s*=\s*([^;]+))?\s*;$/.exec(trimmed);
+    const declaration = /^(?:(?:const\s+)?(?:unsigned\s+)?(int|long|short|byte|char|u?int(?:8|16|32|64)_t|size_t|bool|float|double))\s+([A-Za-z_]\w*)(?:\s*=\s*([^;]+))?\s*;$/.exec(trimmed);
     if (declaration) {
       instructions.push({ kind: "declare", name: declaration[2], expression: declaration[3]?.trim() ?? "0", integer: !["float", "double"].includes(declaration[1]!), ...sourceInfo });
       return;
@@ -1269,7 +1269,7 @@ function collectGlobalVariables(source: string, boardId = "arduino-uno"): Record
     const value = evaluateStatic(match[2].trim(), new Map([...constants, ...Object.entries(globals)]));
     if (value !== undefined) { globals[match[1]] = value; constants.set(match[1], value); }
   }
-  for (const match of prefix.matchAll(/\b(?:unsigned\s+)?(?:int|long|short|byte|u?int(?:8|16|32|64)_t|size_t|bool|float|double)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g)) {
+  for (const match of prefix.matchAll(/\b(?:unsigned\s+)?(?:int|long|short|byte|char|u?int(?:8|16|32|64)_t|size_t|bool|float|double)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g)) {
     const value = evaluateStatic(match[2], new Map([...constants, ...Object.entries(globals)]));
     if (value !== undefined) globals[match[1]] = value;
   }
@@ -1280,7 +1280,7 @@ function collectIntegerVariables(source: string): string[] {
   const setupIndex = source.search(/\bvoid\s+setup\s*\(/);
   const prefix = setupIndex >= 0 ? source.slice(0, setupIndex) : source;
   const names = new Set<string>();
-  const declaration = /\b(?:const\s+)?(?:unsigned\s+)?(?:int|long|short|byte|u?int(?:8|16|32|64)_t|size_t|bool)\s+([A-Za-z_]\w*)\s*(?:=[^;]*)?;/g;
+  const declaration = /\b(?:const\s+)?(?:unsigned\s+)?(?:int|long|short|byte|char|u?int(?:8|16|32|64)_t|size_t|bool)\s+([A-Za-z_]\w*)\s*(?:=[^;]*)?;/g;
   for (const match of prefix.matchAll(declaration)) names.add(match[1]!);
   return [...names];
 }

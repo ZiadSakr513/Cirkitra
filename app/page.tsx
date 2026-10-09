@@ -15,7 +15,7 @@ const steps = [
 
 const faqs = [
   ["What is Cirkitra?", "Cirkitra is an AI-assisted circuit design and browser simulation workbench for microcontroller projects."],
-  ["Do I need to install anything?", "No. Cirkitra runs in a modern web browser and stores project preferences on your device."],
+  ["Do I need to install anything?", "No. Cirkitra runs in a modern web browser. An account is required to open the workbench and save projects to your account."],
   ["What can I simulate?", "Cirkitra supports boards including Arduino Uno, Mega and Nano, ESP32, ESP8266, and Raspberry Pi Pico, along with a growing catalog of connected components."],
   ["Does Cirkitra generate code for different boards?", "Yes. Circuit generation creates a board-compatible sketch with pin assignments matched to the schematic for supported boards."],
 ];
@@ -50,7 +50,7 @@ export default function Home() {
       <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(structuredData).replace(/</g, "\\u003c") }} />
       <nav className="landing-nav" aria-label="Main navigation">
         <Link className="landing-brand" href="/" aria-label="Cirkitra home"><Image className="cirkitra-logo" src="/cirkitra-logo.png" alt="" width={38} height={38} priority /><span>Cirkitra<small>Founded by Ziad Sakr</small></span></Link>
-        <div><a href="#features">Features</a><a href="#how-it-works">How it works</a><a href="#faq">FAQ</a></div>
+        <div><a href="#features">Features</a><a href="#how-it-works">How it works</a><a href="#faq">FAQ</a><Link href="/pricing">Pricing</Link></div>
         <Link className="landing-button landing-button-small" href="/studio">Open Cirkitra <span aria-hidden="true">→</span></Link>
       </nav>
 
@@ -58,14 +58,16 @@ export default function Home() {
         <div className="landing-eyebrow"><i /> AI circuit design meets browser simulation</div>
         <h1>Describe the circuit.<br /><span>Watch it come alive.</span></h1>
         <p>Generate circuit schematics, wiring, and board-compatible code from a prompt. Then edit and simulate the complete design in one browser workbench.</p>
-        <div className="landing-actions"><Link className="landing-button" href="/studio">Start building <span aria-hidden="true">→</span></Link><a className="landing-text-link" href="#how-it-works">See how it works</a></div>
-        <div className="landing-preview" aria-label="Preview of the Cirkitra circuit workbench">
-          <div className="preview-top"><span><i /> CIRKITRA WORKBENCH</span><b>Simulation ready</b></div>
-          <div className="preview-grid">
-            <aside><small>COMPONENTS</small>{["Arduino Uno", "LED", "Resistor", "Logic Gate"].map((item, index) => <span key={item}><i>{["UNO", "LED", "R", "&"][index]}</i>{item}</span>)}</aside>
-            <div className="preview-canvas"><div className="preview-uno">UNO<small>ARDUINO</small></div><div className="preview-resistor" /><div className="preview-led" /><i className="preview-wire wire-one" /><i className="preview-wire wire-two" /><i className="preview-wire wire-three" /></div>
-            <aside className="preview-ai"><small>AI ASSISTANT</small><p>Build a motion-activated warning light</p><span>Creating schematic, wiring, and board-ready code…</span></aside>
+        <div className="landing-actions"><Link className="landing-button" href="/studio">Start building <span aria-hidden="true">→</span></Link><a className="landing-text-link" href="#how-it-works">See how it works</a><Link className="landing-text-link" href="/pricing">Pricing</Link></div>
+        <div className="landing-demo">
+          <div className="landing-demo-heading">
+            <div><small>PRODUCT DEMO</small><h2>See Cirkitra in action</h2></div>
+            <p>From circuit idea to a working simulation.</p>
           </div>
+          <video controls playsInline preload="metadata" aria-label="Cirkitra product demo">
+            <source src="/cirkitra-demo.mp4" type="video/mp4" />
+            Your browser does not support embedded video.
+          </video>
         </div>
       </section>
 

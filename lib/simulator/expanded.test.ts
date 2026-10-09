@@ -67,7 +67,7 @@ test("power-short diagnostics identify the exact wire path between opposing boar
   assert.match(diagnostic.message, /source path .*\[wire wrong-5v-to-ground\]/i);
 });
 
-test("ESP32 drives a 5 V WS2812B strip through a powered AHCT buffer", () => {
+test("ESP32 drives a 5 V WS2812B strip through a powered AHCT buffer and series resistor", () => {
   const project: CircuitProject = {
     ...createDefaultBlinkProject(),
     board: "esp32-devkitc-v4",
@@ -76,6 +76,7 @@ test("ESP32 drives a 5 V WS2812B strip through a powered AHCT buffer", () => {
       { id: "esp32", type: "esp32-devkitc-v4", label: "ESP32", x: 0, y: 0 },
       { id: "supply", type: "dc-supply", label: "5 V supply", x: 0, y: 0, properties: { voltage: 5, enabled: true } },
       { id: "buffer", type: "sn74ahct1g125", label: "AHCT buffer", x: 0, y: 0 },
+      { id: "data-resistor", type: "resistor", label: "330 ohm data resistor", x: 0, y: 0, properties: { resistance: 330 } },
       { id: "strip", type: "ws2812b-strip-8", label: "WS2812B", x: 0, y: 0 },
     ],
     connections: [],
@@ -84,7 +85,7 @@ test("ESP32 drives a 5 V WS2812B strip through a powered AHCT buffer", () => {
     id: `wire-${project.connections.length}`,
     from: { componentId: from, pin }, to: { componentId: to, pin: other },
   });
-  wire("esp32", "GPIO5", "buffer", "A"); wire("buffer", "Y", "strip", "DIN");
+  wire("esp32", "GPIO5", "buffer", "A"); wire("buffer", "Y", "data-resistor", "1"); wire("data-resistor", "2", "strip", "DIN");
   wire("buffer", "OE", "esp32", "GND"); wire("buffer", "GND", "esp32", "GND"); wire("strip", "GND", "esp32", "GND");
   wire("supply", "+", "buffer", "VCC"); wire("supply", "+", "strip", "VDD"); wire("supply", "-", "esp32", "GND");
 

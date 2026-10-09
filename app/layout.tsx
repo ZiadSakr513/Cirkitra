@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { Analytics } from "@vercel/analytics/next";
+import { FirebaseSessionProvider } from "../lib/firebase/session-provider";
 import "./globals.css";
 import "./schematic-symbols.css";
 
@@ -62,8 +63,10 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <body>
-        {children}
-        <Analytics />
+        <FirebaseSessionProvider>
+          {children}
+          <Analytics />
+        </FirebaseSessionProvider>
       </body>
     </html>
   );

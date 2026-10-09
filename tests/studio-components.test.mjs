@@ -37,6 +37,13 @@ test("schematic symbols omit wiring fault badges while simulation errors remain 
   assert.doesNotMatch(symbols, /state\.fault \? "Wiring fault"/);
 });
 
+test("generation failures show a concrete next step with diagnostics and safe retry", async () => {
+  const studio = await readFile(studioUrl, "utf8");
+  assert.match(studio, /generationFailureNextStep\(failedGeneration\?\.code, generationErrorDetails\)/);
+  assert.match(studio, /className="generation-error-next-action"/);
+  assert.match(studio, /Your current circuit was not changed\./);
+});
+
 test("registry symbol names wrap across words instead of into vertical letters", async () => {
   const styles = await readFile(symbolStylesUrl, "utf8");
   const nameRule = styles.match(/\.symbol-registry__body b \{([^}]+)\}/)?.[1];
@@ -110,19 +117,36 @@ test("Arduino Uno uses the ordinary component removal path", async () => {
   );
 });
 
-test("AI-generated layouts are centered on origin and fitted immediately", async () => {
+test("fresh AI builds are centered and fitted while edits keep the existing canvas layout", async () => {
   const source = (await readFile(studioUrl, "utf8")).replace(/\r\n/g, "\n");
   const submitPrompt = source.match(
     /const submitPrompt = async[\s\S]*?\n  };\n\n  const exportProject/,
   )?.[0];
 
   assert.ok(submitPrompt, "submitPrompt implementation should be present");
+  assert.match(submitPrompt, /const isEdit = result\.generationMode === "edit"/);
   assert.match(
     submitPrompt,
-    /components: centerComponentsAtOrigin\(parsed\.data\.components\)/,
+    /components: spaceGeneratedComponents\(parsed\.data\.components/,
   );
-  assert.match(submitPrompt, /fitComponentsInCanvas\(nextProject\.components\)/);
+  assert.match(submitPrompt, /fixedComponentIds/);
+  assert.match(submitPrompt, /if \(!isEdit \|\| layoutChanged\) fitComponentsInCanvas\(nextProject\.components\)/);
+  assert.match(submitPrompt, /if \(isEdit\) \{[\s\S]*setSelectedIds\(addedIds\.length \? addedIds/);
   assert.match(submitPrompt, /setPendingPin\(null\)/);
+});
+
+test("sketch editor wraps long lines and provides vertical scrolling", async () => {
+  const [studio, styles, route] = await Promise.all([
+    readFile(studioUrl, "utf8"),
+    readFile(globalStylesUrl, "utf8"),
+    readFile(new URL("../app/api/ai/generate/route.ts", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(studio, /ref={codeLineNumbersRef}/);
+  assert.match(studio, /onScroll=\{\(event\) => \{ if \(codeLineNumbersRef\.current\)/);
+  assert.match(styles, /\.code-editor pre \{[^}]*overflow-y: hidden/);
+  assert.match(styles, /\.code-editor textarea \{[^}]*overflow-x: hidden; overflow-y: auto;[^}]*white-space: pre-wrap; overflow-wrap: anywhere/);
+  assert.match(route, /Format every sketch as readable multiline C\+\+ with two-space indentation/);
 });
 
 test("imported projects fit their components into the visible canvas", async () => {
@@ -132,8 +156,9 @@ test("imported projects fit their components into the visible canvas", async () 
   )?.[0];
 
   assert.ok(importProject, "importProject implementation should be present");
-  assert.match(importProject, /commitProject\(parsed\.data\)/);
-  assert.match(importProject, /fitComponentsInCanvas\(parsed\.data\.components\)/);
+  assert.match(importProject, /const imported = \{ \.\.\.parsed\.data, id: projectRef\.current\.id \}/);
+  assert.match(importProject, /commitProject\(imported\)/);
+  assert.match(importProject, /fitComponentsInCanvas\(imported\.components\)/);
 });
 
 test("Gemini generation defaults to supported Flash-Lite and is sent with prompts", async () => {
@@ -145,14 +170,40 @@ test("Gemini generation defaults to supported Flash-Lite and is sent with prompt
   assert.match(source, /"gemini-3\.5-flash-lite"/);
   assert.match(source, /localStorage\.getItem\(MODEL_STORAGE_KEY\)/);
   assert.match(source, /localStorage\.setItem\(MODEL_STORAGE_KEY, nextModel\)/);
-  assert.match(source, /JSON\.stringify\(\{ prompt: clean, currentProject: project, model: retryModel \}\)/);
-  assert.match(source, /aria-label="Circuit generation model"/);
+  assert.match(source, /assistantMode: requestMode/);
+  assert.match(source, /generationModeOverride/);
+  assert.match(source, /chatHistory: requestHistory/);
+  assert.match(source, /useState<AssistantMode>\("build"\)/);
+  assert.match(source, /className="assistant-mode-select"/);
+  assert.match(source, /aria-label="Assistant mode"/);
+  assert.match(source, /<option value="chat">Chat<\/option>/);
+  assert.match(source, /<option value="build">Build<\/option>/);
+  assert.match(source, /aria-label="AI model"/);
   assert.doesNotMatch(source, /generationTarget|Design only/);
-  assert.match(source, /AI CIRCUIT PLANNER/);
+  assert.match(source, /AI CIRCUIT BUILDER/);
+  assert.match(source, /GENERAL AI CHAT/);
+  assert.match(source, /Chat doesn’t use circuit requests\./);
   assert.match(source, /"gemini-3\.5-flash-lite": "Gemini 3\.5 Flash-Lite"/);
   assert.doesNotMatch(source, />\s*GEMINI CIRCUIT PLANNER/);
   assert.doesNotMatch(source, /sent to Gemini|Gemini generation failed/);
   assert.doesNotMatch(source, /AI-generated circuits only/);
+});
+
+test("assistant chat area can be resized independently from its fixed prompt composer", async () => {
+  const [source, styles] = await Promise.all([
+    readFile(studioUrl, "utf8"),
+    readFile(globalStylesUrl, "utf8"),
+  ]);
+
+  assert.match(source, /assistantPrompt: number/);
+  assert.match(source, /aria-label="Resize chat and prompt panels"/);
+  assert.match(source, /className=\{`panel-resizer panel-resizer-assistant/);
+  assert.match(source, /onPointerDown=\{\(event\) => beginPanelResize\("assistantPrompt", event\)\}/);
+  assert.match(source, /panelSizes\.assistantPrompt \+ step/);
+  assert.match(source, /"--assistant-prompt-height": `\$\{panelSizes\.assistantPrompt\}px`/);
+  assert.match(styles, /grid-template-rows: 43px minmax\(0, 1fr\) 11px var\(--assistant-prompt-height, 320px\)/);
+  assert.match(styles, /\.prompt-controls-scroll \{[^}]*overflow-y: auto/);
+  assert.match(styles, /\.panel-resizer-assistant \{[^}]*cursor: row-resize/);
 });
 
 test("AI generation streams progress and keeps failed prompts available for retry", async () => {
@@ -164,8 +215,14 @@ test("AI generation streams progress and keeps failed prompts available for retr
   assert.ok(submitPrompt, "submitPrompt implementation should be present");
   assert.match(submitPrompt, /Accept: "application\/x-ndjson"/);
   assert.match(submitPrompt, /readGenerationResponse\(response, setGenerationStage\)/);
-  assert.match(submitPrompt, /setFailedGeneration\(\{ prompt: clean, model: retryModel, retryable:/);
-  assert.match(source, /submitPrompt\(failedGeneration\.prompt, true, failedGeneration\.model\)/);
+  assert.match(submitPrompt, /result\.kind === "mode-clarification"/);
+  assert.match(submitPrompt, /modeChoice: \{ prompt: clean, model: responseModel \}/);
+  assert.match(submitPrompt, /setFailedGeneration\(\{ prompt: clean, model: retryModel, assistantMode: requestMode/);
+  assert.match(source, />Edit current circuit<\/button>/);
+  assert.match(source, />Create new circuit<\/button>/);
+  assert.match(source, /submitPrompt\(modeChoice\.prompt, true, modeChoice\.model, "build", \[\], "edit"\)/);
+  assert.match(source, /submitPrompt\(modeChoice\.prompt, true, modeChoice\.model, "build", \[\], "create"\)/);
+  assert.match(source, /submitPrompt\(failedGeneration\.prompt, true, failedGeneration\.model, failedGeneration\.assistantMode, failedGeneration\.chatHistory, failedGeneration\.generationModeOverride\)/);
   assert.match(source, /Your current circuit was not changed\./);
 });
 
@@ -188,6 +245,17 @@ test("select all and bulk delete work even when a canvas button has focus", asyn
   assert.match(source, /event\.key\.toLowerCase\(\) === "a"/);
   assert.match(source, /if \(!editing && \(event\.key === "Delete" \|\| event\.key === "Backspace"\)/);
   assert.doesNotMatch(source, /if \(!interactive && \(event\.key === "Delete" \|\| event\.key === "Backspace"\)/);
+});
+
+test("deterministic generation failures point to diagnostics instead of repeating the same retry", async () => {
+  const source = (await readFile(studioUrl, "utf8")).replace(/\r\n/g, "\n");
+  const messageHelper = source.match(/function conciseGenerationError\(error: GenerationRequestError\) \{[\s\S]*?\n\}/)?.[0];
+
+  assert.ok(messageHelper, "generation failure guidance should be centralized");
+  assert.match(messageHelper, /Open View diagnostics/);
+  assert.match(messageHelper, /simplify the request/);
+  assert.doesNotMatch(messageHelper, /Retry this prompt/);
+  assert.match(source, /failedGeneration\?\.retryable && <button/);
 });
 
 test("pan mode still allows components to be dragged", async () => {

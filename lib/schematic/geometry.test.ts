@@ -12,6 +12,7 @@ import {
   type Point,
   type SchematicDefinitionLike,
 } from "./geometry.ts";
+import { calculateWireRoutes, isLatestWireRouteResponse } from "./route-worker-core.ts";
 
 const everySideDefinition: SchematicDefinitionLike = {
   pins: [
@@ -331,3 +332,42 @@ test("overlapping parts do not hide a complete wire from connected pins", () => 
     if (index > 0) assert.deepEqual(route.segments[index - 1].to, segment.from);
   }
 });
+
+test("worker routing preserves coordinated route output", () => {
+  const request = {
+    requestId: 7,
+    components: [
+      { type: "arduino-uno", x: 0, y: 0 },
+      { type: "led", x: 460, y: 30 },
+      { type: "resistor", x: 270, y: 180 },
+    ],
+    wires: [
+      { id: "wire-a", from: { point: { x: 320, y: 70 }, side: "right" as const }, to: { point: { x: 460, y: 50 }, side: "left" as const } },
+      { id: "wire-b", from: { point: { x: 320, y: 110 }, side: "right" as const }, to: { point: { x: 460, y: 70 }, side: "left" as const } },
+    ],
+  };
+
+  assert.deepEqual(calculateWireRoutes(request), {
+    requestId: request.requestId,
+    routes: coordinatedWireRoutes(request.wires, request.components),
+  });
+});
+
+test("dense wire requests return all routes and stale responses are rejected", () => {
+  const components = Array.from({ length: 60 }, (_, index) => ({
+    type: index % 3 === 0 ? "resistor" : "led",
+    x: (index % 10) * 130,
+    y: Math.floor(index / 10) * 120,
+  }));
+  const wires = Array.from({ length: 45 }, (_, index) => ({
+    id: `wire-${index}`,
+    from: { point: { x: (index % 10) * 130 + 50, y: Math.floor(index / 10) * 120 + 35 }, side: "right" as const },
+    to: { point: { x: ((index + 4) % 10) * 130 + 40, y: (Math.floor(index / 10) + 2) * 120 + 35 }, side: "left" as const },
+  }));
+  const result = calculateWireRoutes({ requestId: 12, wires, components });
+  assert.equal(result.requestId, 12);
+  assert.equal(result.routes?.length, wires.length);
+  assert.equal(isLatestWireRouteResponse(result, 12), true);
+  assert.equal(isLatestWireRouteResponse(result, 13), false);
+});
+import "./generated-layout.test.ts";

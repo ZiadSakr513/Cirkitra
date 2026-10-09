@@ -2,12 +2,145 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 
 import { createDefaultBlinkProject } from "../../../../lib/circuit/default-project.ts";
-import { classifyGenerationMode, dualBmeMuxProgramGuidance, encoderThresholdProbeProjects, encoderValidationPositions, generationRepairInstructions, GEMINI_PROVIDER_CALL_TIMEOUT_MS, hasObservableButtonEffect, hasObservableButtonEffectAfterRelease, hasObservableEncoderEffect, includeRequiredSupportingParts, ledSeriesResistorIssues, maxDuration, peripheralPinConflictIssues, repairConflictedKy040SignalConnections, repairConflictedNeoPixelDataBranch, repairMissingLedCurrentLimiters, repairStrayCommaBeforeStatement, repairUniquePeripheralPinAssignments, repairUnwiredPeripheralSignalConnections, requestedButtonBehaviorComponents, requestedRotaryControlAction, requestedWs2812DataResistorIssues, sensorThresholdBehaviorIssues, sensorThresholdContract, sensorThresholdOutputStates, simulateButtonScenario, simulateEncoderScenario, structuredIssueDiagnostics, validatedProgramReferenceGuidance, validatedWiringReferenceGuidance, POST } from "./route.ts";
+import { applyCircuitEditOperations, configureGenerationTestLimitsForTests, dualBmeMuxProgramGuidance, encoderThresholdProbeProjects, encoderValidationPositions, generationRepairInstructions, GEMINI_PROVIDER_CALL_TIMEOUT_MS, hasObservableButtonEffect, hasObservableButtonEffectAfterRelease, hasObservableEncoderEffect, includeRequiredSupportingParts, ledSeriesResistorIssues, maxDuration, peripheralPinConflictIssues, repairConflictedKy040SignalConnections, repairConflictedNeoPixelDataBranch, repairMissingLedCurrentLimiters, repairStrayCommaBeforeStatement, repairUniquePeripheralPinAssignments, repairUnwiredPeripheralSignalConnections, requestedButtonBehaviorComponents, requestedRotaryControlAction, requestedWs2812DataResistorIssues, resolveUniqueComponentReference, sensorThresholdBehaviorIssues, sensorThresholdContract, sensorThresholdOutputStates, simulateButtonScenario, simulateEncoderScenario, structuredIssueDiagnostics, validatedProgramReferenceGuidance, validatedWiringReferenceGuidance, POST } from "./route.ts";
+import { configureAiUsageAdapterForTests, type AiUsageAdapter } from "../../../../lib/billing/ai-usage.ts";
+import { configureAiChatRateLimitAdapterForTests } from "../../../../lib/billing/ai-chat-rate-limit.ts";
+import { configureAiGenerationRateLimitAdapterForTests } from "../../../../lib/billing/ai-generation-rate-limit.ts";
+import { GET as getAiUsage } from "../usage/route.ts";
 import { COMPONENT_CATALOG } from "../../../../lib/circuit/index.ts";
 import { COMPONENT_EXAMPLES, KY040_CONTROL_EXAMPLE_CODE } from "../../../../lib/circuit/component-examples.ts";
 import { greenhouseExample, greenhousePrompt } from "../../../../tests/fixtures/greenhouse.ts";
 import { ArduinoSimulator } from "../../../../lib/simulator/index.ts";
 import { MultiBoardSimulator } from "../../../../lib/simulator/index.ts";
+
+let testReservationId = 0;
+let testAiReservations = 0;
+let testAiReservationAllowed = true;
+const testAiReservationOwnerFlags: boolean[] = [];
+let testChatRateLimitAllowed = true;
+const testChatRateLimitUsers: string[] = [];
+let testGenerationRateLimitAllowed = true;
+let testGenerationRateLimitFails = false;
+const testGenerationRateLimitUsers: string[] = [];
+const testAiFinalizations: Array<{ userId: string; reservationId: string; succeeded: boolean; inputTokens: number; outputTokens: number; model: string }> = [];
+const testAiUsageAdapter: AiUsageAdapter = {
+  authenticate: async () => "ai-route-test-user",
+  reserve: async (_userId, _model, unlimited = false) => {
+    testAiReservations += 1;
+    testAiReservationOwnerFlags.push(unlimited);
+    const usage = {
+      planId: "free" as const,
+      planName: unlimited ? "Owner" : "Free",
+      used: 1,
+      limit: unlimited ? 0 : 5,
+      remaining: unlimited ? 0 : 4,
+      unlimited,
+      resetsAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+      billingEnabled: false,
+    };
+    if (!testAiReservationAllowed && !unlimited) return { allowed: false, usage };
+    return {
+      allowed: true,
+      reservation: { reservationId: `ai-route-test-${++testReservationId}`, usage },
+    };
+  },
+  finalize: async (userId, reservationId, succeeded, inputTokens, outputTokens, model) => {
+    testAiFinalizations.push({ userId, reservationId, succeeded, inputTokens, outputTokens, model });
+  },
+  snapshot: async (_userId, unlimited = false) => ({
+    planId: "free",
+    planName: unlimited ? "Owner" : "Free",
+    used: 0,
+    limit: unlimited ? 0 : 5,
+    remaining: unlimited ? 0 : 5,
+    unlimited,
+    resetsAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+    billingEnabled: false,
+  }),
+};
+configureAiUsageAdapterForTests(testAiUsageAdapter);
+configureAiChatRateLimitAdapterForTests(async (userId) => {
+  testChatRateLimitUsers.push(userId);
+  return {
+    allowed: testChatRateLimitAllowed,
+    remaining: testChatRateLimitAllowed ? 9 : 0,
+    resetsAt: new Date(Date.now() + 60_000).toISOString(),
+  };
+});
+configureAiGenerationRateLimitAdapterForTests(async (userId) => {
+  testGenerationRateLimitUsers.push(userId);
+  if (testGenerationRateLimitFails) throw new Error("test database unavailable");
+  return {
+    allowed: testGenerationRateLimitAllowed,
+    remaining: testGenerationRateLimitAllowed ? 4 : 0,
+    resetsAt: new Date(Date.now() + 60_000).toISOString(),
+  };
+});
+after(() => {
+  configureAiUsageAdapterForTests(undefined);
+  configureAiChatRateLimitAdapterForTests(undefined);
+  configureAiGenerationRateLimitAdapterForTests(undefined);
+});
+
+test("usage endpoint returns the authenticated user's monthly Free allowance", async () => {
+  const response = await getAiUsage(new Request("http://localhost/api/ai/usage"));
+  assert.equal(response.status, 200);
+  const usage = await response.json();
+  assert.deepEqual(
+    { planName: usage.planName, used: usage.used, limit: usage.limit, remaining: usage.remaining, billingEnabled: usage.billingEnabled },
+    { planName: "Free", used: 0, limit: 5, remaining: 5, billingEnabled: false },
+  );
+});
+
+test("the configured owner sees unlimited monthly AI access while ordinary accounts keep their plan quota", async (context) => {
+  const originalOwnerUid = process.env.CIRKITRA_OWNER_UID;
+  context.after(() => {
+    if (originalOwnerUid === undefined) delete process.env.CIRKITRA_OWNER_UID;
+    else process.env.CIRKITRA_OWNER_UID = originalOwnerUid;
+  });
+
+  process.env.CIRKITRA_OWNER_UID = "ai-route-test-user";
+  const ownerResponse = await getAiUsage(new Request("http://localhost/api/ai/usage"));
+  assert.equal(ownerResponse.status, 200);
+  const ownerUsage = await ownerResponse.json();
+  assert.equal(ownerUsage.unlimited, true);
+  assert.equal(ownerUsage.limit, 0);
+  assert.equal(ownerUsage.planName, "Owner");
+
+  process.env.CIRKITRA_OWNER_UID = "some-other-firebase-uid";
+  const regularResponse = await getAiUsage(new Request("http://localhost/api/ai/usage"));
+  const regularUsage = await regularResponse.json();
+  assert.equal(regularUsage.unlimited, false);
+  assert.equal(regularUsage.limit, 5);
+  assert.equal(regularUsage.planName, "Free");
+});
+
+test("the configured owner bypasses the monthly Build quota while the request is still tracked", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const originalOwnerUid = process.env.CIRKITRA_OWNER_UID;
+  const originalAllowed = testAiReservationAllowed;
+  const finalizationsBefore = testAiFinalizations.length;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    testAiReservationAllowed = originalAllowed;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+    if (originalOwnerUid === undefined) delete process.env.CIRKITRA_OWNER_UID;
+    else process.env.CIRKITRA_OWNER_UID = originalOwnerUid;
+  });
+
+  process.env.GEMINI_API_KEY = "test-secret";
+  process.env.CIRKITRA_OWNER_UID = "ai-route-test-user";
+  testAiReservationAllowed = false;
+  globalThis.fetch = async () => modelResponse(JSON.stringify(generatedEnvelope));
+
+  const response = await POST(generationRequest());
+  assert.equal(response.status, 200);
+  assert.equal(testAiReservationOwnerFlags.at(-1), true);
+  assert.equal(testAiFinalizations.length, finalizationsBefore + 1);
+  assert.equal(testAiFinalizations.at(-1)?.succeeded, true);
+});
 import { selectGenerationComponents } from "../../../../lib/circuit/discovery.ts";
 
 test("generation prompts include reusable simulator-validated pin topologies", () => {
@@ -56,12 +189,25 @@ test("whole-project repair instructions turn simulator and wiring diagnostics in
   assert.match(pixel, /live sensor and threshold/);
   assert.match(pixel, /strip\.show\(\)/);
   assert.match(pixel, /distinct non-black colors/);
+  const size = generationRepairInstructions([
+    "project.components must contain between 1 and 100 components",
+    "project.connections[5].to.componentId does not reference a component",
+  ]).join(" ");
+  assert.match(size, /no more than 100 components and 500 connections/);
+  assert.match(size, /do not add duplicate or alternate parts to repair wiring/);
+  assert.match(size, /every wire endpoint references one of the retained component IDs/);
+  const tupleFormat = generationRepairInstructions([
+    "project.connections[5] must contain from component ID, from pin, to component ID, and to pin.",
+  ]).join(" ");
+  assert.match(tupleFormat, /exactly a four-string array/);
+  assert.match(tupleFormat, /Do not add IDs, colors, labels, objects, or extra tuple entries/);
 
   const topology = generationRepairInstructions([
     "project.circuit NET_PIN_CONTENTION: net buzzer:+ merges incompatible board pins uno.D6, sensor.GND.",
     "project.connections[7].from.pin cannot be empty.",
   ]).join(" ");
   assert.match(topology, /split every named contending net/);
+  assert.match(topology, /never connect a board GPIO to that board's GND\/3V3 pin/i);
   assert.match(topology, /non-empty, exact catalog pin ID/);
   const duplicateWire = generationRepairInstructions(["project.connections[4] duplicates another connection."]).join(" ");
   assert.match(duplicateWire, /each unordered endpoint pair only once/);
@@ -78,6 +224,11 @@ test("whole-project repair instructions turn simulator and wiring diagnostics in
   assert.match(mux, /selectChannel\(0\)[\s\S]*before[\s\S]*begin\(0x76\)/);
   assert.match(mux, /selectChannel\(1\)[\s\S]*before[\s\S]*begin\(0x76\)/);
   assert.match(mux, /separate Adafruit_BME280 objects/);
+
+  const unsupportedSwitch = generationRepairInstructions([
+    "project.code simulator UNSUPPORTED_STATEMENT: This statement is outside the simulator subset and was skipped: 0 = key;",
+  ]).join(" ");
+  assert.match(unsupportedSwitch, /express branches with if\/else \(never switch\/case\)/);
 
   const sonar = generationRepairInstructions([
     "project.code threshold behavior: Barrier Servo did not change when distance crossed below 30; HC-SR04 readings did not activate the output.",
@@ -1270,18 +1421,8 @@ test("generation repairs a button-controlled edit when Gemini omits the button w
     else process.env.GEMINI_API_KEY = originalKey;
   });
   process.env.GEMINI_API_KEY = "test-secret";
-
-  const broken = createDefaultBlinkProject();
-  broken.name = "Button controlled LED";
-  broken.components.push({ id: "button", type: "push-button", label: "Target Button", x: 420, y: 360 });
-  broken.code = `void setup(){ pinMode(9, OUTPUT); pinMode(2, INPUT_PULLUP); }
-void loop(){ int btnState = digitalRead(2); if (btnState == LOW) { digitalWrite(9, LOW); } else { digitalWrite(9, HIGH); delay(500); digitalWrite(9, LOW); delay(500); } }`;
-
-  const repaired = structuredClone(broken);
-  repaired.connections.push(
-    { id: "button-input", from: { componentId: "button", pin: "1" }, to: { componentId: "uno", pin: "D2" } },
-    { id: "button-ground", from: { componentId: "button", pin: "2" }, to: { componentId: "uno", pin: "GND" } },
-  );
+  const code = `void setup(){ pinMode(13, OUTPUT); pinMode(2, INPUT_PULLUP); }
+void loop(){ if(digitalRead(2)==LOW){ digitalWrite(13, LOW); } else { digitalWrite(13, HIGH); delay(500); digitalWrite(13, LOW); delay(500); } }`;
   let calls = 0;
   let repairIssues: string[] = [];
   globalThis.fetch = async (_input, init) => {
@@ -1290,20 +1431,29 @@ void loop(){ int btnState = digitalRead(2); if (btnState == LOW) { digitalWrite(
     const content = JSON.parse(request.contents[0].parts[0].text);
     repairIssues = content.validationIssues ?? [];
     return modelResponse(JSON.stringify({
-      project: Array.isArray(content.validationIssues) ? repaired : broken,
+      operations: [
+        { type: "add_component", component: { id: "button", type: "push-button", label: "Target Button", x: 420, y: 360, rotation: 0, properties: {} } },
+        { type: "set_program", boardId: "uno", code },
+        ...(Array.isArray(content.validationIssues) ? [
+          { type: "add_connection", from: { componentId: "button", pin: "1" }, to: { componentId: "uno", pin: "D2" } },
+          { type: "add_connection", from: { componentId: "button", pin: "2" }, to: { componentId: "uno", pin: "GND" } },
+        ] : []),
+      ],
       explanation: "The button controls whether the LED blinks.",
       warnings: [],
       assumptions: [],
     }));
   };
 
-  const prompt = "Edit the current circuit. Keep its Arduino Uno, red LED, 220 ohm resistor, D9 wiring, and blink behavior. Add one push button between D2 and GND using INPUT_PULLUP. When the button is pressed, keep the LED off; when released, blink it every 500 milliseconds.";
-  const response = await POST(requestWithCurrentProject(prompt));
+  const prompt = "Edit the current circuit. Keep its Arduino Uno, red LED, 220 ohm resistor, existing wires, and blink behavior. Add one push button between D2 and GND using INPUT_PULLUP. When the button is pressed, keep the LED off; when released, blink it every 500 milliseconds.";
+  const response = await POST(requestWithCurrentProject(prompt, "edit"));
   const body = await response.json();
   assert.equal(response.status, 200, JSON.stringify(repairIssues));
   assert.equal(calls, 2, "the missing input connection should trigger one targeted repair");
   assert.ok(repairIssues.some(issue => issue.includes("button behavior") && issue.includes("no observable circuit change")));
+  assert.equal(body.generationMode, "edit");
   assert.equal(body.project.connections.filter((connection: FixtureWire) => [connection.from, connection.to].some(endpoint => endpoint.componentId === "button")).length, 2);
+  assert.deepEqual(body.project.connections.slice(0, createDefaultBlinkProject().connections.length), createDefaultBlinkProject().connections);
 });
 
 test("generation repairs an LED circuit that directly shorts its anode and cathode", async context => {
@@ -1512,7 +1662,7 @@ test("a fresh single-board request ignores boards in the previous project", asyn
   };
   const response = await POST(new Request("http://localhost/api/ai/generate", {
     method: "POST",
-    body: JSON.stringify({ prompt: "Create a fresh single-board Uno circuit that blinks an LED.", currentProject: previousProject }),
+    body: JSON.stringify({ prompt: "Create a fresh single-board Uno circuit that blinks an LED.", currentProject: previousProject, generationModeOverride: "create" }),
   }));
   assert.equal(response.status, 200);
   assert.equal(multipleBoardRuleSelected, false, "the old multi-board canvas must not change a fresh-generation request into a multi-board request");
@@ -1723,6 +1873,7 @@ test("repeated invalid full-project repairs are rejected without returning a par
   assert.ok(typeof nonInitialPayload?.rejectedResponse === "string" && nonInitialPayload.rejectedResponse.includes("unsupportedSimulationCall"), "repair receives the complete rejected project");
   assert.ok(Array.isArray(nonInitialPayload?.validationIssues) && nonInitialPayload.validationIssues.some(issue => String(issue).includes("unsupportedSimulationCall")));
   assert.ok(body.error.details.length > 0, "deduplicated validation diagnostics remain available for the UI details panel");
+  assert.equal(body.error.retryable, false, "a deterministic validation failure should not invite the same automatic retry");
   assert.equal(Object.hasOwn(body, "project"), false, "an invalid candidate must never be returned for the canvas");
 });
 
@@ -1735,16 +1886,19 @@ test("generation makes one complete-project request without planner or subsystem
     else process.env.GEMINI_API_KEY = previousKey;
   });
   process.env.GEMINI_API_KEY = "test-secret";
+  testAiFinalizations.length = 0;
   const prompt = "Blink an LED fast";
   let calls = 0;
   let requestContent: Record<string, unknown> | undefined;
+  let systemInstructionText = "";
   let generationConfig: Record<string, unknown> | undefined;
   globalThis.fetch = async (_input, init) => {
     calls += 1;
     const providerRequest = JSON.parse(String(init?.body));
     requestContent = JSON.parse(providerRequest.contents[0].parts[0].text);
+    systemInstructionText = providerRequest.systemInstruction.parts[0].text;
     generationConfig = providerRequest.generationConfig;
-    return modelResponse(JSON.stringify({ project: createDefaultBlinkProject(), explanation: "A complete LED blink circuit.", assumptions: [], warnings: [] }));
+    return modelResponse(JSON.stringify({ project: createDefaultBlinkProject(), explanation: "A complete LED blink circuit.", assumptions: [], warnings: [] }), "STOP", { promptTokenCount: 42, candidatesTokenCount: 17 });
   };
 
   const response = await POST(new Request("http://localhost/api/ai/generate", {
@@ -1755,14 +1909,40 @@ test("generation makes one complete-project request without planner or subsystem
   assert.equal(calls, 1, "a valid prompt should use exactly one initial complete-project generation call");
   assert.equal(requestContent?.request, prompt);
   assert.equal(requestContent?.mode, "create");
+  assert.match(systemInstructionText, /POWER-RANGE CHECK BEFORE WIRING/);
+  assert.match(systemInstructionText, /single Li-ion cell is at most 4\.2 V/);
   assert.equal("plan" in (requestContent ?? {}), false);
   assert.equal("subsystem" in (requestContent ?? {}), false);
   assert.equal(generationConfig?.maxOutputTokens, 65_536);
   const schema = generationConfig?.responseJsonSchema as { properties?: Record<string, unknown> } | undefined;
   const projectSchema = schema?.properties?.project as { properties?: Record<string, unknown> } | undefined;
   assert.ok(projectSchema?.properties?.components && projectSchema.properties.connections && projectSchema.properties.code);
+  assert.match(systemInstructionText, /at most 100 components and 500 connections/);
+  assert.match(systemInstructionText, /each sketch within 30,000 characters/);
   assert.equal(schema?.properties?.programs, undefined, "sketches remain part of the complete project rather than a staged programs payload");
   assert.ok(body.project && body.project.code.includes("digitalWrite"));
+  assert.equal(testAiFinalizations.at(-1)?.succeeded, true);
+  assert.equal(testAiFinalizations.at(-1)?.inputTokens, 42);
+  assert.equal(testAiFinalizations.at(-1)?.outputTokens, 17);
+});
+
+test("a failed model request releases its reserved AI request instead of consuming the monthly allowance", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  testAiFinalizations.length = 0;
+  globalThis.fetch = async () => Response.json({ error: { message: "Invalid provider request" } }, { status: 400 });
+
+  const response = await POST(generationRequest());
+  assert.notEqual(response.status, 200);
+  assert.equal(testAiFinalizations.at(-1)?.succeeded, false);
+  assert.equal(testAiFinalizations.at(-1)?.inputTokens, 0);
+  assert.equal(testAiFinalizations.at(-1)?.outputTokens, 0);
 });
 
 test("stray separators before standalone statements are removed only after a completed statement", () => {
@@ -2622,6 +2802,8 @@ test("generation normalizes unambiguous two-terminal polarity markers to exact c
     { id: "buzzer-tilde-marker", from: { componentId: "buzzer", pin: "~" }, to: { componentId: "uno", pin: "D9" } },
     { id: "buzzer-return", from: { componentId: "buzzer", pin: "GND" }, to: { componentId: "uno", pin: "GND" } },
     { id: "buzzer-return-marker", from: { componentId: "buzzer", pin: "-\"" }, to: { componentId: "uno", pin: "GND" } },
+    { id: "buzzer-comment-return-marker", from: { componentId: "buzzer", pin: "-//" }, to: { componentId: "uno", pin: "GND" } },
+    { id: "buzzer-underscore-return-marker", from: { componentId: "buzzer", pin: "_" }, to: { componentId: "uno", pin: "GND" } },
   );
   project.code = project.code.replace("void setup(){ strip.begin();", "void setup(){ pinMode(9,OUTPUT); tone(9,880); delay(100); noTone(9); strip.begin();");
   globalThis.fetch = async () => modelResponse(JSON.stringify({
@@ -2644,6 +2826,8 @@ test("generation normalizes unambiguous two-terminal polarity markers to exact c
   assert.ok(body.warnings.some((warning: string) => warning.includes("polarity marker \"--\"") && warning.includes("catalog terminal -")));
   assert.ok(body.warnings.some((warning: string) => warning.includes("polarity marker \"++\"") && warning.includes("catalog terminal +")));
   assert.ok(body.warnings.some((warning: string) => warning.includes(`polarity marker ${JSON.stringify("-\"")}`) && warning.includes("buzzer") && warning.includes("catalog terminal -")));
+  assert.ok(body.warnings.some((warning: string) => warning.includes('polarity marker "-//"') && warning.includes("buzzer") && warning.includes("catalog terminal -")));
+  assert.ok(body.warnings.some((warning: string) => warning.includes('polarity marker "_"') && warning.includes("buzzer") && warning.includes("catalog terminal -")));
   assert.ok(body.warnings.some((warning: string) => warning.includes("polarity marker \"GND\"") && warning.includes("buzzer") && warning.includes("catalog terminal -")));
   assert.ok(body.warnings.some((warning: string) => warning.includes("Inferred the missing terminal on buzzer as +")));
   assert.ok(body.warnings.some((warning: string) => warning.includes('polarity marker "~" on buzzer to catalog terminal +')));
@@ -2653,6 +2837,56 @@ test("generation normalizes unambiguous two-terminal polarity markers to exact c
   const buzzerReturn = body.project.connections.find((connection: { from: { componentId: string; pin: string }; to: { componentId: string; pin: string } }) =>
     [connection.from, connection.to].some(endpoint => endpoint.componentId === "buzzer" && endpoint.pin === "-"));
   assert.ok(buzzerReturn, JSON.stringify(body.project.connections));
+});
+
+test("generation infers malformed battery and H-bridge motor terminals from their paired endpoints", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = structuredClone(COMPONENT_EXAMPLES.l298());
+  project.components.push(
+    { id: "cell", type: "battery-cell", label: "Li-ion cell", x: 1100, y: 300, properties: { initialSoc: 70, capacityMah: 2000, temperature: 25 } },
+    { id: "cell-load", type: "dc-load", label: "100 ohm cell load", x: 1320, y: 300, properties: { resistance: 100 } },
+  );
+  project.connections.push(
+    { id: "cell-positive", from: { componentId: "cell", pin: "+" }, to: { componentId: "cell-load", pin: "+" } },
+    { id: "cell-negative", from: { componentId: "cell", pin: "-" }, to: { componentId: "cell-load", pin: "-" } },
+  );
+  for (const connection of project.connections) {
+    for (const endpoint of [connection.from, connection.to]) {
+      if (endpoint.componentId === "cell" || (endpoint.componentId.startsWith("motor-") && (endpoint.pin === "+" || endpoint.pin === "-"))) {
+        endpoint.pin = "_";
+      }
+    }
+  }
+  globalThis.fetch = async () => modelResponse(JSON.stringify({
+    project,
+    explanation: "The L298 drives two motors; the battery cell independently powers its load.",
+    assumptions: [],
+    warnings: [],
+  }));
+
+  const response = await POST(new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    body: JSON.stringify({ prompt: "Build an Arduino Uno L298 dual H-bridge demo with two DC motors and an independent Li-ion battery cell connected across a 100 ohm DC load." }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body.error ?? body));
+  const motorTerminal = (motorId: string, terminal: string) => body.project.connections.find((connection: FixtureWire) =>
+    [connection.from, connection.to].some(endpoint => endpoint.componentId === motorId && endpoint.pin === terminal));
+  assert.ok(motorTerminal("motor-a", "+") && motorTerminal("motor-a", "-"), "OUT1/OUT2 should provide distinct canonical motor terminals");
+  assert.ok(motorTerminal("motor-b", "+") && motorTerminal("motor-b", "-"), "OUT3/OUT4 should provide distinct canonical motor terminals");
+  assert.ok(body.project.connections.some((connection: FixtureWire) =>
+    [connection.from, connection.to].some(endpoint => endpoint.componentId === "cell" && endpoint.pin === "+")
+    && [connection.from, connection.to].some(endpoint => endpoint.componentId === "cell-load" && endpoint.pin === "+")));
+  assert.ok(body.project.connections.some((connection: FixtureWire) =>
+    [connection.from, connection.to].some(endpoint => endpoint.componentId === "cell" && endpoint.pin === "-")
+    && [connection.from, connection.to].some(endpoint => endpoint.componentId === "cell-load" && endpoint.pin === "-")));
 });
 
 test("Gemini schema rejection retries in JSON mode and still validates the complete circuit", async context => {
@@ -2747,9 +2981,11 @@ test("explicit multi-board generation validates and runs independent wired UART 
   assert.equal(response.status, 200, JSON.stringify(body));
   assert.equal(calls, 2, "generation should repair a receiver sketch that silently discards the received byte");
   assert.ok(repairIssues.some(issue => issue.includes("USB Serial Monitor") && issue.includes("Serial1/Serial2")), "generation should distinguish the wired UART from monitor output");
-  assert.match(sketchInstructions, /Do not declare local char variables or use C-style casts/);
+  assert.match(sketchInstructions, /Local char variables are supported/);
+  assert.match(sketchInstructions, /C-style casts and switch\/case are not supported/);
+  assert.match(sketchInstructions, /switch\/case are not supported/);
   assert.match(sketchInstructions, /including early return/i);
-  assert.match(sketchInstructions, /do not use (?:recursive helpers, )?break, continue, goto/i);
+  assert.match(sketchInstructions, /do not use recursive or side-effecting helper functions, break, continue, goto/i);
   const projectSchema = requestSchema?.properties?.project as { properties?: Record<string, unknown> } | undefined;
   assert.ok(projectSchema?.properties?.boardPrograms, "the complete-project schema should request one executable sketch per board");
   assert.ok(projectSchema?.properties?.code, "the active board's sketch remains in project.code");
@@ -2769,7 +3005,7 @@ test("explicit multi-board generation validates and runs independent wired UART 
   assert.ok(simulator.getSnapshot().boardSerial?.esp?.some(entry => entry.text === "65"), "receiver sketch should observe the sender byte through the connected RX/TX pins");
 });
 
-test("an edit that promises to preserve wiring keeps the original wire endpoints before publishing", async context => {
+test("targeted multi-board program edits preserve the existing hardware and UART wiring", async context => {
   const previousFetch = globalThis.fetch;
   const previousKey = process.env.GEMINI_API_KEY;
   context.after(() => {
@@ -2810,28 +3046,26 @@ void loop() {
     code: megaCode,
     programs: { mega: megaCode, esp: espCode },
   };
-  const changedProject = structuredClone(currentProject);
-  changedProject.connections[0] = { id: "mega-tx", from: { componentId: "mega", pin: "D1" }, to: { componentId: "esp", pin: "GPIO3" } };
-  changedProject.connections[1] = { id: "esp-tx", from: { componentId: "mega", pin: "D0" }, to: { componentId: "esp", pin: "GPIO1" } };
-  Object.assign(changedProject, { boardPrograms: [{ boardId: "mega", code: megaCode }, { boardId: "esp", code: espCode }] });
   let repairRequests = 0;
   globalThis.fetch = async (_input, init) => {
     const request = JSON.parse(String(init?.body));
     const content = JSON.parse(request.contents[0].parts[0].text);
     if (Array.isArray(content.validationIssues)) repairRequests += 1;
-    return modelResponse(JSON.stringify({ project: changedProject, explanation: "ESP32 reports the received byte and responds to the Mega.", assumptions: [], warnings: [] }));
+    return modelResponse(JSON.stringify({ operations: [{ type: "set_program", boardId: "esp", code: espCode }], explanation: "ESP32 reports the received byte and responds to the Mega.", assumptions: [], warnings: [] }));
   };
 
   const response = await POST(new Request("http://localhost/api/ai/generate", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      prompt: "Edit the current Arduino Mega 2560 and ESP32 circuit. Preserve every wire and do not alter wiring. Do not add physical parts. Keep the UART P/A handshake, log each received byte to the ESP32 USB Serial Monitor, and turn on the ESP32 built-in LED on GPIO2 when P arrives.",
+      body: JSON.stringify({
+       prompt: "Edit the current Arduino Mega 2560 and ESP32 circuit. Preserve every wire and do not alter wiring. Do not add physical parts. Keep the UART P/A handshake, log each received byte to the ESP32 USB Serial Monitor, and turn on the ESP32 built-in LED on GPIO2 when P arrives.",
       currentProject,
+      generationModeOverride: "edit",
     }),
   }));
   const body = await response.json();
   assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(body.generationMode, "edit");
   assert.equal(repairRequests, 0, "the app should deterministically preserve explicitly protected wiring instead of spending another provider call");
   assert.deepEqual(body.project.connections.map((wire: FixtureWire) => [wire.from.componentId, wire.from.pin, wire.to.componentId, wire.to.pin]), [
     ["mega", "D18", "esp", "GPIO16"],
@@ -2849,9 +3083,10 @@ void loop() {
   assert.ok(snapshot.boardSerial?.mega?.some(entry => entry.text === "65"), `Mega should receive the A acknowledgement through the preserved GPIO17/D19 wire: ${JSON.stringify({ serial: snapshot.boardSerial, diagnostics: snapshot.diagnostics, programs: body.project.programs })}`);
 });
 
-function modelResponse(text: string, finishReason = "STOP") {
+function modelResponse(text: string, finishReason = "STOP", usageMetadata?: { promptTokenCount: number; candidatesTokenCount: number }) {
   return Response.json({
     candidates: [{ finishReason, content: { parts: [{ text }] } }],
+    ...(usageMetadata ? { usageMetadata } : {}),
   });
 }
 
@@ -2863,20 +3098,40 @@ function generationRequest(model?: string) {
   });
 }
 
-function requestWithCurrentProject(prompt: string) {
+function requestWithCurrentProject(prompt: string, generationModeOverride?: "create" | "edit") {
   return new Request("http://localhost/api/ai/generate", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ prompt, currentProject: createDefaultBlinkProject() }),
+    body: JSON.stringify({ prompt, currentProject: createDefaultBlinkProject(), ...(generationModeOverride ? { generationModeOverride } : {}) }),
   });
 }
 
-test("ordinary greetings receive a model-generated chat reply without circuit generation", async (context) => {
+function assistantRequest(payload: Record<string, unknown>) {
+  return new Request("http://localhost/api/ai/generate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+test("Build rejects an oversized streamed request before authentication, quota reservation, or provider calls", async () => {
+  const reservationsBefore = testAiReservations;
+  const response = await POST(assistantRequest({ prompt: "x".repeat(100_001) }));
+  assert.equal(response.status, 413);
+  assert.equal((await response.json()).error.code, "REQUEST_TOO_LARGE");
+  assert.equal(testAiReservations, reservationsBefore);
+});
+
+test("explicit Chat mode handles natural conversation with recent turns and circuit context without using circuit credits", async (context) => {
   const originalFetch = globalThis.fetch;
   const originalKey = process.env.GEMINI_API_KEY;
+  const reservationsBefore = testAiReservations;
+  const finalizationsBefore = testAiFinalizations.length;
+  const chatLimitCallsBefore = testChatRateLimitUsers.length;
   let requestBody: {
+    systemInstruction: { parts: Array<{ text: string }> };
     generationConfig: { maxOutputTokens: number; responseMimeType: string; responseJsonSchema: { required: string[] } };
-    contents: Array<{ parts: Array<{ text: string }> }>;
+    contents: Array<{ role: string; parts: Array<{ text: string }> }>;
   } | undefined;
   context.after(() => {
     globalThis.fetch = originalFetch;
@@ -2886,24 +3141,176 @@ test("ordinary greetings receive a model-generated chat reply without circuit ge
   process.env.GEMINI_API_KEY = "test-secret";
   globalThis.fetch = async (_input, init) => {
     requestBody = JSON.parse(String(init?.body));
-    return modelResponse(JSON.stringify({ reply: "Hello! How can I help with your circuit?" }));
+    return modelResponse(JSON.stringify({ reply: "Debugging is just asking your circuit what it meant, one wire at a time." }));
   };
 
-  const response = await POST(requestWithCurrentProject("hello"));
+  const response = await POST(assistantRequest({
+    assistantMode: "chat",
+    prompt: "Tell me a quick joke about debugging.",
+    chatHistory: [
+      { role: "user", text: "I am learning how this project works." },
+      { role: "assistant", text: "I can help explain the open circuit too." },
+    ],
+    currentProject: createDefaultBlinkProject(),
+  }));
   const body = await response.json();
   assert.equal(response.status, 200, JSON.stringify(body));
   assert.deepEqual(body, {
     kind: "chat",
-    reply: "Hello! How can I help with your circuit?",
+    reply: "Debugging is just asking your circuit what it meant, one wire at a time.",
     model: "gemini-3.5-flash-lite",
   });
-  assert.equal(requestBody?.generationConfig.maxOutputTokens, 512);
+  assert.equal(requestBody?.generationConfig.maxOutputTokens, 1_024);
   assert.equal(requestBody?.generationConfig.responseMimeType, "application/json");
   assert.deepEqual(requestBody?.generationConfig.responseJsonSchema.required, ["reply"]);
-  assert.equal(requestBody?.contents[0].parts[0].text, "hello");
+  assert.deepEqual(requestBody?.contents.map(turn => [turn.role, turn.parts[0].text]), [
+    ["user", "I am learning how this project works."],
+    ["model", "I can help explain the open circuit too."],
+    ["user", "Tell me a quick joke about debugging."],
+  ]);
+  const systemInstruction = requestBody?.systemInstruction.parts.map(part => part.text).join("\n") ?? "";
+  assert.match(systemInstruction, /general-purpose assistant/i);
+  assert.match(systemInstruction, /Board: arduino-uno/);
+  assert.match(systemInstruction, /Wire:/);
+  assert.equal(testChatRateLimitUsers.length, chatLimitCallsBefore + 1);
+  assert.equal(testAiReservations, reservationsBefore, "chat must not reserve a circuit credit");
+  assert.equal(testAiFinalizations.length, finalizationsBefore, "chat must not finalize a circuit credit");
 });
 
-test("standalone and ambiguous prompts create fresh circuits without current project context", async (context) => {
+test("Chat mode rejects malformed and oversized conversation history before calling Gemini", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  let providerCalls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return modelResponse(JSON.stringify({ reply: "unexpected" }));
+  };
+
+  for (const chatHistory of [
+    [{ role: "system", text: "not allowed" }],
+    Array.from({ length: 13 }, () => ({ role: "user", text: "previous" })),
+    [{ role: "user", text: "x".repeat(2_001) }],
+  ]) {
+    const response = await POST(assistantRequest({ assistantMode: "chat", prompt: "hello", chatHistory }));
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.code, "INVALID_CHAT_HISTORY");
+  }
+  assert.equal(providerCalls, 0);
+});
+
+test("Chat mode requires a verified account and does not consume the chat rate slot when unauthenticated", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const chatLimitCallsBefore = testChatRateLimitUsers.length;
+  let providerCalls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    configureAiUsageAdapterForTests(testAiUsageAdapter);
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  configureAiUsageAdapterForTests({ ...testAiUsageAdapter, authenticate: async () => null });
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return modelResponse(JSON.stringify({ reply: "unexpected" }));
+  };
+
+  const response = await POST(assistantRequest({ assistantMode: "chat", prompt: "hello" }));
+  assert.equal(response.status, 401);
+  assert.equal((await response.json()).error.code, "AUTH_REQUIRED");
+  assert.equal(providerCalls, 0);
+  assert.equal(testChatRateLimitUsers.length, chatLimitCallsBefore);
+});
+
+test("Chat mode enforces the separate server-side per-minute limit", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const originalRateLimit = testChatRateLimitAllowed;
+  const reservationsBefore = testAiReservations;
+  let providerCalls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    testChatRateLimitAllowed = originalRateLimit;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  testChatRateLimitAllowed = false;
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return modelResponse(JSON.stringify({ reply: "unexpected" }));
+  };
+
+  const response = await POST(assistantRequest({ assistantMode: "chat", prompt: "hello" }));
+  assert.equal(response.status, 429);
+  assert.equal((await response.json()).error.code, "AI_CHAT_RATE_LIMITED");
+  assert.equal(providerCalls, 0);
+  assert.equal(testAiReservations, reservationsBefore, "chat throttling remains separate from circuit credits");
+});
+
+test("Build mode enforces an account-scoped generation limit before consuming monthly quota or calling Gemini", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const originalRateLimit = testGenerationRateLimitAllowed;
+  const reservationsBefore = testAiReservations;
+  const rateLimitCallsBefore = testGenerationRateLimitUsers.length;
+  let providerCalls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    testGenerationRateLimitAllowed = originalRateLimit;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  testGenerationRateLimitAllowed = false;
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return modelResponse(JSON.stringify(generatedEnvelope));
+  };
+
+  const response = await POST(assistantRequest({ prompt: "Blink an LED" }));
+  assert.equal(response.status, 429);
+  assert.equal((await response.json()).error.code, "AI_GENERATION_RATE_LIMITED");
+  assert.ok(Number(response.headers.get("retry-after")) > 0);
+  assert.equal(testGenerationRateLimitUsers.length, rateLimitCallsBefore + 1);
+  assert.equal(providerCalls, 0);
+  assert.equal(testAiReservations, reservationsBefore);
+});
+
+test("Build mode fails closed when the account generation limiter is unavailable", async (context) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const originalFailure = testGenerationRateLimitFails;
+  const reservationsBefore = testAiReservations;
+  let providerCalls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    testGenerationRateLimitFails = originalFailure;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  testGenerationRateLimitFails = true;
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return modelResponse(JSON.stringify(generatedEnvelope));
+  };
+
+  const response = await POST(assistantRequest({ prompt: "Blink an LED" }));
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).error.code, "AI_GENERATION_RATE_LIMIT_UNAVAILABLE");
+  assert.equal(providerCalls, 0);
+  assert.equal(testAiReservations, reservationsBefore);
+});
+
+test("requests without assistantMode default to Build and create fresh circuits", async (context) => {
   const originalFetch = globalThis.fetch;
   const originalKey = process.env.GEMINI_API_KEY;
   const requests: RequestInit[] = [];
@@ -2915,11 +3322,15 @@ test("standalone and ambiguous prompts create fresh circuits without current pro
   process.env.GEMINI_API_KEY = "test-secret";
   globalThis.fetch = async (_input, init) => {
     requests.push(init ?? {});
-    return modelResponse(JSON.stringify(generatedEnvelope));
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    return modelResponse(content.mode === "edit"
+      ? JSON.stringify({ operations: [{ type: "update_component", componentId: "uno", changes: { label: "Arduino Uno" } }], explanation: "Kept the current circuit intact.", assumptions: [], warnings: [] })
+      : JSON.stringify(generatedEnvelope));
   };
 
-  for (const prompt of ["Blink an LED", "Make something useful"]) {
-    const response = await POST(requestWithCurrentProject(prompt));
+  for (const prompt of ["Blink an LED", "Tell me a joke"]) {
+    const response = await POST(requestWithCurrentProject(prompt, "create"));
     assert.equal(response.status, 200);
   }
   for (const request of requests) {
@@ -2930,12 +3341,498 @@ test("standalone and ambiguous prompts create fresh circuits without current pro
   }
 });
 
-test("explicit fresh circuit prompts stay in create mode when behavior mentions changing an output", () => {
-  assert.equal(
-    classifyGenerationMode("Create a fresh Arduino Uno circuit with a KY-040 and WS2812B strip; rotate the encoder to change the strip color.", true),
-    "create",
-  );
-  assert.equal(classifyGenerationMode("Change the strip color in the current circuit", true), "edit");
+test("Gemini classifies the whole request, preserving detailed create intent and targeted edits", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  type ProviderRequest = {
+    contents: Array<{ parts: Array<{ text: string }> }>;
+    systemInstruction: { parts: Array<{ text: string }> };
+    generationConfig: { maxOutputTokens?: number };
+  };
+  const requests: Array<{ body: ProviderRequest; system: string; content: Record<string, unknown> }> = [];
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const currentProject = createDefaultBlinkProject();
+  globalThis.fetch = async (_input, init) => {
+    const body = JSON.parse(String(init?.body)) as ProviderRequest;
+    const content = JSON.parse(body.contents[0]!.parts[0]!.text) as Record<string, unknown>;
+    requests.push({ body, system: body.systemInstruction.parts[0]!.text, content });
+    if ("currentCircuitSummary" in content) {
+      const intent = typeof content.request === "string" && content.request.startsWith("Build a complete") ? "create" : "edit";
+      return modelResponse(JSON.stringify({ intent }), "STOP", { promptTokenCount: 12, candidatesTokenCount: 2 });
+    }
+    if (content.mode === "create") return modelResponse(JSON.stringify(generatedEnvelope), "STOP", { promptTokenCount: 50, candidatesTokenCount: 10 });
+    return modelResponse(JSON.stringify({
+      operations: [{ type: "update_component", componentId: "uno", changes: { label: "Current controller" } }],
+      explanation: "Updated the current controller label.", assumptions: [], warnings: [],
+    }), "STOP", { promptTokenCount: 40, candidatesTokenCount: 8 });
+  };
+
+  const createResponse = await POST(assistantRequest({
+    prompt: "Build a complete traffic intersection with an Arduino Uno. Add the lights and button, then wire every branch and write its behavior.",
+    currentProject,
+  }));
+  const createBody = await createResponse.json();
+  assert.equal(createResponse.status, 200, JSON.stringify(createBody));
+  assert.equal(createBody.generationMode, "create");
+  const editResponse = await POST(assistantRequest({ prompt: "Build on the existing circuit by adding a second LED branch.", currentProject }));
+  const editBody = await editResponse.json();
+  assert.equal(editResponse.status, 200, JSON.stringify(editBody));
+  assert.equal(editBody.generationMode, "edit");
+  assert.equal(editBody.project.components.find((component: FixtureComponent) => component.id === "uno").label, "Current controller");
+
+  const classifierRequests = requests.filter(request => {
+    return "currentCircuitSummary" in request.content;
+  });
+  assert.equal(classifierRequests.length, 2);
+  assert.equal(requests.length, 4, "each open-project request is classified before its selected generation path");
+  for (const request of classifierRequests) {
+    assert.equal(request.body.generationConfig.maxOutputTokens, 128);
+    assert.match(request.system, /whole request/i);
+    assert.match(request.system, /untrusted data/i);
+    assert.equal("currentProject" in request.content, false, "classification receives a compact summary instead of the full saved project");
+    assert.equal(typeof request.content.currentCircuitSummary, "string");
+    assert.ok((request.content.currentCircuitSummary as string).length <= 6_000);
+  }
+  const createGeneration = requests.find(request => request.content.mode === "create");
+  assert.ok(createGeneration);
+  assert.equal("currentProject" in createGeneration.content, false);
+  const editGeneration = requests.find(request => request.content.mode === "edit");
+  assert.deepEqual(editGeneration?.content.currentProject, currentProject);
+});
+
+test("saved projects without a controller board go straight to full circuit generation", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const baseProject = createDefaultBlinkProject();
+  const boardlessProjects = [
+    { ...baseProject, components: [], connections: [] },
+    {
+      ...baseProject,
+      // A stale top-level board field is not proof that there is a board to edit.
+      components: [{ id: "r1", type: "resistor", label: "Resistor 1", x: 0, y: 0, rotation: 0, properties: {} }],
+      connections: [],
+    },
+  ];
+  const providerContents: Array<Record<string, unknown>> = [];
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text) as Record<string, unknown>;
+    providerContents.push(content);
+    return modelResponse(JSON.stringify(generatedEnvelope));
+  };
+
+  for (const currentProject of boardlessProjects) {
+    const response = await POST(assistantRequest({ prompt: "Blink LED fast", currentProject }));
+    const body = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(body));
+    assert.equal(body.generationMode, "create");
+  }
+
+  assert.equal(providerContents.length, boardlessProjects.length, "each request should make one full-generation call and skip the intent classifier");
+  for (const content of providerContents) {
+    assert.equal(content.mode, "create");
+    assert.equal("currentProject" in content, false);
+    assert.equal("currentCircuitSummary" in content, false);
+  }
+});
+
+test("clarification asks the user without generating or consuming a circuit request", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const project = createDefaultBlinkProject();
+  const snapshot = structuredClone(project);
+  const reservationsBefore = testAiReservations;
+  const finalizationsBefore = testAiFinalizations.length;
+  let providerCalls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return modelResponse(JSON.stringify({ intent: "clarify" }), "STOP", { promptTokenCount: 20, candidatesTokenCount: 3 });
+  };
+
+  const response = await POST(assistantRequest({ prompt: "Make this into a buzzer circuit.", currentProject: project }));
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.kind, "mode-clarification");
+  assert.deepEqual(body.options, ["edit", "create"]);
+  assert.equal(providerCalls, 1, "clarification must stop before circuit generation");
+  assert.deepEqual(project, snapshot, "classification must not mutate the supplied circuit");
+  assert.equal(testAiReservations, reservationsBefore + 1, "classification still reserves through the existing auth/quota path");
+  assert.equal(testAiFinalizations.length, finalizationsBefore + 1);
+  assert.equal(testAiFinalizations.at(-1)?.succeeded, false, "clarification releases the reservation instead of consuming a credit");
+  assert.deepEqual({ input: testAiFinalizations.at(-1)?.inputTokens, output: testAiFinalizations.at(-1)?.outputTokens }, { input: 20, output: 3 });
+});
+
+test("invalid Gemini intent fails retryably without falling back or touching the circuit", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const project = createDefaultBlinkProject();
+  const snapshot = structuredClone(project);
+  let providerCalls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return modelResponse(JSON.stringify({ intent: "build" }));
+  };
+
+  const response = await POST(assistantRequest({ prompt: "Add a buzzer", currentProject: project }));
+  const body = await response.json();
+  assert.equal(response.status, 503);
+  assert.equal(body.error.code, "AI_INTENT_CLASSIFICATION_FAILED");
+  assert.equal(body.error.retryable, true);
+  assert.equal(providerCalls, 1, "an invalid classifier result must not call the circuit generator");
+  assert.equal(testAiFinalizations.at(-1)?.succeeded, false);
+  assert.deepEqual(project, snapshot);
+});
+
+test("Build authentication and request reservation happen before any classifier call", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const originalAllowed = testAiReservationAllowed;
+  let providerCalls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    testAiReservationAllowed = originalAllowed;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  testAiReservationAllowed = false;
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return modelResponse(JSON.stringify({ intent: "edit" }));
+  };
+
+  const response = await POST(assistantRequest({ prompt: "Add a buzzer", currentProject: createDefaultBlinkProject() }));
+  assert.equal(response.status, 429);
+  assert.equal((await response.json()).error.code, "AI_MONTHLY_LIMIT_REACHED");
+  assert.equal(providerCalls, 0, "an over-quota request must not contact Gemini for classification");
+});
+
+test("explicit mode choices bypass classification and Edit requires an open project", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  let providerCalls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    providerCalls += 1;
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    assert.equal("currentCircuitSummary" in content, false, "a user-selected mode skips the classifier");
+    assert.equal(content.mode, "create");
+    return modelResponse(JSON.stringify(generatedEnvelope));
+  };
+
+  const project = createDefaultBlinkProject();
+  const response = await POST(assistantRequest({ prompt: "Create a new Arduino Uno LED blinking circuit.", currentProject: project, generationModeOverride: "create" }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(body.generationMode, "create");
+  assert.equal(body.project.id, project.id, "a user-selected replacement retains the saved project identity");
+  assert.equal(providerCalls, 1);
+
+  const invalidEdit = await POST(assistantRequest({ prompt: "Add a buzzer", generationModeOverride: "edit" }));
+  assert.equal(invalidEdit.status, 400);
+  assert.equal((await invalidEdit.json()).error.code, "CURRENT_PROJECT_REQUIRED");
+
+  const emptyProject = { ...project, components: [], connections: [] };
+  const editWithoutBoard = await POST(assistantRequest({ prompt: "Blink LED fast", currentProject: emptyProject, generationModeOverride: "edit" }));
+  assert.equal(editWithoutBoard.status, 400);
+  assert.equal((await editWithoutBoard.json()).error.code, "CURRENT_CONTROLLER_BOARD_REQUIRED");
+  assert.equal(providerCalls, 1, "an impossible edit must be rejected before contacting Gemini");
+});
+
+test("targeted edit operations preserve unrelated parts, positions, properties, and wires", () => {
+  const original = createDefaultBlinkProject();
+  const snapshot = structuredClone(original);
+  const result = applyCircuitEditOperations(original, [
+    { type: "add_component", component: { id: "buzzer1", type: "buzzer", label: "Buzzer", x: 820, y: 180, rotation: 0, properties: {} } },
+    { type: "add_connection", from: { componentId: "buzzer1", pin: "+" }, to: { componentId: "uno", pin: "D8" } },
+    { type: "add_connection", from: { componentId: "buzzer1", pin: "-" }, to: { componentId: "uno", pin: "GND" } },
+  ]);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(original, snapshot, "applying a patch must not mutate the supplied saved project object");
+  assert.deepEqual((result.project.components as unknown[]).slice(0, snapshot.components.length), snapshot.components);
+  assert.deepEqual((result.project.connections as unknown[]).slice(0, snapshot.connections.length), snapshot.connections);
+  assert.equal((result.project.components as Array<{ id: string }>).at(-1)?.id, "buzzer1");
+});
+
+test("single-board set_program patches canonicalize an unambiguous board reference", () => {
+  const original = createDefaultBlinkProject();
+  const code = "void setup(){} void loop(){ delay(10); }";
+  const result = applyCircuitEditOperations(original, [{ type: "set_program", boardId: "Arduino Uno", code }]);
+  assert.equal(result.ok, true, "the only board is the unambiguous target even when the model echoes its display label");
+  if (result.ok) assert.equal(result.project.code, code);
+  assert.equal(original.code, createDefaultBlinkProject().code, "the source project remains unchanged");
+});
+
+test("wire reference aliases resolve only to a unique exact type or label", () => {
+  const components = [
+    { id: "board-esp", type: "esp32-devkitc-v4", label: "ESP32" },
+    { id: "light-sensor", type: "bh1750-sen0097", label: "BH1750" },
+    { id: "red-led", type: "led", label: "Red status LED" },
+    { id: "green-led", type: "led", label: "Green status LED" },
+  ];
+  assert.equal(resolveUniqueComponentReference("ESP32", components), "board-esp");
+  assert.equal(resolveUniqueComponentReference("bh1750-sen0097", components), "light-sensor");
+  assert.equal(resolveUniqueComponentReference("led", components), undefined, "repeated component types must remain ambiguous");
+  assert.equal(resolveUniqueComponentReference("unplaced-buzzer", components), undefined, "unknown references remain validation failures");
+});
+
+test("targeted removal and rewiring touch only the requested connection", () => {
+  const original = createDefaultBlinkProject();
+  const result = applyCircuitEditOperations(original, [
+    { type: "remove_connection", connectionId: "wire-d13-r1" },
+    { type: "add_connection", from: { componentId: "uno", pin: "D9" }, to: { componentId: "r1", pin: "1" } },
+  ]);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(original.connections[0], { id: "wire-d13-r1", from: { componentId: "uno", pin: "D13" }, to: { componentId: "r1", pin: "1" }, color: "#f59e0b" });
+  const wires = result.project.connections as Array<{ id: string; from: { componentId: string; pin: string }; to: { componentId: string; pin: string } }>;
+  assert.equal(wires.some(wire => wire.id === "wire-d13-r1"), false);
+  assert.ok(wires.some(wire => wire.from.componentId === "uno" && wire.from.pin === "D9" && wire.to.componentId === "r1" && wire.to.pin === "1"));
+  assert.deepEqual(wires.filter(wire => wire.id !== "wire-ai-1"), original.connections.slice(1));
+});
+
+test("invalid targeted edits leave the original project untouched", () => {
+  const original = createDefaultBlinkProject();
+  const snapshot = structuredClone(original);
+  const result = applyCircuitEditOperations(original, [{ type: "remove_connection", connectionId: "missing-wire" }]);
+  assert.equal(result.ok, false);
+  assert.deepEqual(original, snapshot);
+});
+
+test("an AI edit patch adds and simulates a buzzer without replacing the open circuit", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const initialProject = createDefaultBlinkProject();
+  const setProgram = `void setup(){ pinMode(13, OUTPUT); pinMode(8, OUTPUT); }\nvoid loop(){ digitalWrite(13, HIGH); tone(8, 880); delay(1000); digitalWrite(13, LOW); noTone(8); delay(1000); }`;
+  let providerRequest: Record<string, unknown> | undefined;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    providerRequest = request;
+    return modelResponse(JSON.stringify({
+      operations: [
+        { type: "add_component", component: { id: "buzzer1", type: "buzzer", label: "Buzzer", x: 820, y: 180, rotation: 0, properties: {} } },
+        { type: "add_connection", from: { componentId: "buzzer1", pin: "__plus" }, to: { componentId: "uno", pin: "D8" } },
+        { type: "add_connection", from: { componentId: "buzzer1", pin: "@" }, to: { componentId: "uno", pin: "GND" } },
+        { type: "set_program", boardId: "uno", code: setProgram },
+      ],
+      explanation: "The buzzer now sounds alongside the existing LED blink.",
+      assumptions: [], warnings: [],
+    }));
+  };
+  const response = await POST(assistantRequest({ prompt: "Add a buzzer that beeps in sync with the existing LED blink.", currentProject: initialProject, generationModeOverride: "edit" }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(body.generationMode, "edit");
+  for (const existing of initialProject.components) {
+    const actual = body.project.components.find((component: FixtureComponent) => component.id === existing.id);
+    assert.deepEqual(actual && { ...actual, rotation: actual.rotation ?? 0 }, { ...existing, rotation: existing.rotation ?? 0 });
+  }
+  assert.deepEqual(body.project.connections.slice(0, initialProject.connections.length), initialProject.connections);
+  assert.ok(body.project.connections.some((wire: FixtureWire) => [wire.from, wire.to].some(endpoint => endpoint.componentId === "buzzer1" && endpoint.pin === "+")));
+  assert.ok(body.project.connections.some((wire: FixtureWire) => [wire.from, wire.to].some(endpoint => endpoint.componentId === "buzzer1" && endpoint.pin === "-")));
+  assert.equal(body.project.components.find((component: { id: string }) => component.id === "buzzer1").x, 820);
+  assert.equal(body.project.code, setProgram);
+  const providerBody = providerRequest as { contents: Array<{ parts: Array<{ text: string }> }>; generationConfig: { responseJsonSchema: { properties: Record<string, unknown> } }; systemInstruction: { parts: Array<{ text: string }> } };
+  const prompt = JSON.parse(providerBody.contents[0]!.parts[0]!.text);
+  assert.equal(prompt.mode, "edit");
+  assert.deepEqual(prompt.currentProject, initialProject);
+  assert.ok("operations" in providerBody.generationConfig.responseJsonSchema.properties);
+  assert.equal("project" in providerBody.generationConfig.responseJsonSchema.properties, false);
+  assert.match(providerBody.systemInstruction.parts[0]!.text, /NEVER a replacement project/);
+
+  const simulator = new ArduinoSimulator(body.project.code);
+  simulator.attachProject(body.project);
+  simulator.run(); simulator.advance(0);
+  assert.ok(simulator.getSnapshot().tones?.some(tone => tone.active && tone.frequency === 880));
+  assert.deepEqual(simulator.getSnapshot().diagnostics.filter(diagnostic => diagnostic.severity === "error"), []);
+});
+
+test("AI adds a blinking LED to the open circuit and preserves its numeric-first UUID identity", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const initialProject = createDefaultBlinkProject();
+  initialProject.id = "3290a16e-f370-4e5e-9c09-1a6fe3c8b0ab";
+  const snapshot = structuredClone(initialProject);
+  const blinkCode = "void setup(){ pinMode(13,OUTPUT); pinMode(12,OUTPUT); } void loop(){ digitalWrite(13,HIGH); digitalWrite(12,HIGH); delay(500); digitalWrite(13,LOW); digitalWrite(12,LOW); delay(500); }";
+  let providerCalls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return modelResponse(JSON.stringify({
+      operations: [
+        { type: "add_component", component: { id: "r2", type: "resistor", label: "R2 · 220 Ω", x: 900, y: 180, rotation: 0, properties: { resistance: 220 } } },
+        { type: "add_component", component: { id: "led2", type: "led", label: "LED2 · Green", x: 1120, y: 180, rotation: 90, properties: { color: "#22c55e", forwardVoltage: 2 } } },
+        { type: "add_connection", from: { componentId: "uno", pin: "D12" }, to: { componentId: "r2", pin: "1" } },
+        { type: "add_connection", from: { componentId: "r2", pin: "2" }, to: { componentId: "led2", pin: "A" } },
+        { type: "add_connection", from: { componentId: "led2", pin: "K" }, to: { componentId: "uno", pin: "GND" } },
+        { type: "set_program", boardId: "uno", code: blinkCode },
+      ],
+      explanation: "Added a green LED branch that blinks in sync with the existing LED.",
+      assumptions: [], warnings: [],
+    }));
+  };
+
+  const response = await POST(assistantRequest({ prompt: "Add a blinking LED please.", currentProject: initialProject, generationModeOverride: "edit" }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(body.generationMode, "edit");
+  assert.equal(body.project.id, snapshot.id);
+  assert.equal(providerCalls, 1, "a numeric-first project UUID must not trigger provider repair");
+  assert.deepEqual(initialProject, snapshot, "AI edits must not mutate the submitted open project");
+  for (const component of snapshot.components) {
+    const actual = body.project.components.find((item: FixtureComponent) => item.id === component.id);
+    assert.deepEqual(actual && { ...actual, rotation: actual.rotation ?? 0 }, { ...component, rotation: component.rotation ?? 0 });
+  }
+  for (const connection of snapshot.connections) assert.deepEqual(body.project.connections.find((item: FixtureWire) => item.id === connection.id), connection);
+  assert.ok(body.project.connections.some((wire: FixtureWire) => [wire.from, wire.to].some(endpoint => endpoint.componentId === "uno" && endpoint.pin === "D12") && [wire.from, wire.to].some(endpoint => endpoint.componentId === "r2" && endpoint.pin === "1")));
+  assert.ok(body.project.connections.some((wire: FixtureWire) => [wire.from, wire.to].some(endpoint => endpoint.componentId === "r2" && endpoint.pin === "2") && [wire.from, wire.to].some(endpoint => endpoint.componentId === "led2" && endpoint.pin === "A")));
+  assert.ok(body.project.connections.some((wire: FixtureWire) => [wire.from, wire.to].some(endpoint => endpoint.componentId === "led2" && endpoint.pin === "K")));
+  assert.equal(body.project.code, blinkCode);
+
+  const simulator = new ArduinoSimulator(body.project.code);
+  simulator.attachProject(body.project);
+  simulator.run();
+  simulator.advance(0);
+  assert.deepEqual(simulator.getSnapshot().diagnostics.filter(diagnostic => diagnostic.severity === "error"), []);
+  assert.equal(simulator.getSnapshot().componentStates.led1?.powered, true);
+  assert.equal(simulator.getSnapshot().componentStates.led2?.powered, true);
+});
+
+test("project identity is server-owned for edits, replacements, and new projects", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const existingProject = createDefaultBlinkProject();
+  existingProject.id = "3290a16e-f370-4e5e-9c09-1a6fe3c8b0ab";
+  const createProjectSchemas: Array<{ properties: Record<string, unknown>; required: string[] }> = [];
+  let providerCalls = 0;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    providerCalls += 1;
+    const request: {
+      contents: Array<{ parts: Array<{ text: string }> }>;
+      generationConfig: {
+        responseJsonSchema: {
+          properties: {
+            project: { properties: Record<string, unknown>; required: string[] };
+          };
+        };
+      };
+    } = JSON.parse(String(init?.body));
+    const modelRequest: { mode: string } = JSON.parse(request.contents[0].parts[0].text);
+    if (modelRequest.mode !== "edit") {
+      createProjectSchemas.push(request.generationConfig.responseJsonSchema.properties.project);
+    }
+    if (modelRequest.mode === "edit") {
+      return modelResponse(JSON.stringify({
+        operations: [{ type: "update_component", componentId: "uno", changes: { label: "Identity test board" } }],
+        explanation: "Renamed the open controller.", assumptions: [], warnings: [],
+      }));
+    }
+    const envelope = structuredClone(generatedEnvelope);
+    if (providerCalls === 2) envelope.project.id = "9-provider-generated-id";
+    else delete (envelope.project as { id?: string }).id;
+    return modelResponse(JSON.stringify(envelope));
+  };
+
+  const editResponse = await POST(assistantRequest({ prompt: "Rename the controller to Identity test board.", currentProject: existingProject, generationModeOverride: "edit" }));
+  const editBody = await editResponse.json();
+  assert.equal(editResponse.status, 200, JSON.stringify(editBody));
+  assert.equal(editBody.generationMode, "edit");
+  assert.equal(editBody.project.id, existingProject.id);
+  assert.equal(editBody.project.components.find((component: FixtureComponent) => component.id === "uno").label, "Identity test board");
+
+  const replacementResponse = await POST(assistantRequest({ prompt: "Create a fresh Arduino Uno blink circuit from scratch.", currentProject: existingProject, generationModeOverride: "create" }));
+  const replacementBody = await replacementResponse.json();
+  assert.equal(replacementResponse.status, 200, JSON.stringify(replacementBody));
+  assert.equal(replacementBody.generationMode, "create");
+  assert.equal(replacementBody.project.id, existingProject.id, "replacing the circuit contents must preserve the saved-project key");
+
+  const newProjectResponse = await POST(assistantRequest({ prompt: "Blink an LED" }));
+  const newProjectBody = await newProjectResponse.json();
+  assert.equal(newProjectResponse.status, 200, JSON.stringify(newProjectBody));
+  assert.match(newProjectBody.project.id, /^project-[0-9a-f-]{36}$/i, "the server must assign an ID when there is no open saved project");
+  assert.equal(providerCalls, 3, "invalid or omitted provider project IDs must not trigger repairs");
+
+  for (const schema of createProjectSchemas) {
+    assert.equal(Object.hasOwn(schema.properties, "id"), false, "the provider schema must not ask Gemini for the storage key");
+    assert.equal(schema.required.includes("id"), false);
+  }
+});
+
+test("server-owned project IDs do not weaken component or wire ID validation", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  const invalidProject = createDefaultBlinkProject();
+  invalidProject.id = "9-invalid-model-project-id";
+  invalidProject.components[1]!.id = "9-invalid-component-id";
+  invalidProject.connections[0]!.id = "9-invalid-wire-id";
+  let providerCalls = 0;
+  configureGenerationTestLimitsForTests({ maxRepairs: 0 });
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    configureGenerationTestLimitsForTests(undefined);
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return modelResponse(JSON.stringify({ ...generatedEnvelope, project: invalidProject }));
+  };
+
+  const response = await POST(generationRequest());
+  const body = await response.json();
+  assert.equal(response.status, 502);
+  assert.equal(body.error.code, "AI_VALIDATION_FAILED");
+  assert.ok(body.error.details.some((issue: string) => /project\.components\[1\]\.id must start with a letter/.test(issue)), JSON.stringify(body.error.details));
+  assert.ok(body.error.details.some((issue: string) => /project\.connections\[0\]\.id must start with a letter/.test(issue)), JSON.stringify(body.error.details));
+  assert.equal(providerCalls, 1, "invalid circuit identifiers remain validation errors, separate from the ignored project ID");
 });
 
 test("explicit edit prompts include the current project", async (context) => {
@@ -2950,11 +3847,14 @@ test("explicit edit prompts include the current project", async (context) => {
   process.env.GEMINI_API_KEY = "test-secret";
   globalThis.fetch = async (_input, init) => {
     requests.push(init ?? {});
-    return modelResponse(JSON.stringify(generatedEnvelope));
+    return modelResponse(JSON.stringify({
+      operations: [{ type: "update_component", componentId: "uno", changes: { label: "Arduino Uno" } }],
+      explanation: "Kept the current circuit intact.", assumptions: [], warnings: [],
+    }));
   };
 
   for (const prompt of ["Modify the current circuit", "Update the current circuit", "Edit the current circuit"]) {
-    const response = await POST(requestWithCurrentProject(prompt));
+    const response = await POST(requestWithCurrentProject(prompt, "edit"));
     assert.equal(response.status, 200);
   }
   for (const request of requests) {
@@ -2962,6 +3862,8 @@ test("explicit edit prompts include the current project", async (context) => {
     const data = JSON.parse(body.contents[0].parts[0].text);
     assert.equal(data.mode, "edit");
     assert.deepEqual(data.currentProject, createDefaultBlinkProject());
+    assert.ok(body.generationConfig.responseJsonSchema.properties.operations);
+    assert.equal("project" in body.generationConfig.responseJsonSchema.properties, false);
   }
 });
 
@@ -3152,6 +4054,8 @@ test("passes schema issues into the repair attempt", async (context) => {
   const repairBody = JSON.parse(String(requests[1].body));
   const repairData = JSON.parse(repairBody.contents[0].parts[0].text);
   assert.ok(repairData.validationIssues.some((issue: string) => issue.includes("project.components must be an array")), JSON.stringify(repairData.validationIssues));
+  assert.deepEqual(repairData.requiredComponentCounts, [{ type: "led", count: 1 }]);
+  assert.ok(repairData.availableComponentTypes.includes("led"));
   assert.equal("details" in (await response.json()), false);
 });
 

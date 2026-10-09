@@ -1,0 +1,12 @@
+{
+  "name": "cirkitra-firebase-auth-blocking",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": "22"
+  },
+  "dependencies": {
+    "firebase-functions": "^6.0.0"
+  }
+}

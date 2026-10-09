@@ -1,0 +1,46 @@
+name: Security checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 5 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: Scan repository history for secrets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Pin third-party actions to immutable commits; Dependabot tracks updates.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependencies-and-tests:
+    name: Dependency audit and application checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.13.0"
+          cache: npm
+      - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high
+      # A transitive development-only advisory currently has no upstream patch;
+      # still fail the complete tree for any critical advisory.
+      - run: npm audit --audit-level=critical
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: npm test

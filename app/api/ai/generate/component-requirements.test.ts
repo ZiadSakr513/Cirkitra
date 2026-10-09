@@ -22,6 +22,27 @@ test("distinguishes addressable strip pixels from individually requested LEDs", 
   const mixed = requestedComponentCounts("Use one LED and one WS2812B LED strip with 8 LEDs.", definitions);
   assert.equal(mixed.get("led"), 1);
   assert.equal(mixed.get("ws2812b-strip-8"), 1);
+
+  const patternController = requestedComponentCounts("Create an ESP32 LED-pattern controller with a WS2812B strip.", definitions);
+  assert.equal(patternController.has("led"), false, "the addressable strip itself satisfies a generic LED-pattern request");
+  const indicator = requestedComponentCounts("Add one separate indicator LED beside a NeoPixel strip.", definitions);
+  assert.equal(indicator.get("led"), 1, "an explicitly separate indicator LED remains required");
+});
+
+test("treats an RGB LED as its own component instead of also requiring a discrete LED", () => {
+  const rgbOnly = requestedComponentCounts("Use one common-cathode RGB LED with a resistor on each color.", definitions);
+  assert.equal(rgbOnly.get("rgb-led"), 1);
+  assert.equal(rgbOnly.has("led"), false);
+
+  const rgbWithIndicator = requestedComponentCounts("Use one RGB LED and one separate status LED.", definitions);
+  assert.equal(rgbWithIndicator.get("rgb-led"), 1);
+  assert.equal(rgbWithIndicator.get("led"), 1);
+});
+
+test("resolves the common SHT31 model name to the supported SHT31-DIS part", () => {
+  const prompt = "Build an I2C sensor with one SHT31 and an Arduino Uno.";
+  assert.ok(selectGenerationComponents(prompt, "simulation").some(part => part.id === "sht31-dis"));
+  assert.equal(requestedComponentCounts(prompt, definitions).get("sht31-dis"), 1);
 });
 
 test("recognizes explicit ground symbols and separate motor supplies", () => {

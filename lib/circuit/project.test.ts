@@ -1,8 +1,28 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createDefaultBlinkProject } from "./default-project.ts";
-import { connectFloatingMotorDriverEnables, normalizeGroundReturns, removeComponentFromProject, removeComponentsFromProject } from "./project.ts";
+import { connectFloatingMotorDriverEnables, isPositionOnlyProjectChange, normalizeGroundReturns, removeComponentFromProject, removeComponentsFromProject } from "./project.ts";
 import { COMPONENT_EXAMPLES } from "./component-examples.ts";
+
+test("recognizes a coordinate-only edit without classifying electrical edits as layout", () => {
+  const project = createDefaultBlinkProject();
+  const moved = {
+    ...project,
+    components: project.components.map((component) => component.id === "led1"
+      ? { ...component, x: component.x + 40, y: component.y - 12 }
+      : component),
+  };
+  assert.equal(isPositionOnlyProjectChange(project, moved), true);
+  assert.equal(isPositionOnlyProjectChange(project, { ...moved, code: `${moved.code}\n` }), false);
+  assert.equal(isPositionOnlyProjectChange(project, {
+    ...moved,
+    components: moved.components.map((component) => component.id === "led1" ? { ...component, label: "Renamed" } : component),
+  }), false);
+  assert.equal(isPositionOnlyProjectChange(project, {
+    ...moved,
+    connections: [...moved.connections],
+  }), false);
+});
 
 test("removes an Arduino Uno and all wires attached to it", () => {
   const project = createDefaultBlinkProject();

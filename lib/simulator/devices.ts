@@ -294,7 +294,12 @@ export class DeviceRuntime {
     if (seriesResistors.length === 1) return { logicVoltage: profile.logicVoltage };
     const buffers = this.project.components.filter(component => component.type === "sn74ahct1g125"
       && this.powered(component)
-      && this.wiring.connected(strip.id, "DIN", component.id, "Y")
+      && (this.wiring.connected(strip.id, "DIN", component.id, "Y")
+        || this.project.components.some(resistor => resistor.type === "resistor"
+          && Number(resistor.properties?.resistance ?? 10_000) > 0
+          && !this.wiring.connected(resistor.id, "1", resistor.id, "2")
+          && ((this.wiring.connected(strip.id, "DIN", resistor.id, "1") && this.wiring.connected(resistor.id, "2", component.id, "Y"))
+            || (this.wiring.connected(strip.id, "DIN", resistor.id, "2") && this.wiring.connected(resistor.id, "1", component.id, "Y")))))
       && this.wiring.boardConnected(component.id, "A", dataPin)
       && this.wiring.voltage(component.id, "OE") === 0
       && (this.wiring.voltage(component.id, "VCC") ?? 0) >= 4.5);
