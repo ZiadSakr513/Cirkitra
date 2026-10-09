@@ -19,6 +19,7 @@ export type PayPalBillingStatus = {
   subscriptionStatus: string | null;
   paidThrough: string | null;
   canCancel: boolean;
+  renewalCancelled: boolean;
 };
 
 export function isMissingPayPalBillingSchema(error: unknown) {
@@ -98,6 +99,7 @@ export async function getPayPalBillingStatus(userId: string, environment: PayPal
       subscriptionStatus: relevant?.status ?? null,
       paidThrough: relevant?.paid_through ?? null,
       canCancel: (relevant?.status === "ACTIVE" || relevant?.status === "APPROVED") && !relevant.cancellation_requested_at,
+      renewalCancelled: Boolean(relevant?.cancellation_requested_at) || relevant?.status === "CANCELLED",
     };
   }
   if (error) throw new Error(`Could not read billing entitlements: ${error.message}`);
@@ -136,6 +138,7 @@ export async function getPayPalBillingStatus(userId: string, environment: PayPal
     subscriptionStatus: subscription.status,
     paidThrough: subscription.paid_through,
     canCancel: (subscription.status === "ACTIVE" || subscription.status === "APPROVED") && !subscription.cancellation_requested_at,
+    renewalCancelled: Boolean(subscription.cancellation_requested_at) || subscription.status === "CANCELLED",
   };
 }
 

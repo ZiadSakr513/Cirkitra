@@ -88,7 +88,7 @@ export async function POST(request: Request) {
       paymentSucceeded: Boolean(payment),
     });
 
-    return response(200, { confirmed: Boolean(payment), pending: !payment });
+    return response(200, { confirmed: Boolean(payment), pending: !payment, planId: configuredPlanId });
   } catch (error) {
     console.error("[paypal-confirmation-failed]", error instanceof Error ? error.message : "unknown error");
     return response(503, { error: { code: "CONFIRMATION_UNAVAILABLE", message: "PayPal has not yet provided enough verified payment details. No new payment was started; check again shortly." } });

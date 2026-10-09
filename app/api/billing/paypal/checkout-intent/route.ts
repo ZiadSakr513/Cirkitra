@@ -48,7 +48,7 @@ export async function POST(request: Request) {
     return Response.json({ intentId }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     if (error instanceof Error && error.message === "PAID_PLAN_ALREADY_ACTIVE") {
-      return Response.json({ error: { code: "PAID_PLAN_ACTIVE", message: "Your current paid plan is still active. You can choose another plan after its paid-through date; no second subscription was started." } }, { status: 409, headers: { "Cache-Control": "no-store" } });
+      return Response.json({ error: { code: "PAID_PLAN_ACTIVE", message: "Could not start this checkout. Please try again shortly." } }, { status: 409, headers: { "Cache-Control": "no-store" } });
     }
     if (error instanceof Error && error.message === "OPEN_SUBSCRIPTION_EXISTS") {
       return Response.json({ error: { code: "CHECKOUT_UNAVAILABLE", message: "Could not start checkout. Please try again." } }, { status: 409, headers: { "Cache-Control": "no-store" } });

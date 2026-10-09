@@ -19,6 +19,7 @@ type BillingStatus = {
   subscriptionStatus: string | null;
   paidThrough: string | null;
   canCancel: boolean;
+  renewalCancelled: boolean;
   checkoutEnabled: boolean;
 };
 
@@ -52,6 +53,10 @@ function displayDate(value: string | null) {
   if (!value) return "the end of the paid period";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "the end of the paid period" : date.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+}
+
+function pendingSubscriptionStorageKey(planId: PaidCirkitraPlanId) {
+  return `cirkitra-paypal-pending-subscription:${planId}`;
 }
 
 async function readBillingStatus(): Promise<{ response: Response; status?: BillingStatus }> {
@@ -88,6 +93,7 @@ export function PayPalSubscription({ config, planId }: { config: PayPalPublicCon
   const [checkoutReady, setCheckoutReady] = useState(false);
   const [authLoading, setAuthLoading] = useState(true);
   const [approvalPending, setApprovalPending] = useState(false);
+  const [paymentVerificationPending, setPaymentVerificationPending] = useState(false);
   const recoveryCheckedRef = useRef(false);
 
   const refreshStatus = useCallback(async () => {
@@ -104,13 +110,19 @@ export function PayPalSubscription({ config, planId }: { config: PayPalPublicCon
     return null;
   }, []);
 
-  const confirmPayPalSubscription = useCallback(async (subscriptionId: string, retryBriefly = false) => {
+  const confirmPayPalSubscription = useCallback(async (
+    subscriptionId: string,
+    retryBriefly = false,
+    expectedPlanId: PaidCirkitraPlanId | null = planId,
+  ) => {
     if (!subscriptionId) {
       setMessage("PayPal could not finish this checkout. You can try Upgrade again.");
       setApprovalPending(false);
+      setPaymentVerificationPending(false);
       return;
     }
     setApprovalPending(true);
+    setPaymentVerificationPending(true);
     const attempts = retryBriefly ? 4 : 1;
     try {
       for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -121,21 +133,23 @@ export function PayPalSubscription({ config, planId }: { config: PayPalPublicCon
             body: JSON.stringify({ subscriptionId }),
             cache: "no-store",
           });
-          const result = await response.json() as { confirmed?: boolean; pending?: boolean; error?: { message?: string } };
+          const result = await response.json() as { confirmed?: boolean; pending?: boolean; planId?: unknown; error?: { message?: string } };
           if (!response.ok) throw new Error(result.error?.message || "Could not verify this PayPal subscription yet.");
 
+          const verifiedPlanId = result.planId === "maker" || result.planId === "pro" ? result.planId : expectedPlanId;
           const updated = await refreshStatus();
-          if (updated?.planId !== "free" && updated) {
+          if (result.confirmed && verifiedPlanId && updated?.paypalPlanId === verifiedPlanId) {
+            window.sessionStorage.removeItem(pendingSubscriptionStorageKey(verifiedPlanId));
             window.sessionStorage.removeItem("cirkitra-paypal-pending-subscription");
             setApprovalPending(false);
-            const activePlan = CIRKITRA_PLANS[updated.planId];
-            setMessage(`${activePlan.name} is active.`);
+            setPaymentVerificationPending(false);
+            setMessage(`${CIRKITRA_PLANS[verifiedPlanId].name} is active.`);
             return;
           }
           if (result.confirmed) {
-            setMessage("Your payment is confirmed. Your plan is being updated.");
+            setMessage(`Your ${verifiedPlanId ? CIRKITRA_PLANS[verifiedPlanId].name : "plan"} payment is confirmed. We're finishing the update.`);
           } else {
-            setMessage("Your payment is not confirmed yet. You can try Upgrade again.");
+            setMessage("We're still confirming your PayPal payment. Please check again shortly.");
           }
         } catch (error) {
           setMessage(error instanceof Error ? error.message : "Could not verify this PayPal subscription yet.");
@@ -146,7 +160,7 @@ export function PayPalSubscription({ config, planId }: { config: PayPalPublicCon
     } finally {
       setApprovalPending(false);
     }
-  }, [refreshStatus]);
+  }, [planId, refreshStatus]);
 
   useEffect(() => {
     let active = true;
@@ -186,10 +200,15 @@ export function PayPalSubscription({ config, planId }: { config: PayPalPublicCon
   useEffect(() => {
     if (authLoading || !signedIn || recoveryCheckedRef.current) return;
     recoveryCheckedRef.current = true;
-    const pendingSubscriptionId = window.sessionStorage.getItem("cirkitra-paypal-pending-subscription");
+    const scopedKey = pendingSubscriptionStorageKey(planId);
+    const pendingSubscriptionId = window.sessionStorage.getItem(scopedKey)
+      ?? (planId === "pro" ? window.sessionStorage.getItem("cirkitra-paypal-pending-subscription") : null);
     if (!pendingSubscriptionId) return;
-    window.setTimeout(() => void confirmPayPalSubscription(pendingSubscriptionId, true), 0);
-  }, [authLoading, confirmPayPalSubscription, signedIn]);
+    window.setTimeout(() => {
+      setPaymentVerificationPending(true);
+      void confirmPayPalSubscription(pendingSubscriptionId, true, planId);
+    }, 0);
+  }, [authLoading, confirmPayPalSubscription, planId, signedIn]);
 
   useEffect(() => {
     if (!config || !paypalPlanId || !signedIn || !checkoutReady || approvalPending || !sdkLoaded || !containerRef.current) return;
@@ -225,7 +244,8 @@ export function PayPalSubscription({ config, planId }: { config: PayPalPublicCon
           onApprove: async (data) => {
             const subscriptionId = typeof data.subscriptionID === "string" ? data.subscriptionID : "";
             setApprovalPending(true);
-            if (subscriptionId) window.sessionStorage.setItem("cirkitra-paypal-pending-subscription", subscriptionId);
+            setPaymentVerificationPending(true);
+            if (subscriptionId) window.sessionStorage.setItem(pendingSubscriptionStorageKey(planId), subscriptionId);
             setMessage("Confirming your payment…");
             await confirmPayPalSubscription(subscriptionId, true);
           },
@@ -235,6 +255,7 @@ export function PayPalSubscription({ config, planId }: { config: PayPalPublicCon
           },
           onError: (error) => {
             console.error("[paypal-button-error]", error);
+            setCheckoutReady(false);
             setMessage("PayPal checkout could not be completed. Please try Upgrade again.");
           },
         }).render(container);
@@ -282,7 +303,12 @@ export function PayPalSubscription({ config, planId }: { config: PayPalPublicCon
     status.paypalPlanId === "free"
     || (status.complimentaryGrant.planId === "pro" && status.paypalPlanId === "maker")
   ));
-  if (status?.planId !== "free" && status && !(checkoutReady && status.paypalPlanId === "free")) {
+  const canUpgradeFromCancelledMaker = planId === "pro"
+    && status?.planId === "maker"
+    && status.paypalPlanId === "maker"
+    && status.renewalCancelled
+    && Boolean(status.paidThrough);
+  if (status?.planId !== "free" && status && !canUpgradeFromCancelledMaker && !(checkoutReady && status.paypalPlanId === "free")) {
     const activePlan = CIRKITRA_PLANS[status.planId];
     return <div className="pricing-account-status">
       {grantCanRaisePlan && status.complimentaryGrant
@@ -290,9 +316,16 @@ export function PayPalSubscription({ config, planId }: { config: PayPalPublicCon
         : <p className="pricing-account-message">Your paid {activePlan.name} plan is active through {displayDate(status.paidThrough)} ({activePlan.monthlyAiRequests} successful requests per rolling month).</p>}
       {status.complimentaryGrant && !grantCanRaisePlan && <p className="pricing-account-subtle">You also have complimentary {CIRKITRA_PLANS[status.complimentaryGrant.planId].name} access{status.complimentaryGrant.expiresAt ? ` through ${displayDate(status.complimentaryGrant.expiresAt)}` : " with no expiration"}.</p>}
       {grantCanRaisePlan && status.paypalPlanId !== "free" && <p className="pricing-account-subtle">Your paid {CIRKITRA_PLANS[status.paypalPlanId].name} subscription remains unchanged and is active through {displayDate(status.paidThrough)}.</p>}
-      {status.canCancel ? <button className="landing-button pricing-cancel-button" type="button" disabled={busy} onClick={() => void cancelSubscription()}>{busy ? "Cancelling…" : status.paypalPlanId === "free" ? "Cancel PayPal subscription" : `Cancel ${CIRKITRA_PLANS[status.paypalPlanId].name} renewal`}</button> : status.paypalPlanId !== "free" && <p className="pricing-account-subtle">Renewal is cancelled; your paid access will end on that date. You can choose a different paid plan after then.</p>}
+      {status.canCancel ? <button className="landing-button pricing-cancel-button" type="button" disabled={busy} onClick={() => void cancelSubscription()}>{busy ? "Cancelling…" : status.paypalPlanId === "free" ? "Cancel PayPal subscription" : `Cancel ${CIRKITRA_PLANS[status.paypalPlanId].name} renewal`}</button> : status.paypalPlanId === "maker" && status.renewalCancelled
+        ? <p className="pricing-account-subtle">Maker stays available through {displayDate(status.paidThrough)}. You can upgrade to Pro now.</p>
+        : status.paypalPlanId !== "free" && <p className="pricing-account-subtle">Renewal is cancelled; your paid access will end on {displayDate(status.paidThrough)}.</p>}
       {status.paypalPlanId === "free" && config && paypalPlanId && <button className="landing-button pricing-action" type="button" onClick={() => setCheckoutReady(true)}>Upgrade <span aria-hidden="true">→</span></button>}
       {message && <p aria-live="polite" className="pricing-account-subtle">{message}</p>}
+    </div>;
+  }
+  if (paymentVerificationPending) {
+    return <div className="pricing-account-status">
+      <p className="pricing-account-message" aria-live="polite">{message || "We're confirming your PayPal payment. Please check again shortly."}</p>
     </div>;
   }
   if (approvalPending) {
@@ -310,12 +343,15 @@ export function PayPalSubscription({ config, planId }: { config: PayPalPublicCon
 
   if (!checkoutReady) {
     return <div className="pricing-checkout">
+      {canUpgradeFromCancelledMaker && <p className="pricing-checkout-note">Pro starts when PayPal confirms your payment. Your remaining Maker time is not refunded or credited.</p>}
       <button className="landing-button pricing-action" type="button" onClick={() => setCheckoutReady(true)}>Upgrade <span aria-hidden="true">→</span></button>
+      {message && <p aria-live="polite" className="pricing-account-message">{message}</p>}
     </div>;
   }
 
   const sdkSrc = `https://www.paypal.com/sdk/js?client-id=${encodeURIComponent(config.clientId)}&components=buttons&vault=true&intent=subscription&currency=USD`;
   return <div className="pricing-checkout">
+    {canUpgradeFromCancelledMaker && <p className="pricing-checkout-note">Pro starts when PayPal confirms your payment. Your remaining Maker time is not refunded or credited.</p>}
     <Script src={sdkSrc} strategy="afterInteractive" data-cirkitra-paypal-sdk onReady={() => setSdkLoaded(true)} />
     <div className="pricing-paypal-frame">
       <div ref={containerRef} className="pricing-paypal-buttons" aria-label="PayPal subscription checkout" />

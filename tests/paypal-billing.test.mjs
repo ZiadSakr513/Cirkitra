@@ -138,6 +138,32 @@ test("abandoned PayPal checkouts can be retried without blocking paid entitlemen
   assert.match(webhookFunction, /Another paid entitlement is still active/i);
 });
 
+test("a cancelled Maker renewal can move to Pro after verified payment without overlapping renewals", async () => {
+  const [migration, ui, store, confirm, checkout, environmentMigration] = await Promise.all([
+    readFile(file("../supabase/migrations/20261009120000_paypal_maker_to_pro_upgrade.sql"), "utf8"),
+    readFile(file("../app/pricing/paypal-subscription.tsx"), "utf8"),
+    readFile(file("../lib/billing/paypal-store.ts"), "utf8"),
+    readFile(file("../app/api/billing/paypal/confirm/route.ts"), "utf8"),
+    readFile(file("../app/api/billing/paypal/checkout-intent/route.ts"), "utf8"),
+    readFile(file("../supabase/migrations/20261009080000_paypal_environment_isolation.sql"), "utf8"),
+  ]);
+  const checkoutIntentFunction = migration.match(/create or replace function public\.create_paypal_checkout_intent\([\s\S]*?\$\$;/i)?.[0] ?? "";
+  const webhookFunction = migration.match(/create or replace function public\.apply_paypal_webhook_event\([\s\S]*?\$\$;/i)?.[0] ?? "";
+
+  assert.match(checkoutIntentFunction, /subscriptions\.paid_through > v_now/i);
+  assert.match(checkoutIntentFunction, /p_plan_id = 'pro'[\s\S]*subscriptions\.plan_id = 'maker'[\s\S]*subscriptions\.cancellation_requested_at is not null or subscriptions\.status = 'CANCELLED'/i);
+  assert.match(webhookFunction, /v_plan_id = 'pro'[\s\S]*subscriptions\.plan_id = 'maker'[\s\S]*subscriptions\.cancellation_requested_at is not null or subscriptions\.status = 'CANCELLED'/i);
+  assert.match(webhookFunction, /when p_subscription_status = 'CANCELLED' then coalesce\(paypal_subscriptions\.cancellation_requested_at, v_now\)/i);
+  assert.match(environmentMigration, /case when subscriptions\.plan_id = 'pro' then 0 else 1 end/i,
+    "when both paid periods overlap, Pro is selected as the current entitlement");
+  assert.match(store, /renewalCancelled: Boolean\(subscription\.cancellation_requested_at\) \|\| subscription\.status === "CANCELLED"/);
+  assert.match(ui, /status\.renewalCancelled/);
+  assert.match(ui, /Your remaining Maker time is not refunded or credited/);
+  assert.match(ui, /updated\?\.paypalPlanId === verifiedPlanId/);
+  assert.match(confirm, /pending: !payment, planId: configuredPlanId/);
+  assert.match(checkout, /Could not start this checkout\. Please try again shortly\./);
+});
+
 test("pricing checks the Cirkitra session separately and offers an Upgrade sign-in action", async () => {
   const [session, ui, statusRoute, store] = await Promise.all([
     readFile(file("../app/api/auth/session/route.ts"), "utf8"),
