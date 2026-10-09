@@ -176,15 +176,10 @@ export function ProjectsDashboard({ userId, email, displayName }: { userId: stri
     if (!name) return;
     setBusy(true);
     setError("");
-    const currentProject = safeParseCircuitProject(project.project);
-    if (!currentProject.success) {
-      setBusy(false);
-      setError("This project cannot be renamed because its saved circuit data is invalid.");
-      return;
-    }
-    const updatedProject = { ...currentProject.data, id: project.id, name };
     const { error: updateError } = await createClient().from("projects")
-      .update({ name, project: serializeJson(updatedProject), updated_at: new Date().toISOString() })
+      // Renaming is a project-metadata change; don't parse or rewrite its
+      // circuit payload, which may be from an older schema or partially invalid.
+      .update({ name, updated_at: new Date().toISOString() })
       .eq("id", project.id);
     setBusy(false);
     if (updateError) {

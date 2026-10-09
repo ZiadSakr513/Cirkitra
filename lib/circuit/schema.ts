@@ -41,6 +41,7 @@ function addRequiredString(
   key: string,
   path: string,
   issues: ValidationIssue[],
+  options: { allowEmpty?: boolean } = {},
 ): void {
   const value = object[key];
   if (typeof value !== "string") {
@@ -50,7 +51,7 @@ function addRequiredString(
       message: "Expected a string.",
       received: value,
     });
-  } else if (value.trim().length === 0) {
+  } else if (!options.allowEmpty && value.trim().length === 0) {
     issues.push({
       code: "invalid_value",
       path: `${path}.${key}`,
@@ -171,7 +172,9 @@ export function safeParseCircuitProject(
   }
 
   addRequiredString(value, "id", "$", issues);
-  addRequiredString(value, "name", "$", issues);
+  // Titles are editable metadata, so an intentionally blank title must not
+  // make an otherwise valid circuit impossible to open or rename.
+  addRequiredString(value, "name", "$", issues, { allowEmpty: true });
 
   if (typeof value.description !== "string") {
     issues.push({

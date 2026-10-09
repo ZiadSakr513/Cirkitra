@@ -1,8 +1,28 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createDefaultBlinkProject } from "./default-project.ts";
+import { safeParseCircuitProject } from "./schema.ts";
 import { connectFloatingMotorDriverEnables, isPositionOnlyProjectChange, normalizeGroundReturns, removeComponentFromProject, removeComponentsFromProject } from "./project.ts";
 import { COMPONENT_EXAMPLES } from "./component-examples.ts";
+
+test("accepts a blank project title while still validating circuit data", () => {
+  const project = createDefaultBlinkProject();
+  project.name = "";
+
+  assert.equal(safeParseCircuitProject(project).success, true);
+
+  const invalidProject = {
+    ...project,
+    components: project.components.map((component, index) =>
+      index === 0 ? { ...component, x: Number.NaN } : component,
+    ),
+  };
+  const invalidResult = safeParseCircuitProject(invalidProject);
+  assert.equal(invalidResult.success, false);
+  if (!invalidResult.success) {
+    assert.ok(invalidResult.issues.some((issue) => issue.path === "$.components[0].x"));
+  }
+});
 
 test("recognizes a coordinate-only edit without classifying electrical edits as layout", () => {
   const project = createDefaultBlinkProject();

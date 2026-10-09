@@ -25,15 +25,19 @@ export default async function StudioPage({ searchParams }: { searchParams: Promi
   const supabase = createAdminClient();
   const { data, error } = await supabase
     .from("projects")
-    .select("id,project,updated_at")
+    .select("id,name,project,updated_at")
     .eq("owner_id", user.uid)
     .eq("id", params.project)
     .maybeSingle();
   if (error || !data) redirect("/projects");
 
-  const parsed = safeParseCircuitProject(data.project);
+  const projectValue =
+    typeof data.project === "object" && data.project !== null && !Array.isArray(data.project)
+      ? { ...data.project, name: data.name }
+      : data.project;
+  const parsed = safeParseCircuitProject(projectValue);
   if (!parsed.success) redirect("/projects");
-  const project = { ...parsed.data, id: data.id };
+  const project = { ...parsed.data, id: data.id, name: data.name };
 
   return <CircuitStudio key={project.id} initialProject={project} projectUpdatedAt={data.updated_at} userId={user.uid} />;
 }
