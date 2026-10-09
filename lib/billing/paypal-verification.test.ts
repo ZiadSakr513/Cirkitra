@@ -16,7 +16,7 @@ const paidDetails = {
   },
 };
 
-test("PayPal confirmation requires an active subscription and the full USD Maker payment", () => {
+test("PayPal confirmation requires a live paid period and the full USD Maker payment", () => {
   assert.deepEqual(getVerifiedPayPalPaymentPeriod(paidDetails, 1000, now), {
     paidAt: "2026-10-08T11:59:00.000Z",
     paidThrough: "2026-11-08T11:59:00.000Z",
@@ -26,6 +26,14 @@ test("PayPal confirmation requires an active subscription and the full USD Maker
     ...paidDetails,
     billing_info: { ...paidDetails.billing_info, last_payment: { ...paidDetails.billing_info.last_payment, amount: { currency_code: "USD", value: "0.00" } } },
   }, 1000, now), null);
+});
+
+test("a cancelled subscription retains a verified period that was already paid", () => {
+  assert.deepEqual(getVerifiedPayPalPaymentPeriod({ ...paidDetails, status: "CANCELLED" }, 1000, now), {
+    paidAt: "2026-10-08T11:59:00.000Z",
+    paidThrough: "2026-11-08T11:59:00.000Z",
+  });
+  assert.equal(getVerifiedPayPalPaymentPeriod({ ...paidDetails, status: "CANCELLED", billing_info: { ...paidDetails.billing_info, last_payment: null } }, 1000, now), null);
 });
 
 test("PayPal Pro confirmation requires the exact configured $20 USD payment", () => {

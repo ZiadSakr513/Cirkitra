@@ -17,16 +17,17 @@ function moneyToCents(value: string | undefined) {
 }
 
 /**
- * Only return a paid period when PayPal's server API reports an active
- * subscription, a full USD payment, no outstanding balance, and a future
- * billing boundary. Browser approval alone is never enough to grant access.
+ * Only return a paid period when PayPal's server API reports a full USD
+ * payment, no outstanding balance, and a future billing boundary. A cancelled
+ * or expired subscription can still have a paid period in force. Browser
+ * approval alone is never enough to grant access.
  */
 export function getVerifiedPayPalPaymentPeriod(
   details: PayPalPaymentDetails,
   expectedAmountUsdCents: number,
   now = Date.now(),
 ) {
-  if (details.status?.toUpperCase() !== "ACTIVE") return null;
+  if (!["ACTIVE", "CANCELLED", "EXPIRED", "SUSPENDED"].includes(details.status?.toUpperCase() ?? "")) return null;
 
   const billing = details.billing_info;
   const amount = billing?.last_payment?.amount;

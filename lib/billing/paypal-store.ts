@@ -13,6 +13,7 @@ export type AdminPlanGrantSummary = {
 export type PayPalBillingStatus = {
   planId: CirkitraPlanId;
   paypalPlanId: CirkitraPlanId;
+  subscriptionPlanId: CirkitraPlanId;
   complimentaryGrant: AdminPlanGrantSummary | null;
   subscriptionId: string | null;
   subscriptionStatus: string | null;
@@ -85,11 +86,13 @@ export async function getPayPalBillingStatus(userId: string, environment: PayPal
     const rows = subscriptions ?? [];
     const now = Date.now();
     const entitled = rows.find((subscription) => Boolean(subscription.successful_payment_at && subscription.paid_through && Date.parse(subscription.paid_through) > now));
-    const relevant = entitled ?? rows[0];
+    const openSubscription = rows.find((subscription) => ["APPROVAL_PENDING", "APPROVED", "ACTIVE", "SUSPENDED"].includes(subscription.status ?? "") && !subscription.cancellation_requested_at);
+    const relevant = entitled ?? openSubscription ?? rows[0];
     const paypalPlanId: CirkitraPlanId = entitled?.plan_id === "pro" ? "pro" : entitled ? "maker" : "free";
     return {
       planId: paypalPlanId,
       paypalPlanId,
+      subscriptionPlanId: relevant?.plan_id === "maker" || relevant?.plan_id === "pro" ? relevant.plan_id : "free",
       complimentaryGrant: null,
       subscriptionId: relevant?.paypal_subscription_id ?? null,
       subscriptionStatus: relevant?.status ?? null,
@@ -104,14 +107,35 @@ export async function getPayPalBillingStatus(userId: string, environment: PayPal
     && (row.admin_grant_plan_id === "maker" || row.admin_grant_plan_id === "pro")
     ? { planId: row.admin_grant_plan_id, expiresAt: row.admin_grant_expires_at }
     : null;
+  let subscription = {
+    paypal_subscription_id: row.paypal_subscription_id as string | null,
+    plan_id: paypalPlanId,
+    status: row.subscription_status as string | null,
+    paid_through: row.paid_through as string | null,
+    cancellation_requested_at: row.cancellation_requested_at as string | null,
+  };
+  if (paypalPlanId === "free") {
+    const { data: openRows, error: openError } = await createAdminClient()
+      .from("paypal_subscriptions")
+      .select("paypal_subscription_id,plan_id,status,paid_through,cancellation_requested_at")
+      .eq("user_id", userId)
+      .eq("environment", environment)
+      .in("status", ["APPROVAL_PENDING", "APPROVED", "ACTIVE", "SUSPENDED"])
+      .is("cancellation_requested_at", null)
+      .order("updated_at", { ascending: false })
+      .limit(1);
+    if (openError) throw new Error(`Could not read open PayPal subscription: ${openError.message}`);
+    if (openRows?.[0]) subscription = openRows[0];
+  }
   return {
     planId: resolveEffectiveCirkitraPlan(paypalPlanId, complimentaryGrant?.planId ?? null),
     paypalPlanId,
+    subscriptionPlanId: subscription.plan_id === "maker" || subscription.plan_id === "pro" ? subscription.plan_id : "free",
     complimentaryGrant,
-    subscriptionId: row.paypal_subscription_id,
-    subscriptionStatus: row.subscription_status,
-    paidThrough: row.paid_through,
-    canCancel: (row.subscription_status === "ACTIVE" || row.subscription_status === "APPROVED") && !row.cancellation_requested_at,
+    subscriptionId: subscription.paypal_subscription_id,
+    subscriptionStatus: subscription.status,
+    paidThrough: subscription.paid_through,
+    canCancel: (subscription.status === "ACTIVE" || subscription.status === "APPROVED") && !subscription.cancellation_requested_at,
   };
 }
 
@@ -140,6 +164,25 @@ export async function markPayPalSubscriptionCancelled(userId: string, subscripti
     .eq("environment", environment)
     .eq("paypal_subscription_id", subscriptionId);
   if (error) throw new Error(`Could not save PayPal cancellation: ${error.message}`);
+}
+
+export async function markPayPalSubscriptionStatus(
+  userId: string,
+  subscriptionId: string,
+  environment: PayPalEnvironment,
+  status: "CANCELLED" | "EXPIRED",
+) {
+  const now = new Date().toISOString();
+  const updates = status === "CANCELLED"
+    ? { status, cancellation_requested_at: now, updated_at: now }
+    : { status, updated_at: now };
+  const { error } = await createAdminClient()
+    .from("paypal_subscriptions")
+    .update(updates)
+    .eq("user_id", userId)
+    .eq("environment", environment)
+    .eq("paypal_subscription_id", subscriptionId);
+  if (error) throw new Error(`Could not save PayPal subscription status: ${error.message}`);
 }
 
 export async function findPayPalCheckoutIntentForSubscription(subscriptionId: string, environment: PayPalEnvironment): Promise<string | null> {

@@ -83,10 +83,12 @@ test("Live preflight is explicit, read-only, and verifies prices, cadence, and w
 });
 
 test("only authenticated checkout starts an intent; browser approval cannot grant Maker", async () => {
-  const [checkout, ui, confirm, usage, generate] = await Promise.all([
+  const [checkout, ui, confirm, retry, store, usage, generate] = await Promise.all([
     readFile(file("../app/api/billing/paypal/checkout-intent/route.ts"), "utf8"),
     readFile(file("../app/pricing/paypal-subscription.tsx"), "utf8"),
     readFile(file("../app/api/billing/paypal/confirm/route.ts"), "utf8"),
+    readFile(file("../app/api/billing/paypal/retry/route.ts"), "utf8"),
+    readFile(file("../lib/billing/paypal-store.ts"), "utf8"),
     readFile(file("../lib/billing/ai-usage.ts"), "utf8"),
     readFile(file("../app/api/ai/generate/route.ts"), "utf8"),
   ]);
@@ -101,6 +103,11 @@ test("only authenticated checkout starts an intent; browser approval cannot gran
   assert.match(ui, /cirkitra-paypal-pending-subscription/);
   assert.match(ui, /Don’t approve another checkout while this one is being checked/);
   assert.match(ui, /Already approved a payment\? Check it without paying again/);
+  assert.match(ui, /Cancel unpaid attempt & retry/);
+  assert.match(ui, /configured for this site/);
+  assert.doesNotMatch(ui, /PayPal Sandbox Activity/);
+  assert.match(store, /subscriptionPlanId/);
+  assert.match(store, /\.in\("status", \["APPROVAL_PENDING", "APPROVED", "ACTIVE", "SUSPENDED"\]\)/);
   assert.match(ui, /Verify existing payment/);
   assert.match(confirm, /authenticateAiRequest\(request\)/);
   assert.match(confirm, /isSameOriginRequest\(request\)/);
@@ -110,6 +117,14 @@ test("only authenticated checkout starts an intent; browser approval cannot gran
   assert.match(confirm, /intent\.planId !== configuredPlanId/);
   assert.match(confirm, /getVerifiedPayPalPaymentPeriod\(details, CIRKITRA_PLANS\[configuredPlanId\]\.priceUsdCents\)/);
   assert.match(confirm, /applyPayPalWebhookEvent\(/);
+  assert.match(retry, /authenticateAiRequest\(request\)/);
+  assert.match(retry, /isSameOriginRequest\(request\)/);
+  assert.match(retry, /getPayPalSubscription\(config, subscriptionId\)/);
+  assert.match(retry, /getVerifiedPayPalPaymentPeriod/);
+  assert.match(retry, /cancelPayPalSubscription\(config, subscriptionId\)/);
+  assert.match(retry, /PAYMENT_ALREADY_CONFIRMED/);
+  assert.match(retry, /PAYMENT_REVIEW_REQUIRED/);
+  assert.match(retry, /retryAvailable: true/);
   assert.match(usage, /billingEnabled \? getUserPlan\(userId\) : getComplimentaryPlan\(userId\)/);
   assert.match(usage, /getActiveAdminPlanGrantPlanId/);
   assert.match(generate, /CIRKITRA_PLANS\.pro\.monthlyAiRequests/);

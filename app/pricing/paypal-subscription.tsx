@@ -13,6 +13,7 @@ import { syncFirebaseSession } from "../../lib/firebase/session-client";
 type BillingStatus = {
   planId: "free" | "maker" | "pro";
   paypalPlanId: "free" | "maker" | "pro";
+  subscriptionPlanId: "free" | "maker" | "pro";
   complimentaryGrant: { planId: "maker" | "pro"; expiresAt: string | null } | null;
   subscriptionId: string | null;
   subscriptionStatus: string | null;
@@ -58,7 +59,7 @@ function ExistingPaymentRecovery({ onVerify, busy, amount }: { onVerify: (subscr
   const [subscriptionId, setSubscriptionId] = useState("");
   return <details className="pricing-payment-recovery">
     <summary>Already approved a payment? Check it without paying again</summary>
-    <p>In PayPal Sandbox Activity, open the completed {amount} recurring-payment row and copy its subscription ID (starts with I-).</p>
+    <p>In your PayPal account, open the matching {amount} subscription or payment and copy its subscription ID (starts with I-). This checks the PayPal environment configured for this site and does not start a payment.</p>
     <form className="pricing-payment-recovery-form" onSubmit={(event) => { event.preventDefault(); onVerify(subscriptionId.trim()); }}>
       <label htmlFor="paypal-existing-subscription-id">PayPal subscription ID</label>
       <input id="paypal-existing-subscription-id" className="pricing-payment-recovery-input" value={subscriptionId} onChange={(event) => setSubscriptionId(event.target.value)} autoComplete="off" spellCheck={false} placeholder="I-…" required />
@@ -135,6 +136,7 @@ export function PayPalSubscription({ config, planId }: { config: PayPalPublicCon
   const confirmPayPalSubscription = useCallback(async (subscriptionId: string, retryBriefly = false) => {
     if (!subscriptionId) {
       setMessage("PayPal did not return a subscription ID. Do not start another checkout; refresh this page and check your subscription again.");
+      setApprovalPending(false);
       return;
     }
     setApprovalPending(true);
@@ -174,6 +176,7 @@ export function PayPalSubscription({ config, planId }: { config: PayPalPublicCon
       }
     } finally {
       setConfirmationBusy(false);
+      setApprovalPending(false);
     }
   }, [refreshStatus]);
 
@@ -303,14 +306,54 @@ export function PayPalSubscription({ config, planId }: { config: PayPalPublicCon
     }
   }
 
+  async function cancelUnpaidAttemptAndRetry() {
+    const pendingPlanName = status?.subscriptionPlanId === "maker" || status?.subscriptionPlanId === "pro"
+      ? CIRKITRA_PLANS[status.subscriptionPlanId].name
+      : plan.name;
+    if (!window.confirm(`Cancel the unresolved ${pendingPlanName} PayPal attempt and prepare a fresh checkout? Cirkitra will first check PayPal for a completed payment. If one exists, it will sync that payment instead of starting another. This action does not refund any payment already processed.`)) return;
+    setBusy(true);
+    setMessage("");
+    try {
+      const response = await fetch("/api/billing/paypal/retry", { method: "POST", cache: "no-store" });
+      const result = await response.json() as { retryAvailable?: boolean; error?: { code?: string; message?: string } };
+      if (result.error?.code === "PAYMENT_ALREADY_CONFIRMED") {
+        await refreshStatus();
+        setMessage("PayPal confirmed the existing payment. Your plan status has been updated; no second checkout was started.");
+        return;
+      }
+      if (!response.ok || !result.retryAvailable) throw new Error(result.error?.message || "PayPal has not confirmed that it is safe to retry yet.");
+      window.sessionStorage.removeItem("cirkitra-paypal-pending-subscription");
+      setApprovedSubscriptionId("");
+      setApprovalPending(false);
+      setCheckoutReady(false);
+      const updated = await refreshStatus();
+      const anotherAttemptIsOpen = Boolean(updated && ["APPROVAL_PENDING", "APPROVED", "ACTIVE", "SUSPENDED"].includes(updated.subscriptionStatus ?? ""));
+      if (anotherAttemptIsOpen && updated) {
+        const otherPlanName = updated.subscriptionPlanId === "maker" || updated.subscriptionPlanId === "pro"
+          ? CIRKITRA_PLANS[updated.subscriptionPlanId].name
+          : "another";
+        setMessage(`That unpaid attempt was cancelled, but ${otherPlanName} PayPal attempt is still unresolved. Resolve it before starting a new checkout.`);
+      } else if (updated) {
+        setMessage("The unpaid PayPal attempt was cancelled. You can now start a fresh checkout.");
+      } else {
+        setMessage("PayPal cancelled the old attempt, but Cirkitra could not refresh your status. Refresh the page before starting checkout.");
+      }
+    } catch (error) {
+      await refreshStatus();
+      setMessage(error instanceof Error ? error.message : "Could not safely restart this PayPal attempt.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   if (authLoading) return <div className="pricing-checkout-note">Checking your Cirkitra account…</div>;
   if (accountError) return <div className="pricing-account-status"><p className="pricing-account-message" role="alert">{accountError} Refresh this page to try again.</p></div>;
   if (!signedIn) {
-    if (!config) return <div className="pricing-checkout-note">PayPal sandbox checkout isn’t configured yet. Cirkitra remains free, and no payment details are collected.</div>;
+    if (!config) return <div className="pricing-checkout-note">PayPal checkout is not configured yet. Cirkitra remains free, and no payment details are collected.</div>;
     if (!paypalPlanId) return <div className="pricing-account-status"><p className="pricing-account-message">{plan.name} checkout is being configured. No payment can be started yet.</p><button className="landing-button pricing-action pricing-action-disabled" type="button" disabled>{plan.name} unavailable</button></div>;
     return <div className="pricing-checkout-note"><Link className="landing-button pricing-action" href="/auth?next=%2Fpricing">Upgrade <span aria-hidden="true">→</span></Link>{config.environment === "sandbox" && <p className="pricing-account-subtle">Sign in to continue. Sandbox checkout only; no live charge.</p>}</div>;
   }
-  const hasOpenPayPalSubscription = Boolean(status && ["APPROVAL_PENDING", "APPROVED", "ACTIVE"].includes(status.subscriptionStatus ?? ""));
+  const hasOpenPayPalSubscription = Boolean(status && ["APPROVAL_PENDING", "APPROVED", "ACTIVE", "SUSPENDED"].includes(status.subscriptionStatus ?? ""));
   const grantCanRaisePlan = Boolean(status?.complimentaryGrant && (
     status.paypalPlanId === "free"
     || (status.complimentaryGrant.planId === "pro" && status.paypalPlanId === "maker")
@@ -345,16 +388,24 @@ export function PayPalSubscription({ config, planId }: { config: PayPalPublicCon
   if (!status && !checkoutReady) {
     return <div className="pricing-account-status"><p className="pricing-account-message" role="alert">Could not load your subscription status. Refresh this page to try again.</p></div>;
   }
-  if (status?.subscriptionStatus === "APPROVAL_PENDING" || status?.subscriptionStatus === "APPROVED" || status?.subscriptionStatus === "ACTIVE") {
+  if (status?.subscriptionStatus === "APPROVAL_PENDING" || status?.subscriptionStatus === "APPROVED" || status?.subscriptionStatus === "ACTIVE" || status?.subscriptionStatus === "SUSPENDED") {
+    const pendingPlanId = status.subscriptionPlanId === "maker" || status.subscriptionPlanId === "pro" ? status.subscriptionPlanId : null;
+    const pendingPlanName = pendingPlanId ? CIRKITRA_PLANS[pendingPlanId].name : "paid";
+    const isPendingPlan = pendingPlanId === planId;
     return <div className="pricing-account-status">
-      <p className="pricing-account-message">PayPal has an open subscription. Waiting for its verified payment confirmation; don’t start another checkout.</p>
-      {status.subscriptionId && <button className="landing-button pricing-action" type="button" disabled={confirmationBusy} onClick={() => void confirmPayPalSubscription(status.subscriptionId!)}>{confirmationBusy ? "Checking PayPal…" : "Check payment status"}</button>}
-      {status.canCancel && <button className="landing-button pricing-cancel-button" type="button" disabled={busy} onClick={() => void cancelSubscription()}>{busy ? "Cancelling…" : "Cancel subscription"}</button>}
+      <p className="pricing-account-message">{isPendingPlan
+        ? `Your ${pendingPlanName} PayPal attempt is waiting for payment confirmation.`
+        : `A ${pendingPlanName} PayPal attempt is still unresolved. Resolve it before starting ${plan.name}.`}</p>
+      {isPendingPlan && status.subscriptionId && <>
+        <button className="landing-button pricing-action" type="button" disabled={confirmationBusy || busy} onClick={() => void confirmPayPalSubscription(status.subscriptionId!)}>{confirmationBusy ? "Checking PayPal…" : "Check payment status"}</button>
+        <button className="landing-button pricing-cancel-button" type="button" disabled={confirmationBusy || busy} onClick={() => void cancelUnpaidAttemptAndRetry()}>{busy ? "Checking and cancelling…" : "Cancel unpaid attempt & retry"}</button>
+        <ExistingPaymentRecovery onVerify={(id) => void confirmPayPalSubscription(id, true)} busy={confirmationBusy || busy} amount={`${formatMonthlyPrice(pendingPlanId ? CIRKITRA_PLANS[pendingPlanId].priceUsdCents : plan.priceUsdCents)} USD`} />
+      </>}
       {message && <p aria-live="polite" className="pricing-account-subtle">{message}</p>}
     </div>;
   }
 
-  if (!config) return <div className="pricing-checkout-note">PayPal sandbox checkout isn’t configured yet. Your current complimentary plan remains active, and no payment details are collected.</div>;
+  if (!config) return <div className="pricing-checkout-note">PayPal checkout is not configured yet. Your current complimentary plan remains active, and no payment details are collected.</div>;
 
   if (!paypalPlanId) {
     return <div className="pricing-account-status">
@@ -368,6 +419,7 @@ export function PayPalSubscription({ config, planId }: { config: PayPalPublicCon
       <button className="landing-button pricing-action" type="button" onClick={() => setCheckoutReady(true)}>Choose {plan.name} <span aria-hidden="true">→</span></button>
       {config.environment === "sandbox" && <p className="pricing-account-subtle">Sandbox test checkout. It does not charge a live PayPal account.</p>}
       <ExistingPaymentRecovery onVerify={(id) => void confirmPayPalSubscription(id, true)} busy={confirmationBusy} amount={amount} />
+      {message && <p aria-live="polite" className="pricing-account-subtle">{message}</p>}
     </div>;
   }
 
