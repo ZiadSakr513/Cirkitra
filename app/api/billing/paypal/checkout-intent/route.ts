@@ -51,10 +51,10 @@ export async function POST(request: Request) {
       return Response.json({ error: { code: "PAID_PLAN_ACTIVE", message: "Your current paid plan is still active. You can choose another plan after its paid-through date; no second subscription was started." } }, { status: 409, headers: { "Cache-Control": "no-store" } });
     }
     if (error instanceof Error && error.message === "OPEN_SUBSCRIPTION_EXISTS") {
-      return Response.json({ error: { code: "OPEN_SUBSCRIPTION_EXISTS", message: "A PayPal subscription is already open for this account. Check or cancel that subscription before starting another checkout." } }, { status: 409, headers: { "Cache-Control": "no-store" } });
+      return Response.json({ error: { code: "CHECKOUT_UNAVAILABLE", message: "Could not start checkout. Please try again." } }, { status: 409, headers: { "Cache-Control": "no-store" } });
     }
     if (error instanceof Error && error.message === "CHECKOUT_IN_PROGRESS") {
-      return Response.json({ error: { code: "CHECKOUT_IN_PROGRESS", message: "A checkout is already in progress for this account. Finish or close it before choosing a different plan." } }, { status: 409, headers: { "Cache-Control": "no-store" } });
+      return Response.json({ error: { code: "CHECKOUT_UNAVAILABLE", message: "Could not start checkout. Please try again." } }, { status: 409, headers: { "Cache-Control": "no-store" } });
     }
     if (isMissingPayPalBillingSchema(error)) {
       return Response.json({ error: { code: "BILLING_SETUP_REQUIRED", message: "PayPal billing storage is not set up in Supabase yet." } }, { status: 503, headers: { "Cache-Control": "no-store" } });

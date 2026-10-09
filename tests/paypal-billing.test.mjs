@@ -83,11 +83,10 @@ test("Live preflight is explicit, read-only, and verifies prices, cadence, and w
 });
 
 test("only authenticated checkout starts an intent; browser approval cannot grant Maker", async () => {
-  const [checkout, ui, confirm, retry, store, usage, generate] = await Promise.all([
+  const [checkout, ui, confirm, store, usage, generate] = await Promise.all([
     readFile(file("../app/api/billing/paypal/checkout-intent/route.ts"), "utf8"),
     readFile(file("../app/pricing/paypal-subscription.tsx"), "utf8"),
     readFile(file("../app/api/billing/paypal/confirm/route.ts"), "utf8"),
-    readFile(file("../app/api/billing/paypal/retry/route.ts"), "utf8"),
     readFile(file("../lib/billing/paypal-store.ts"), "utf8"),
     readFile(file("../lib/billing/ai-usage.ts"), "utf8"),
     readFile(file("../app/api/ai/generate/route.ts"), "utf8"),
@@ -97,18 +96,17 @@ test("only authenticated checkout starts an intent; browser approval cannot gran
   assert.match(checkout, /body\.planId !== "maker" && body\.planId !== "pro"/);
   assert.match(checkout, /createPayPalCheckoutIntent\(userId, planId, config\.environment\)/);
   assert.match(checkout, /getConfiguredPayPalPlanId\(config\.planIds, planId\)/);
+  assert.doesNotMatch(checkout, /Check or cancel that subscription|Finish or close it before choosing/i);
   assert.match(ui, /custom_id: result\.intentId/);
   assert.match(ui, /onApprove: async \(data\) =>/);
-  assert.match(ui, /Verifying the payment directly with PayPal/);
   assert.match(ui, /cirkitra-paypal-pending-subscription/);
-  assert.match(ui, /Don’t approve another checkout while this one is being checked/);
-  assert.match(ui, /Already approved a payment\? Check it without paying again/);
-  assert.match(ui, /Cancel unpaid attempt & retry/);
-  assert.match(ui, /configured for this site/);
+  assert.match(ui, /onCancel: \(\) =>/);
+  assert.match(ui, /setCheckoutReady\(false\)/);
+  assert.match(ui, /type="button" onClick=\{\(\) => setCheckoutReady\(true\)\}>Upgrade/);
+  assert.doesNotMatch(ui, /Cancel unpaid attempt|Check payment status|Already approved a payment|unresolved|open subscription/i);
   assert.doesNotMatch(ui, /PayPal Sandbox Activity/);
   assert.match(store, /subscriptionPlanId/);
   assert.match(store, /\.in\("status", \["APPROVAL_PENDING", "APPROVED", "ACTIVE", "SUSPENDED"\]\)/);
-  assert.match(ui, /Verify existing payment/);
   assert.match(confirm, /authenticateAiRequest\(request\)/);
   assert.match(confirm, /isSameOriginRequest\(request\)/);
   assert.match(confirm, /getPayPalSubscription\(config, subscriptionId\)/);
@@ -117,14 +115,6 @@ test("only authenticated checkout starts an intent; browser approval cannot gran
   assert.match(confirm, /intent\.planId !== configuredPlanId/);
   assert.match(confirm, /getVerifiedPayPalPaymentPeriod\(details, CIRKITRA_PLANS\[configuredPlanId\]\.priceUsdCents\)/);
   assert.match(confirm, /applyPayPalWebhookEvent\(/);
-  assert.match(retry, /authenticateAiRequest\(request\)/);
-  assert.match(retry, /isSameOriginRequest\(request\)/);
-  assert.match(retry, /getPayPalSubscription\(config, subscriptionId\)/);
-  assert.match(retry, /getVerifiedPayPalPaymentPeriod/);
-  assert.match(retry, /cancelPayPalSubscription\(config, subscriptionId\)/);
-  assert.match(retry, /PAYMENT_ALREADY_CONFIRMED/);
-  assert.match(retry, /PAYMENT_REVIEW_REQUIRED/);
-  assert.match(retry, /retryAvailable: true/);
   assert.match(usage, /billingEnabled \? getUserPlan\(userId\) : getComplimentaryPlan\(userId\)/);
   assert.match(usage, /getActiveAdminPlanGrantPlanId/);
   assert.match(generate, /CIRKITRA_PLANS\.pro\.monthlyAiRequests/);
@@ -132,6 +122,20 @@ test("only authenticated checkout starts an intent; browser approval cannot gran
   assert.doesNotMatch(generate, /paid plans are not available yet/);
   assert.equal((usage.match(/await getUsagePlan\(userId, billingEnabled, unlimited\)/g) ?? []).length, 2,
     "use the grant-only lookup when PayPal is disabled, and skip entitlement lookups for the configured owner");
+});
+
+test("abandoned PayPal checkouts can be retried without blocking paid entitlements", async () => {
+  const migration = await readFile(file("../supabase/migrations/20261009100000_paypal_checkout_retries.sql"), "utf8");
+  const checkoutIntentFunction = migration.match(/create or replace function public\.create_paypal_checkout_intent\([\s\S]*?\$\$;/i)?.[0] ?? "";
+  const webhookFunction = migration.match(/create or replace function public\.apply_paypal_webhook_event\([\s\S]*?\$\$;/i)?.[0] ?? "";
+
+  assert.ok(checkoutIntentFunction, "the migration replaces the checkout-intent function");
+  assert.ok(webhookFunction, "the migration replaces the webhook event function");
+  assert.match(checkoutIntentFunction, /Every click gets a new intent/i);
+  assert.match(checkoutIntentFunction, /subscriptions\.successful_payment_at is not null[\s\S]*subscriptions\.paid_through > v_now/i);
+  assert.doesNotMatch(checkoutIntentFunction, /open PayPal subscription|checkout is already in progress/i);
+  assert.doesNotMatch(webhookFunction, /Another paid plan or PayPal subscription is already active|subscriptions\.status in \('APPROVAL_PENDING', 'APPROVED', 'ACTIVE', 'SUSPENDED'\)/i);
+  assert.match(webhookFunction, /Another paid entitlement is still active/i);
 });
 
 test("pricing checks the Cirkitra session separately and offers an Upgrade sign-in action", async () => {
@@ -148,9 +152,7 @@ test("pricing checks the Cirkitra session separately and offers an Upgrade sign-
   assert.match(ui, /await auth\.authStateReady\(\)/);
   assert.match(ui, /await syncFirebaseSession\(user, true\)/);
   assert.match(ui, /href="\/auth\?next=%2Fpricing">Upgrade/);
-  assert.match(ui, /if \(billingError\)[\s\S]*Checkout unavailable/);
-  assert.match(ui, /Could not load your subscription status/);
-  assert.match(ui, /20261005040000_paypal_subscriptions\.sql, 20261009040000_paypal_multi_tier\.sql, 20261009050000_admin_plan_grants\.sql, 20261009080000_paypal_environment_isolation\.sql/);
+  assert.doesNotMatch(ui, /billingError|Checkout unavailable|Could not load your subscription status/);
   assert.doesNotMatch(ui, />Retry</);
   assert.match(statusRoute, /BILLING_SETUP_REQUIRED/);
   assert.match(store, /isMissingPayPalBillingSchema/);
