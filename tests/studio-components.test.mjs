@@ -183,7 +183,7 @@ test("Gemini generation defaults to supported Flash-Lite and is sent with prompt
   assert.match(source, /AI CIRCUIT BUILDER/);
   assert.match(source, /GENERAL AI CHAT/);
   assert.match(source, /Chat doesn’t use circuit requests\./);
-  assert.match(source, /"gemini-3\.5-flash-lite": "Gemini 3\.5 Flash-Lite"/);
+  assert.match(source, /"gemini-3\.5-flash-lite": "Autopilot"/);
   assert.doesNotMatch(source, />\s*GEMINI CIRCUIT PLANNER/);
   assert.doesNotMatch(source, /sent to Gemini|Gemini generation failed/);
   assert.doesNotMatch(source, /AI-generated circuits only/);
