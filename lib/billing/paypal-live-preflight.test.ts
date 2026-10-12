@@ -70,14 +70,15 @@ function validPlan(id: string, value: string): PayPalLivePlan {
 }
 
 test("Live plan validation requires the configured active monthly USD amount and no upfront charge", () => {
-  const maker = validPlan("maker-live", "10.00");
-  validatePayPalLivePlan(maker, "maker-live", 1_000, "Maker");
-  assert.throws(() => validatePayPalLivePlan({ ...maker, status: "INACTIVE" }, "maker-live", 1_000, "Maker"), /not ACTIVE/);
-  assert.throws(() => validatePayPalLivePlan(validPlan("maker-live", "10.01"), "maker-live", 1_000, "Maker"), /priced at/);
-  assert.throws(() => validatePayPalLivePlan({ ...maker, billing_cycles: [{ ...maker.billing_cycles![0], frequency: { interval_unit: "YEAR", interval_count: 1 } }] }, "maker-live", 1_000, "Maker"), /every one month/);
-  assert.throws(() => validatePayPalLivePlan({ ...maker, billing_cycles: [{ ...maker.billing_cycles![0], pricing_scheme: { fixed_price: { currency_code: "EUR", value: "10.00" } } }] }, "maker-live", 1_000, "Maker"), /USD monthly amount/);
-  assert.throws(() => validatePayPalLivePlan({ ...maker, billing_cycles: [{ ...maker.billing_cycles![0], tenure_type: "TRIAL" }] }, "maker-live", 1_000, "Maker"), /no trial/);
-  assert.throws(() => validatePayPalLivePlan({ ...maker, payment_preferences: { setup_fee: { currency_code: "USD", value: "1.00" } } }, "maker-live", 1_000, "Maker"), /setup fee/);
+  const maker = validPlan("maker-live", "5.00");
+  validatePayPalLivePlan(maker, "maker-live", 500, "Maker");
+  assert.throws(() => validatePayPalLivePlan({ ...maker, status: "INACTIVE" }, "maker-live", 500, "Maker"), /not ACTIVE/);
+  assert.throws(() => validatePayPalLivePlan(validPlan("maker-live", "5.01"), "maker-live", 500, "Maker"), /priced at/);
+  assert.throws(() => validatePayPalLivePlan(validPlan("maker-live", "10.00"), "maker-live", 500, "Maker"), /priced at/);
+  assert.throws(() => validatePayPalLivePlan({ ...maker, billing_cycles: [{ ...maker.billing_cycles![0], frequency: { interval_unit: "YEAR", interval_count: 1 } }] }, "maker-live", 500, "Maker"), /every one month/);
+  assert.throws(() => validatePayPalLivePlan({ ...maker, billing_cycles: [{ ...maker.billing_cycles![0], pricing_scheme: { fixed_price: { currency_code: "EUR", value: "5.00" } } }] }, "maker-live", 500, "Maker"), /USD monthly amount/);
+  assert.throws(() => validatePayPalLivePlan({ ...maker, billing_cycles: [{ ...maker.billing_cycles![0], tenure_type: "TRIAL" }] }, "maker-live", 500, "Maker"), /no trial/);
+  assert.throws(() => validatePayPalLivePlan({ ...maker, payment_preferences: { setup_fee: { currency_code: "USD", value: "1.00" } } }, "maker-live", 500, "Maker"), /setup fee/);
 });
 
 test("Live preflight performs only OAuth and read-only plan/webhook checks", async () => {
@@ -87,8 +88,8 @@ test("Live preflight performs only OAuth and read-only plan/webhook checks", asy
     const method = init?.method ?? "GET";
     calls.push({ url, method });
     if (url.endsWith("/v1/oauth2/token")) return Response.json({ access_token: "test-token" });
-    if (url.endsWith("/v1/billing/plans/maker-live")) return Response.json(validPlan("maker-live", "10.00"));
-    if (url.endsWith("/v1/billing/plans/pro-live")) return Response.json(validPlan("pro-live", "20.00"));
+    if (url.endsWith("/v1/billing/plans/maker-live")) return Response.json(validPlan("maker-live", "5.00"));
+    if (url.endsWith("/v1/billing/plans/pro-live")) return Response.json(validPlan("pro-live", "10.00"));
     if (url.endsWith("/v1/notifications/webhooks/webhook-live")) {
       return Response.json({
         id: "webhook-live",
@@ -108,6 +109,10 @@ test("Live preflight performs only OAuth and read-only plan/webhook checks", asy
     fetchImpl,
   });
   assert.equal(result.plans.length, 2);
+  assert.deepEqual(result.plans.map(({ plan, monthlyUsd }) => ({ plan, monthlyUsd })), [
+    { plan: "maker", monthlyUsd: 5 },
+    { plan: "pro", monthlyUsd: 10 },
+  ]);
   assert.equal(result.webhook.url, "https://cirkitra.example/api/billing/paypal/webhook");
   assert.equal(calls.length, 4);
   assert.deepEqual(calls.map((call) => call.method), ["POST", "GET", "GET", "GET"]);
@@ -120,8 +125,8 @@ test("Live preflight rejects duplicate tiers and incomplete webhook configuratio
   const fetchImpl: typeof fetch = async (input) => {
     const url = String(input);
     if (url.endsWith("/v1/oauth2/token")) return Response.json({ access_token: "test-token" });
-    if (url.endsWith("/v1/billing/plans/maker-live")) return Response.json(validPlan("maker-live", "10.00"));
-    if (url.endsWith("/v1/billing/plans/pro-live")) return Response.json(validPlan("pro-live", "20.00"));
+    if (url.endsWith("/v1/billing/plans/maker-live")) return Response.json(validPlan("maker-live", "5.00"));
+    if (url.endsWith("/v1/billing/plans/pro-live")) return Response.json(validPlan("pro-live", "10.00"));
     return Response.json({ id: "webhook-live", url: "http://localhost/api/billing/paypal/webhook", event_types: [] });
   };
   await assert.rejects(runPayPalLivePreflight({ clientId: "id", clientSecret: "secret", makerPlanId: "maker-live", proPlanId: "pro-live", webhookId: "webhook-live", fetchImpl }), /must use HTTPS/);

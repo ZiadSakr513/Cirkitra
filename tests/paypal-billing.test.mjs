@@ -20,10 +20,10 @@ test("PayPal is sandbox-first and all server credentials stay server-only", asyn
   assert.match(configCore, /CIRKITRA_PAYPAL_LIVE_BILLING_CONFIRMED/);
   assert.match(config, /resolvePayPalConfigValues\(process\.env\)/);
   assert.match(config, /getPayPalEnvironment/);
-  assert.match(plans, /priceUsdCents: 1000/);
+  assert.match(plans, /priceUsdCents: 500/);
   assert.match(plans, /monthlyAiRequests: 50/);
   assert.match(plans, /monthlyAiRequests: 5/);
-  assert.match(plans, /priceUsdCents: 2000/);
+  assert.match(plans, /priceUsdCents: 1000/);
   assert.match(plans, /monthlyAiRequests: 200/);
 });
 
@@ -113,7 +113,7 @@ test("only authenticated checkout starts an intent; browser approval cannot gran
   assert.match(confirm, /identifyCirkitraPlanId\(config\.planIds, details\.plan_id\)/);
   assert.match(confirm, /intent\.userId !== userId/);
   assert.match(confirm, /intent\.planId !== configuredPlanId/);
-  assert.match(confirm, /getVerifiedPayPalPaymentPeriod\(details, CIRKITRA_PLANS\[configuredPlanId\]\.priceUsdCents\)/);
+  assert.match(confirm, /getVerifiedPayPalPlanPaymentPeriod\(details, configuredPlanId\)/);
   assert.match(confirm, /applyPayPalWebhookEvent\(/);
   assert.match(usage, /billingEnabled \? getUserPlan\(userId\) : getComplimentaryPlan\(userId\)/);
   assert.match(usage, /getActiveAdminPlanGrantPlanId/);
@@ -195,7 +195,7 @@ test("webhook signature, plan identity, and database idempotency gate paid acces
   assert.match(webhook, /readBoundedText\(request, 1_000_000\)/);
   assert.match(webhook, /event\s*=\s*JSON\.parse\(rawBody\)/);
   assert.match(webhook, /identifyCirkitraPlanId\(config\.planIds, details\.plan_id\)/);
-  assert.match(webhook, /getVerifiedPayPalPaymentPeriod\(details, CIRKITRA_PLANS\[planId\]\.priceUsdCents\)/);
+  assert.match(webhook, /getVerifiedPayPalPlanPaymentPeriod\(details, planId\)/);
   assert.match(migration, /add column if not exists plan_id text/i);
   assert.match(migration, /set plan_id = coalesce\(intents\.plan_id, 'maker'\)/i);
   assert.match(migration, /p_plan_id not in \('maker', 'pro'\)/i);

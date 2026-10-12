@@ -3,8 +3,7 @@ import { cancelPayPalSubscription, getPayPalSubscription } from "../../../../../
 import { getPayPalServerConfig } from "../../../../../lib/billing/paypal-config";
 import { applyPayPalWebhookEvent, findPayPalCheckoutIntentForSubscription, getPayPalBillingStatus, getPayPalCheckoutIntent, markPayPalSubscriptionStatus } from "../../../../../lib/billing/paypal-store";
 import { identifyCirkitraPlanId } from "../../../../../lib/billing/paypal-plan-mapping";
-import { CIRKITRA_PLANS } from "../../../../../lib/billing/plans";
-import { getVerifiedPayPalPaymentPeriod } from "../../../../../lib/billing/paypal-verification";
+import { getVerifiedPayPalPlanPaymentPeriod } from "../../../../../lib/billing/paypal-verification";
 import { isSameOriginRequest } from "../../../../../lib/auth/request-origin";
 import { isSupabaseAdminConfigured } from "../../../../../lib/supabase/admin";
 
@@ -76,7 +75,7 @@ export async function POST(request: Request) {
     }
 
     const applyVerifiedPayment = async (paymentDetails: typeof details) => {
-      const payment = getVerifiedPayPalPaymentPeriod(paymentDetails, CIRKITRA_PLANS[planId].priceUsdCents);
+      const payment = getVerifiedPayPalPlanPaymentPeriod(paymentDetails, planId);
       if (!payment) return false;
       await applyPayPalWebhookEvent({
         environment: config.environment,

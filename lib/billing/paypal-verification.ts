@@ -1,3 +1,5 @@
+import { CIRKITRA_PLANS, type PaidCirkitraPlanId } from "./plans.ts";
+
 export type PayPalPaymentDetails = {
   status?: string;
   billing_info?: {
@@ -46,4 +48,18 @@ export function getVerifiedPayPalPaymentPeriod(
     paidAt: new Date(paidAtMs).toISOString(),
     paidThrough: new Date(paidThroughMs).toISOString(),
   };
+}
+
+// PayPal can retain the old rate for an existing subscription's next cycle.
+// Keep previously paid periods valid; these values never set checkout pricing.
+const previousPriceUsdCents: Record<PaidCirkitraPlanId, number> = { maker: 1000, pro: 2000 };
+
+/** Call only after the authenticated PayPal plan ID and checkout owner match. */
+export function getVerifiedPayPalPlanPaymentPeriod(
+  details: PayPalPaymentDetails,
+  planId: PaidCirkitraPlanId,
+  now = Date.now(),
+) {
+  return getVerifiedPayPalPaymentPeriod(details, CIRKITRA_PLANS[planId].priceUsdCents, now)
+    ?? getVerifiedPayPalPaymentPeriod(details, previousPriceUsdCents[planId], now);
 }

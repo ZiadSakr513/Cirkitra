@@ -2,8 +2,7 @@ import { getPayPalSubscription, verifyPayPalWebhook } from "../../../../../lib/b
 import { getPayPalServerConfig } from "../../../../../lib/billing/paypal-config";
 import { applyPayPalWebhookEvent, findPayPalCheckoutIntentForSubscription, getPayPalCheckoutIntent } from "../../../../../lib/billing/paypal-store";
 import { identifyCirkitraPlanId } from "../../../../../lib/billing/paypal-plan-mapping";
-import { CIRKITRA_PLANS } from "../../../../../lib/billing/plans";
-import { getVerifiedPayPalPaymentPeriod } from "../../../../../lib/billing/paypal-verification";
+import { getVerifiedPayPalPlanPaymentPeriod } from "../../../../../lib/billing/paypal-verification";
 import { isSupabaseAdminConfigured } from "../../../../../lib/supabase/admin";
 import { readBoundedText } from "../../../../../lib/http/bounded-json.ts";
 
@@ -96,7 +95,7 @@ export async function POST(request: Request) {
     const paymentSucceeded = eventType === "PAYMENT.SALE.COMPLETED";
     const revokeEntitlement = eventType === "PAYMENT.SALE.REFUNDED" || eventType === "PAYMENT.SALE.REVERSED";
     const payment = paymentSucceeded
-      ? getVerifiedPayPalPaymentPeriod(details, CIRKITRA_PLANS[planId].priceUsdCents)
+      ? getVerifiedPayPalPlanPaymentPeriod(details, planId)
       : null;
     if (paymentSucceeded && !payment) {
       throw new Error(`PayPal payment did not match the verified ${planId} amount or paid-through period.`);

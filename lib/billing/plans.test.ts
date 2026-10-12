@@ -7,12 +7,12 @@ import { isHigherCirkitraPlan, resolveEffectiveCirkitraPlan } from "./plan-entit
 test("Free, Maker, and Pro allowances and USD prices are explicit", () => {
   assert.equal(CIRKITRA_PLANS.free.priceUsdCents, 0);
   assert.equal(CIRKITRA_PLANS.free.monthlyAiRequests, 5);
-  assert.equal(CIRKITRA_PLANS.maker.priceUsdCents, 1000);
+  assert.equal(CIRKITRA_PLANS.maker.priceUsdCents, 500);
   assert.equal(CIRKITRA_PLANS.maker.monthlyAiRequests, 50);
-  assert.equal(CIRKITRA_PLANS.pro.priceUsdCents, 2000);
+  assert.equal(CIRKITRA_PLANS.pro.priceUsdCents, 1000);
   assert.equal(CIRKITRA_PLANS.pro.monthlyAiRequests, 200);
-  assert.equal(formatMonthlyPrice(CIRKITRA_PLANS.maker.priceUsdCents), "$10");
-  assert.equal(formatMonthlyPrice(CIRKITRA_PLANS.pro.priceUsdCents), "$20");
+  assert.equal(formatMonthlyPrice(CIRKITRA_PLANS.maker.priceUsdCents), "$5");
+  assert.equal(formatMonthlyPrice(CIRKITRA_PLANS.pro.priceUsdCents), "$10");
   assert.equal(formatMonthlyPrice(599), "$5.99");
 });
 

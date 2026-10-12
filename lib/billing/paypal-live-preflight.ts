@@ -1,3 +1,5 @@
+import { CIRKITRA_PLANS } from "./plans.ts";
+
 export type PayPalLivePlan = {
   id?: unknown;
   status?: unknown;
@@ -143,14 +145,14 @@ export async function runPayPalLivePreflight(input: PayPalLivePreflightInput) {
     getJson<PayPalLiveWebhook>(fetchImpl, token, `/v1/notifications/webhooks/${encodeURIComponent(webhookId)}`, "webhook"),
   ]);
 
-  validatePayPalLivePlan(makerPlan, makerPlanId, 1_000, "Maker");
-  validatePayPalLivePlan(proPlan, proPlanId, 2_000, "Pro");
+  validatePayPalLivePlan(makerPlan, makerPlanId, CIRKITRA_PLANS.maker.priceUsdCents, "Maker");
+  validatePayPalLivePlan(proPlan, proPlanId, CIRKITRA_PLANS.pro.priceUsdCents, "Pro");
   const validatedWebhook = validatePayPalLiveWebhook(webhook, webhookId);
   return {
     environment: "live" as const,
     plans: [
-      { plan: "maker" as const, status: "ACTIVE" as const, monthlyUsd: 10 },
-      { plan: "pro" as const, status: "ACTIVE" as const, monthlyUsd: 20 },
+      { plan: "maker" as const, status: "ACTIVE" as const, monthlyUsd: CIRKITRA_PLANS.maker.priceUsdCents / 100 },
+      { plan: "pro" as const, status: "ACTIVE" as const, monthlyUsd: CIRKITRA_PLANS.pro.priceUsdCents / 100 },
     ],
     webhook: validatedWebhook,
   };

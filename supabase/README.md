@@ -26,7 +26,7 @@ The public site remains accessible without an account. The workbench, project li
 
 Live billing is intentionally opt-in. Existing Sandbox intents, subscriptions, and webhook events are retained and marked `sandbox`; they do not grant Live access or block a Live checkout. Admin plan grants remain environment-independent.
 
-In PayPal’s **Live** app, create two distinct active subscription plans: Maker at USD $10 every month and Pro at USD $20 every month. Create a Live webhook for the production URL `https://<your-production-domain>/api/billing/paypal/webhook` and subscribe it to the nine event types listed in `lib/billing/paypal-live-preflight.ts`. Copy the Live client ID, secret, plan IDs, and webhook ID into Vercel; never commit them or paste them into chat.
+In PayPal’s **Live** app, create two distinct active subscription plans: Maker at USD $5 every month and Pro at USD $10 every month. Create a Live webhook for the production URL `https://<your-production-domain>/api/billing/paypal/webhook` and subscribe it to the nine event types listed in `lib/billing/paypal-live-preflight.ts`. Copy the Live client ID, secret, plan IDs, and webhook ID into Vercel; never commit them or paste them into chat.
 
 In Vercel Project Settings > Environment Variables, scope the same variable names separately:
 
@@ -42,6 +42,8 @@ After adding the Live variables to Production, run the no-charge read-only check
 vercel env run -e production -- npm run paypal:preflight -- --live
 ```
 
-The preflight authenticates with the Live API and reads both plans and the configured Live webhook. It requires active, unlimited monthly cycles priced at exactly $10/$20 USD with no trial/upfront setup fee, and checks the webhook URL and required event subscriptions. It does not create a subscription or charge anyone. Fix any failed checks before continuing.
+The preflight authenticates with the Live API and reads both plans and the configured Live webhook. It requires active, unlimited monthly cycles priced at exactly $5/$10 USD with no trial/upfront setup fee, and checks the webhook URL and required event subscriptions. It does not create a subscription or charge anyone. Fix any failed checks before continuing.
+
+After lowering prices on existing plans, payment reconciliation also accepts the previous exact Maker ($10) and Pro ($20) amounts for the matching authenticated plan ID. This preserves already paid periods and renewals billed at the old rate during PayPal's price-change transition. It does not change checkout prices or infer a tier from the amount. Update Sandbox plans separately to keep local checkout prices consistent with the site.
 
 Then apply the migrations, deploy once with checkout still disabled, and verify the production site’s pricing/status behavior. Only after that should you set `CIRKITRA_PAYPAL_ENABLED=true` and `CIRKITRA_PAYPAL_LIVE_BILLING_CONFIRMED=true` in **Production** and redeploy. Preview/Development remain Sandbox. This code change does not itself modify Vercel settings, apply a remote migration, deploy, or run a paid smoke test.

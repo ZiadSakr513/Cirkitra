@@ -12,14 +12,14 @@ export const CIRKITRA_PLANS = {
   maker: {
     id: "maker",
     name: "Maker",
-    priceUsdCents: 1000,
+    priceUsdCents: 500,
     monthlyAiRequests: 50,
     description: "More AI circuit requests for personal projects.",
   },
   pro: {
     id: "pro",
     name: "Pro",
-    priceUsdCents: 2000,
+    priceUsdCents: 1000,
     monthlyAiRequests: 200,
     description: "Four times the Maker AI requests for bigger projects.",
   },

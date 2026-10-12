@@ -1,9 +1,8 @@
 import { authenticateAiRequest } from "../../../../../lib/billing/ai-usage.ts";
 import { getPayPalSubscription } from "../../../../../lib/billing/paypal-api";
 import { getPayPalServerConfig } from "../../../../../lib/billing/paypal-config";
-import { CIRKITRA_PLANS } from "../../../../../lib/billing/plans";
 import { applyPayPalWebhookEvent, getPayPalCheckoutIntent } from "../../../../../lib/billing/paypal-store";
-import { getVerifiedPayPalPaymentPeriod } from "../../../../../lib/billing/paypal-verification";
+import { getVerifiedPayPalPlanPaymentPeriod } from "../../../../../lib/billing/paypal-verification";
 import { identifyCirkitraPlanId } from "../../../../../lib/billing/paypal-plan-mapping";
 import { isSameOriginRequest } from "../../../../../lib/auth/request-origin";
 import { isSupabaseAdminConfigured } from "../../../../../lib/supabase/admin";
@@ -66,7 +65,7 @@ export async function POST(request: Request) {
       return response(409, { error: { code: "SUBSCRIPTION_PLAN_MISMATCH", message: "The PayPal subscription plan does not match this checkout. No plan access was changed." } });
     }
 
-    const payment = getVerifiedPayPalPaymentPeriod(details, CIRKITRA_PLANS[configuredPlanId].priceUsdCents);
+    const payment = getVerifiedPayPalPlanPaymentPeriod(details, configuredPlanId);
     const statusTime = typeof details.status_update_time === "string"
       ? details.status_update_time
       : typeof details.update_time === "string" ? details.update_time : status;
