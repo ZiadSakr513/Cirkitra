@@ -7,6 +7,22 @@ import { requestedComponentCounts } from "./component-requirements.ts";
 
 const definitions = Object.values(COMPONENT_CATALOG);
 
+test("specific component models do not also require their embedded generic part", () => {
+  for (const [specific, generic] of [
+    ["ds18b20-waterproof", "ds18b20"],
+    ["mpu-6050-breakout", "mpu-6050"],
+    ["mg996r-servo", "servo"],
+    ["sg90-servo", "servo"],
+  ]) {
+    const counts = requestedComponentCounts(`Use one ${specific}.`, definitions);
+    assert.equal(counts.get(specific), 1);
+    assert.equal(counts.has(generic), false, `${specific} must not require an extra ${generic}`);
+  }
+  const mixed = requestedComponentCounts("Use two MG996R servos and one servo.", definitions);
+  assert.equal(mixed.get("mg996r-servo"), 2);
+  assert.equal(mixed.get("servo"), 1);
+});
+
 test("counts explicit part quantities without treating board model numbers as quantities", () => {
   const counts = requestedComponentCounts("Use an Arduino Mega 2560, two LEDs, and one BME280 sensor.", definitions);
   assert.equal(counts.get("led"), 2);

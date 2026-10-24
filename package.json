@@ -6,12 +6,12 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "dev:sites": "vinext dev",
-    "build:sites": "vinext build",
-    "start:sites": "vinext start",
+    "dev": "node init && next dev",
+    "build": "node init && next build",
+    "start": "node init && next start",
+    "dev:sites": "node init && vinext dev",
+    "build:sites": "node init && vinext build",
+    "start:sites": "node init && vinext start",
     "test:ai-stress": "node --experimental-transform-types scripts/ai-generation-stress.ts",
     "test:ai-coverage": "node --experimental-transform-types scripts/ai-generation-stress.ts --suite remaining-components-v1",
     "test:ai-catalog-30": "node --experimental-transform-types scripts/ai-generation-stress.ts --suite catalog-reliability-30-v1 --live",
