@@ -32,7 +32,6 @@ dev-server.log
 dev-server-error.log
 
 # env files (can opt-in for committing if needed)
-.env*
 !.env.example
 paypal-live-production.env
 /.npm-cache/
@@ -56,3 +55,4 @@ next-env.d.ts
 branch_structure.json
 temp_auto_push.bat
 temp_interactive_push.bat
+config.bat

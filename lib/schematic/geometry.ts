@@ -30,6 +30,7 @@ export interface SchematicPinDefinitionLike {
   id: string;
   side: SchematicPinSide;
   order: number;
+  anchor?: Point;
 }
 
 /** The catalog fields required to lay out all pins on a component. */
@@ -138,6 +139,12 @@ export function pinPosition(
 ): Point | undefined {
   const pin = definition.pins.find((candidate) => candidate.id === pinId);
   if (!pin) return undefined;
+
+  if (pin.anchor) {
+    const size = componentSize(component.type);
+    const point = { x: component.x + pin.anchor.x, y: component.y + pin.anchor.y };
+    return rotateAround(point, { x: component.x + size.width / 2, y: component.y + size.height / 2 }, normalizedRotation(component.rotation));
+  }
 
   const sidePins = definition.pins
     .map((candidate, sourceIndex) => ({ candidate, sourceIndex }))

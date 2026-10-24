@@ -33,7 +33,7 @@ test("schematic symbols omit wiring fault badges while simulation errors remain 
   assert.doesNotMatch(studio, /CAPABILITY_LABELS/);
   assert.doesNotMatch(studio, /capability--\$\{simulationCapability\(part\)\}/);
   assert.doesNotMatch(symbols, /Ready to simulate/);
-  assert.match(symbols, /status !== "idle" && !state\.fault/);
+  assert.doesNotMatch(symbols, /status !== "idle" && !state\.fault/);
   assert.doesNotMatch(symbols, /state\.fault \? "Wiring fault"/);
 });
 
@@ -78,7 +78,7 @@ test("all registered boards render readable pin names over their board artwork",
     readFile(symbolStylesUrl, "utf8"),
   ]);
 
-  assert.ok(studio.includes("(!definition.symbol || isBoardType(component.type)) && <span>{pin.label}</span>"));
+  assert.match(studio, /const showLabels = !definition\?\.symbol \|\| isBoard \|\| hasArtwork/);
   for (const boardType of [
     "arduino-mega-2560",
     "arduino-nano-classic",
@@ -139,7 +139,7 @@ test("sketch editor wraps long lines and provides vertical scrolling", async () 
   const [studio, styles, route] = await Promise.all([
     readFile(studioUrl, "utf8"),
     readFile(globalStylesUrl, "utf8"),
-    readFile(new URL("../app/api/ai/generate/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/ai/generate/implementation.ts", import.meta.url), "utf8"),
   ]);
 
   assert.match(studio, /ref={codeLineNumbersRef}/);

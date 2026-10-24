@@ -21,9 +21,9 @@ const libraryMethodSignatures = {
 
 const constructorSignatures: Readonly<Record<string, readonly [number, number]>> = {
   Servo: [0, 0], LiquidCrystal: [6, 6], SoftwareSerial: [2, 2], WiFiUDP: [0, 0],
-  Adafruit_BME280: [0, 0], Adafruit_BMP280: [0, 0], Adafruit_SHT31: [0, 0], DHT: [2, 2],
+  Adafruit_BME280: [0, 0], Adafruit_BMP280: [0, 0], Adafruit_BME680: [0, 0], Adafruit_SHT31: [0, 0], DHT: [2, 2],
   OneWire: [1, 1], DallasTemperature: [1, 1], Adafruit_MPU6050: [0, 0], BH1750: [0, 0],
-  Adafruit_SSD1306: [2, 4], Adafruit_NeoPixel: [3, 3], Encoder: [2, 2], Keypad: [5, 5],
+  Adafruit_SSD1306: [2, 4], Adafruit_SH1107: [3, 4], Adafruit_NeoPixel: [3, 3], Encoder: [2, 2], Keypad: [5, 5],
   Adafruit_MCP23X17: [0, 0], TCA9548: [1, 1], MFRC522: [2, 2], XBee: [0, 0],
   XBeeAddress64: [2, 2], ZBTxRequest: [3, 4], ZBTxStatusResponse: [0, 0], ZBRxResponse: [0, 0],
   XBeeResponse: [0, 0], SPISettings: [3, 3], bq769x0: [2, 2],
@@ -50,7 +50,7 @@ export const SIMULATOR_CAPABILITY_REGISTRY = Object.freeze({
   coreFunctions,
   coreCalls: Object.keys(coreFunctions),
   coreTypes: ["void", "int", "long", "short", "byte", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "size_t", "bool", "float", "double", "char", "DeviceAddress", "sensors_event_t"],
-  extraHeaders: ["Adafruit_Sensor.h"],
+  extraHeaders: ["Adafruit_Sensor.h", "Adafruit_GFX.h"],
 });
 
 export type SimulatorCapabilityRegistry = typeof SIMULATOR_CAPABILITY_REGISTRY;

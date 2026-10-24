@@ -3,6 +3,7 @@ export interface DeviceApi {
   header: string;
   type: string;
   component?: string;
+  components?: readonly string[];
   singleton?: string;
   methods: Readonly<Record<string, readonly [number, number]>>;
   boards?: readonly string[];
@@ -18,23 +19,27 @@ export const DEVICE_APIS: readonly DeviceApi[] = [
   { header: "SD.h", type: "SDClass", singleton: "SD", component: "micro-sd-spi-module", methods: { ...calls("", "begin exists remove"), open: [1, 2] } },
   { header: "SD.h", type: "File", methods: { ...calls("close flush available read peek position size", "write print println seek"), write: [1, 2], print: [1, 2], println: [0, 1], seek: [1, 1] } },
   { header: "MFRC522.h", type: "MFRC522", component: "mfrc522-rfid-module", methods: { ...calls("PCD_Init PICC_IsNewCardPresent PICC_ReadCardSerial PICC_HaltA PCD_Reset"), PCD_Init: [0, 1], PICC_IsNewCardPresent: [0, 0], PICC_ReadCardSerial: [0, 0] } },
-  { header: "Arduino.h", type: "HardwareSerial", singleton: "Serial1", methods: { ...calls("available read flush", "begin print println write"), write: [1, 2] } },
-  { header: "Arduino.h", type: "HardwareSerial", singleton: "Serial2", methods: { ...calls("available read flush", "begin print println write"), write: [1, 2] } },
-  { header: "Arduino.h", type: "HardwareSerial", singleton: "Serial3", methods: { ...calls("available read flush", "begin print println write"), write: [1, 2] } },
-  { header: "WiFi.h", type: "WiFiClass", singleton: "WiFi", boards: ["esp32-devkitc-v4"], methods: { ...calls("status disconnect", "mode", "begin"), begin: [1, 2] } },
+  { header: "Arduino.h", type: "HardwareSerial", singleton: "Serial", methods: { ...calls("available read flush", "begin print println write"), parseInt: [0, 1], write: [1, 2] } },
+  { header: "Arduino.h", type: "HardwareSerial", singleton: "Serial1", methods: { ...calls("available read flush", "begin print println write"), parseInt: [0, 1], write: [1, 2] } },
+  { header: "Arduino.h", type: "HardwareSerial", singleton: "Serial2", methods: { ...calls("available read flush", "begin print println write"), parseInt: [0, 1], write: [1, 2] } },
+  { header: "Arduino.h", type: "HardwareSerial", singleton: "Serial3", methods: { ...calls("available read flush", "begin print println write"), parseInt: [0, 1], write: [1, 2] } },
+  { header: "WiFi.h", type: "WiFiClass", singleton: "WiFi", boards: ["esp32-devkitc-v4", "esp32-nodemcu-32s", "esp32-devkit-v1-30pin", "xiao-esp32s3-sense", "freenove-esp32s3-wroom"], methods: { ...calls("status disconnect", "mode", "begin"), begin: [1, 2] } },
   { header: "ESP8266WiFi.h", type: "WiFiClass", singleton: "WiFi", boards: ["esp8266-nodemcu-v1"], methods: { ...calls("status disconnect", "mode", "begin"), begin: [1, 2] } },
-  { header: "WiFiUdp.h", type: "WiFiUDP", boards: ["esp32-devkitc-v4", "esp8266-nodemcu-v1"], methods: { ...calls("endPacket parsePacket available read stop remotePort", "begin write print println"), beginPacket: [2, 2], write: [1, 2], print: [1, 2], println: [1, 2] } },
+  { header: "WiFiUdp.h", type: "WiFiUDP", boards: ["esp32-devkitc-v4", "esp32-nodemcu-32s", "esp32-devkit-v1-30pin", "xiao-esp32s3-sense", "freenove-esp32s3-wroom", "esp8266-nodemcu-v1"], methods: { ...calls("endPacket parsePacket available read stop remotePort", "begin write print println"), beginPacket: [2, 2], write: [1, 2], print: [1, 2], println: [1, 2] } },
   { header: "SoftwareSerial.h", type: "SoftwareSerial", methods: calls("available read", "begin write print println") },
-  { header: "Adafruit_BME280.h", type: "Adafruit_BME280", component: "bme280", methods: { ...calls("readTemperature readPressure readHumidity takeForcedMeasurement sensorID"), begin: [0, 2], setSampling: [0, 6] } },
+  { header: "Adafruit_BME280.h", type: "Adafruit_BME280", component: "bme280", components: ["bme280-gy-bme-p280"], methods: { ...calls("readTemperature readPressure readHumidity takeForcedMeasurement sensorID"), begin: [0, 2], setSampling: [0, 6] } },
+  { header: "Adafruit_BME680.h", type: "Adafruit_BME680", component: "bme680-gas-sensor", methods: { ...calls("performReading readTemperature readPressure readHumidity readGasResistance"), begin: [0, 1] } },
   { header: "Adafruit_BMP280.h", type: "Adafruit_BMP280", component: "bmp280", methods: { ...calls("readTemperature readPressure takeForcedMeasurement sensorID"), begin: [0, 2], setSampling: [0, 5] } },
   { header: "Adafruit_SHT31.h", type: "Adafruit_SHT31", component: "sht31-dis", methods: { ...calls("readTemperature readHumidity reset isHeaterEnabled readStatus", "heater"), begin: [0, 1] } },
-  { header: "DHT.h", type: "DHT", component: "dht22", methods: { begin: [0, 1], readTemperature: [0, 2], readHumidity: [0, 1], read: [0, 1] } },
-  { header: "OneWire.h", type: "OneWire", component: "ds18b20", methods: { ...calls("reset read reset_search", "select search", "write"), write: [1, 2], skip: [0, 0] } },
-  { header: "DallasTemperature.h", type: "DallasTemperature", component: "ds18b20", methods: { ...calls("begin getDeviceCount requestTemperatures", "getTempCByIndex getTempC setWaitForConversion", "getAddress"), setResolution: [1, 2], getResolution: [0, 1], requestTemperaturesByAddress: [1, 1] } },
+  { header: "DHT.h", type: "DHT", component: "dht22", components: ["dht11"], methods: { begin: [0, 1], readTemperature: [0, 2], readHumidity: [0, 1], read: [0, 1] } },
+  { header: "OneWire.h", type: "OneWire", component: "ds18b20", components: ["ds18b20-waterproof"], methods: { ...calls("reset read reset_search", "select search", "write"), write: [1, 2], skip: [0, 0] } },
+  { header: "DallasTemperature.h", type: "DallasTemperature", component: "ds18b20", components: ["ds18b20-waterproof"], methods: { ...calls("begin getDeviceCount requestTemperatures", "getTempCByIndex getTempC setWaitForConversion", "getAddress"), setResolution: [1, 2], getResolution: [0, 1], requestTemperaturesByAddress: [1, 1] } },
   { header: "Adafruit_MPU6050.h", type: "Adafruit_MPU6050", component: "mpu-6050", methods: { ...calls("getAccelerometerRange getGyroRange getFilterBandwidth", "setAccelerometerRange setGyroRange setFilterBandwidth enableSleep enableCycle enableDataReadyInterrupt"), begin: [0, 3], getEvent: [3, 3] } },
   { header: "BH1750.h", type: "BH1750", component: "bh1750-sen0097", methods: { begin: [0, 2], configure: [1, 1], setMTreg: [1, 1], measurementReady: [0, 1], readLightLevel: [0, 0] } },
   { header: "Adafruit_SSD1306.h", type: "Adafruit_SSD1306", component: "ssd1306-oled-128x64", methods: { begin: [0, 4], clearDisplay: [0, 0], display: [0, 0], setCursor: [2, 2], setTextSize: [1, 1], setTextColor: [1, 2], print: [1, 2], println: [1, 2] } },
-  { header: "Adafruit_NeoPixel.h", type: "Adafruit_NeoPixel", component: "ws2812b-strip-8", methods: { ...calls("begin show clear numPixels", "setBrightness getPixelColor", "setPixelColor"), Color: [3, 4], setPixelColor: [2, 4] } },
+  { header: "Adafruit_SH110X.h", type: "Adafruit_SH1107", component: "sh1107-oled-128x128", methods: { begin: [0, 2], clearDisplay: [0, 0], display: [0, 0], setCursor: [2, 2], setTextSize: [1, 1], setTextColor: [1, 2], print: [1, 2], println: [1, 2] } },
+  { header: "Adafruit_NeoPixel.h", type: "Adafruit_NeoPixel", component: "ws2812b-strip-8", components: ["neopixel-ring-24", "ws2812b-strip-30", "ws2812b-strip-60", "ws2812b-matrix-8x8"], methods: { ...calls("begin show clear numPixels", "setBrightness getPixelColor", "setPixelColor"), Color: [3, 4], setPixelColor: [2, 4] } },
+  { header: "TM1637Display.h", type: "TM1637Display", component: "tm1637-4-digit-display", methods: { ...calls("clear", "setBrightness showNumberDec showString"), setSegments: [1, 3] } },
   { header: "Encoder.h", type: "Encoder", component: "ky-040", methods: { ...calls("read readAndReset", "write") } },
   { header: "Keypad.h", type: "Keypad", component: "keypad-4x4", methods: { ...calls("getKey getState", "isPressed") } },
   { header: "Adafruit_MCP23X17.h", type: "Adafruit_MCP23X17", component: "mcp23017", methods: { ...calls("readGPIOAB getLastInterruptPin getCapturedInterrupt"), begin_I2C: [0, 2], pinMode: [2, 2], digitalWrite: [2, 2], digitalRead: [1, 1], writeGPIOAB: [1, 1], setupInterrupts: [3, 3], setupInterruptPin: [2, 2], clearInterrupts: [0, 0] } },
@@ -91,7 +96,7 @@ export function deviceInstances(source: string, boardId?: string): Map<string, D
   return instances;
 }
 export const DEVICE_CONSTANTS: Record<string, number> = {
-  DHT22: 22, INPUT: 0, OUTPUT: 1, INPUT_PULLUP: 2, MSBFIRST: 1, LSBFIRST: 0, SPI_MODE0: 0,
+  DHT11: 11, DHT22: 22, INPUT: 0, OUTPUT: 1, INPUT_PULLUP: 2, MSBFIRST: 1, LSBFIRST: 0, SPI_MODE0: 0,
   MPU6050_RANGE_2_G: 0, MPU6050_RANGE_4_G: 1, MPU6050_RANGE_8_G: 2, MPU6050_RANGE_16_G: 3,
   MPU6050_RANGE_250_DEG: 0, MPU6050_RANGE_500_DEG: 1, MPU6050_RANGE_1000_DEG: 2, MPU6050_RANGE_2000_DEG: 3,
   ZB_TX_STATUS_RESPONSE: 0x8b, ZB_RX_RESPONSE: 0x90, SUCCESS: 0,
@@ -101,7 +106,7 @@ export const DEVICE_CONSTANTS: Record<string, number> = {
   CONTINUOUS_HIGH_RES_MODE: 0x10, CONTINUOUS_HIGH_RES_MODE_2: 0x11, CONTINUOUS_LOW_RES_MODE: 0x13,
   ONE_TIME_HIGH_RES_MODE: 0x20, ONE_TIME_HIGH_RES_MODE_2: 0x21, ONE_TIME_LOW_RES_MODE: 0x23,
   BH1750_DEFAULT_MTREG: 69, BH1750_MTREG_MIN: 31, BH1750_MTREG_MAX: 254,
-  SSD1306_SWITCHCAPVCC: 0x02, SSD1306_EXTERNALVCC: 0x01, SSD1306_WHITE: 1, WHITE: 1, BLACK: 0,
+  SSD1306_SWITCHCAPVCC: 0x02, SSD1306_EXTERNALVCC: 0x01, SSD1306_WHITE: 1, SH110X_WHITE: 1, WHITE: 1, BLACK: 0,
   NEO_GRB: 0x52, NEO_RGB: 0x06, NEO_KHZ800: 0x0000,
   FILE_READ: 0, FILE_WRITE: 1,
   IDLE: 0, PRESSED: 1, RELEASED: 2, HOLD: 3,

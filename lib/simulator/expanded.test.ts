@@ -4,6 +4,7 @@ import { ArduinoSimulator, solveCircuit, compileArduinoSketch } from "./index.ts
 import { createDefaultBlinkProject, type CircuitProject } from "../circuit/index.ts";
 import { BOARD_IDS, BOARD_PROFILES } from "../circuit/boards.ts";
 import { COMPONENT_EXAMPLES, KY040_CONTROL_EXAMPLE_CODE } from "../circuit/component-examples.ts";
+import { PowerRuntime } from "./power.ts";
 
 function fixture(type: string) {
   const project: CircuitProject = { ...createDefaultBlinkProject(), components: [
@@ -65,6 +66,28 @@ test("power-short diagnostics identify the exact wire path between opposing boar
   assert.match(diagnostic.message, /Arduino Uno 5V/);
   assert.match(diagnostic.message, /System Ground GND/);
   assert.match(diagnostic.message, /source path .*\[wire wrong-5v-to-ground\]/i);
+});
+
+test("a current-limited resistor path conducts without being diagnosed as a hard output short", () => {
+  const project: CircuitProject = {
+    ...createDefaultBlinkProject(),
+    code: "void setup(){} void loop(){ delay(10); }",
+    components: [
+      { id: "uno", type: "arduino-uno", label: "Arduino Uno", x: 0, y: 0 },
+      { id: "series", type: "resistor", label: "1 kΩ current limiter", x: 300, y: 0, properties: { resistance: 1000 } },
+      { id: "ground", type: "ground", label: "System Ground", x: 600, y: 0 },
+    ],
+    connections: [
+      { id: "supply-to-resistor", from: { componentId: "uno", pin: "5V" }, to: { componentId: "series", pin: "1" } },
+      { id: "resistor-to-ground", from: { componentId: "series", pin: "2" }, to: { componentId: "ground", pin: "GND" } },
+      { id: "ground-return", from: { componentId: "uno", pin: "GND" }, to: { componentId: "ground", pin: "GND" } },
+    ],
+  };
+  const simulator = new ArduinoSimulator(project.code);
+  simulator.attachProject(project); simulator.run(); simulator.advance(0);
+  const solved = solveCircuit(project, simulator.getSnapshot());
+  assert.equal(solved.diagnostics.some(item => item.code === "output-contention"), false, JSON.stringify(solved.diagnostics));
+  assert.ok(Math.abs(new PowerRuntime().solve(project, 0).current("series") - 0.005) < 1e-9);
 });
 
 test("ESP32 drives a 5 V WS2812B strip through a powered AHCT buffer and series resistor", () => {
@@ -452,9 +475,11 @@ test("capacitive soil sensor changes wired ADC results on all published boards",
   const analogPins: Record<string, string> = {
     "arduino-uno": "A0", "arduino-mega-2560": "A0", "arduino-nano-classic": "A0",
     "esp32-devkitc-v4": "GPIO34", "esp8266-nodemcu-v1": "A0", "raspberry-pi-pico": "GP26",
+    "esp32-nodemcu-32s": "GPIO34", "esp32-devkit-v1-30pin": "GPIO34", "xiao-esp32s3-sense": "D0", "freenove-esp32s3-wroom": "GPIO1",
   };
   for (const boardType of BOARD_IDS) {
     const analogPin = analogPins[boardType];
+    assert.ok(analogPin, `${boardType} has a representative ADC pin in the cross-board regression`);
     const project: CircuitProject = {
       ...createDefaultBlinkProject(), board: boardType as CircuitProject["board"], activeBoardId: "board",
       code: `void setup(){Serial.begin(9600);} void loop(){Serial.println(analogRead(${analogPin})); delay(100);}`,
@@ -529,6 +554,19 @@ test("simulator resolves namespaced C++ library constants in device calls", () =
   display.attachProject(displayProject); display.run(); display.advance(0);
   assert.equal(display.getSnapshot().diagnostics.some(diagnostic => diagnostic.code === "DEVICE_NOT_CONNECTED"), false);
   assert.match(display.getSnapshot().componentStates.device?.display?.[0] ?? "", /READY/);
+});
+
+test("Adafruit_SH1107 renders text on the wired 128x128 OLED", () => {
+  const displayProject = COMPONENT_EXAMPLES["ssd1306-oled-128x64"]();
+  displayProject.components = displayProject.components.map(component => component.id === "device"
+    ? { ...component, type: "sh1107-oled-128x128", label: "SH1107 128x128 OLED" }
+    : component);
+  displayProject.code = `#include <Wire.h>\n#include <Adafruit_SH110X.h>\nAdafruit_SH1107 display(128,128,&Wire,-1);\nvoid setup(){ Wire.begin(); display.begin(0x3c,true); display.clearDisplay(); display.setTextColor(SH110X_WHITE); display.setCursor(0,0); display.println("CO2 READY"); display.setCursor(0,16); display.println("450 ppm"); display.display(); }\nvoid loop(){ delay(100); }`;
+  const display = new ArduinoSimulator(displayProject.code);
+  display.attachProject(displayProject); display.run(); display.advance(0);
+  assert.equal(display.getSnapshot().diagnostics.some(diagnostic => diagnostic.severity === "error"), false);
+  assert.match(display.getSnapshot().componentStates.device?.display?.[0] ?? "", /CO2 READY/);
+  assert.ok(display.getSnapshot().componentStates.device?.display?.some(line => /450 ppm/.test(line)), JSON.stringify(display.getSnapshot().componentStates.device?.display));
 });
 
 for (const config of configurations) test(`${config.type} runs two independent bridges and rejects conflicting output drives`, () => {

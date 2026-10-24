@@ -7,7 +7,7 @@ const file = (path) => new URL(path, import.meta.url);
 test("protected handlers enforce auth at the handler boundary and cap bodies", async () => {
   const [compile, generation, session, adminAuth, grants, usage] = await Promise.all([
     readFile(file("../app/api/compile/route.ts"), "utf8"),
-    readFile(file("../app/api/ai/generate/route.ts"), "utf8"),
+    readFile(file("../app/api/ai/generate/implementation.ts"), "utf8"),
     readFile(file("../app/api/auth/session/route.ts"), "utf8"),
     readFile(file("../lib/billing/admin-plan-grant-auth.ts"), "utf8"),
     readFile(file("../app/api/admin/plan-grants/route.ts"), "utf8"),

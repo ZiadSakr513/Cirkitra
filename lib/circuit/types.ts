@@ -7,6 +7,10 @@ export const ARDUINO_NANO_CLASSIC_BOARD = "arduino-nano-classic" as const;
 export const ESP32_DEVKITC_V4_BOARD = "esp32-devkitc-v4" as const;
 export const ESP8266_NODEMCU_V1_BOARD = "esp8266-nodemcu-v1" as const;
 export const RASPBERRY_PI_PICO_BOARD = "raspberry-pi-pico" as const;
+export const ESP32_NODEMCU_32S_BOARD = "esp32-nodemcu-32s" as const;
+export const ESP32_DEVKIT_V1_30PIN_BOARD = "esp32-devkit-v1-30pin" as const;
+export const XIAO_ESP32S3_SENSE_BOARD = "xiao-esp32s3-sense" as const;
+export const FREENOVE_ESP32S3_WROOM_BOARD = "freenove-esp32s3-wroom" as const;
 
 export type CircuitProjectSchemaVersion =
   typeof CIRCUIT_PROJECT_SCHEMA_VERSION;
@@ -16,7 +20,11 @@ export type CircuitBoard =
   | typeof ARDUINO_NANO_CLASSIC_BOARD
   | typeof ESP32_DEVKITC_V4_BOARD
   | typeof ESP8266_NODEMCU_V1_BOARD
-  | typeof RASPBERRY_PI_PICO_BOARD;
+  | typeof RASPBERRY_PI_PICO_BOARD
+  | typeof ESP32_NODEMCU_32S_BOARD
+  | typeof ESP32_DEVKIT_V1_30PIN_BOARD
+  | typeof XIAO_ESP32S3_SENSE_BOARD
+  | typeof FREENOVE_ESP32S3_WROOM_BOARD;
 export type CircuitRotation = 0 | 90 | 180 | 270;
 export type ComponentPropertyValue = string | number | boolean | null;
 export type ComponentProperties = Record<string, ComponentPropertyValue>;

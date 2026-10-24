@@ -86,12 +86,13 @@ export class PowerRuntime {
   private charge = new Map<string, number>();
   private lastTime = 0;
   reset() { this.charge.clear(); this.lastTime = 0; }
-  solve(project: CircuitProject, timeMs: number, controls: Readonly<Record<string, number>> = {}, charging: Readonly<Record<string, number>> = {}, motorLoads: readonly MotorSupplyLoad[] = []): PowerResult {
+  solve(project: CircuitProject, timeMs: number, controls: Readonly<Record<string, number>> = {}, charging: Readonly<Record<string, number>> = {}, motorLoads: readonly MotorSupplyLoad[] = [], bridges: readonly { componentId: string; from: string; to: string }[] = []): PowerResult {
     const dt = Math.max(0, timeMs - this.lastTime) / 3600000; this.lastTime = timeMs;
     const parent = new Map<string, string>();
     const find = (p: string): string => { if (!parent.has(p)) parent.set(p, p); const root = parent.get(p)!; if (root === p) return p; const next = find(root); parent.set(p, next); return next; };
     const join = (a: string, b: string) => parent.set(find(a), find(b));
     for (const w of project.connections) join(key(w.from.componentId, w.from.pin), key(w.to.componentId, w.to.pin));
+    for (const bridge of bridges) join(key(bridge.componentId, bridge.from), key(bridge.componentId, bridge.to));
     const ground = "__ground";
     for (const c of project.components) {
       for (const group of POWER_TERMINAL_GROUPS[c.type] ?? []) for (const pin of group.slice(1)) join(key(c.id, group[0]), key(c.id, pin));
@@ -108,6 +109,7 @@ export class PowerRuntime {
         Object.entries(profile.rails).forEach(([pin, volts]) => add(sources, c, pin, groundPin, volts, `:${pin}`));
       }
       if (c.type === "dc-supply" && c.properties?.enabled !== false) add(sources, c, "+", "-", prop(c, "voltage", 5));
+      if (c.type === "battery-9v" && c.properties?.enabled !== false) add(sources, c, "+", "-", prop(c, "voltage", 9));
       if (c.type === "battery-cell") {
         if (!this.charge.has(c.id)) this.charge.set(c.id, Math.max(0, Math.min(100, prop(c, "initialSoc", 50))));
         const soc = this.charge.get(c.id)!;
@@ -116,6 +118,8 @@ export class PowerRuntime {
       }
       if (c.type === "resistor") add(resistors, c, "1", "2", Math.max(0.000001, prop(c, "resistance", 220)));
       if (c.type === "dc-load" && c.properties?.enabled !== false) add(resistors, c, "+", "-", Math.max(0.001, prop(c, "resistance", 100)));
+      if (c.type === "r385-water-pump") add(resistors, c, "+", "-", Math.max(1, prop(c, "resistance", 30)));
+      if (c.type === "solenoid-valve-12v") add(resistors, c, "+", "-", Math.max(1, prop(c, "resistance", 48)));
       if (c.type === "ideal-mosfet") add(resistors, c, "D", "S", controls[c.id] ? 0.001 : 1e12);
       if (c.type === "bq24074") {
         if (controls[`${c.id}:input`]) add(sources, c, "IN", "OUT_10", controls[`${c.id}:drop`] ?? 0.6);
@@ -169,7 +173,7 @@ export class PowerRuntime {
     });
     if (valid) resistors.forEach(b => currentMap.set(b.id, ((voltages.get(b.a) ?? 0) - (voltages.get(b.b) ?? 0)) / b.value));
     const states: Record<string, SimulatedComponentState> = {};
-    for (const c of project.components.filter(c => ["battery-cell", "dc-supply", "dc-load", "ideal-mosfet"].includes(c.type))) {
+    for (const c of project.components.filter(c => ["battery-cell", "battery-9v", "dc-supply", "dc-load", "ideal-mosfet"].includes(c.type))) {
       const a = voltages.get(node(c.id, c.type === "ideal-mosfet" ? "D" : "+")), b = voltages.get(node(c.id, c.type === "ideal-mosfet" ? "S" : "-"));
       const current = currentMap.get(c.id) ?? 0;
       if (c.type === "battery-cell") this.charge.set(c.id, Math.max(0, Math.min(100, this.charge.get(c.id)! - current * dt * 100000 / Math.max(1, prop(c, "capacityMah", 2000)))));

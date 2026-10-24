@@ -37,6 +37,31 @@ for (const [type, header, klass] of [["bme280", "Adafruit_BME280.h", "Adafruit_B
     assert.equal(f.call("begin", [0x76]), 0); assert.ok(Number.isNaN(f.call("readTemperature")));
   });
 }
+test("BME280 breakout binds through the existing BME280 adapter", () => {
+  const f = fixture("bme280-gy-bme-p280", "#include <Adafruit_BME280.h>\nAdafruit_BME280 sensor;");
+  f.i2c(); f.tick();
+  assert.equal(f.call("begin", [0x76]), 1);
+  f.project.components[1]!.properties = { temperature: 31, humidity: 42, pressure: 100800 };
+  f.tick(1);
+  assert.equal(f.call("readTemperature"), 31);
+  assert.equal(f.call("readHumidity"), 42);
+  assert.equal(f.call("readPressure"), 100800);
+});
+test("BME680 supported adapter reads its interactive environmental values on powered I2C", () => {
+  const f = fixture("bme680-gas-sensor", "#include <Adafruit_BME680.h>\nAdafruit_BME680 sensor;");
+  f.i2c(); f.tick();
+  assert.equal(f.call("begin", [0x77]), 1);
+  assert.equal(f.call("performReading"), 1);
+  f.project.components[1]!.properties = { temperature: 29, humidity: 61, pressure: 100900, gasOhms: 81000 };
+  f.tick(1);
+  assert.equal(f.call("readTemperature"), 29);
+  assert.equal(f.call("readHumidity"), 61);
+  assert.equal(f.call("readPressure"), 100900);
+  assert.equal(f.call("readGasResistance"), 81000);
+  f.project.connections = f.project.connections.filter(wire => wire.from.componentId !== "dut" || !["SDA", "SCL"].includes(wire.from.pin));
+  f.tick(2);
+  assert.equal(f.call("begin", [0x77]), 0);
+});
 test("MCP23017 outputs and TCA9548 channel isolation are stateful", () => {
   const f = fixture("mcp23017", "Adafruit_MCP23X17 sensor;"); f.i2c(); f.rail("RESET"); ["A0", "A1", "A2"].forEach(pin => f.rail(pin, "GND")); f.tick();
   assert.equal(f.call("begin_I2C", [0x20]), 1); f.call("pinMode", [0, 1]); f.call("digitalWrite", [0, 1]); f.tick();
@@ -79,6 +104,27 @@ test("I2C address conflicts and changed address straps do not silently rebind ad
   for (const w of [...f.project.connections].filter(w => w.from.componentId === "dut")) f.wire("duplicate", w.from.pin, w.to.componentId, w.to.pin);
   f.tick(); assert.equal(f.call("begin", [0x77]), 0);
   assert.ok(f.runtime.diagnostics.some(d => d.code === "I2C_ADDRESS_CONFLICT"));
+});
+
+test("AS5600 raw angle registers expose the 12-bit shaft position", () => {
+  const f = fixture("as5600-magnetic-encoder", "#include <Wire.h>");
+  f.i2c();
+  f.project.components[1]!.properties = { angleDeg: 180 };
+  f.tick();
+  const readRawAngle = () => {
+    f.call("beginTransmission", [0x36], "Wire");
+    f.call("write", [0x0e], "Wire");
+    f.call("endTransmission", [], "Wire");
+    assert.equal(f.call("requestFrom", [0x36, 2], "Wire"), 2);
+    return (Number(f.call("read", [], "Wire")) << 8) | Number(f.call("read", [], "Wire"));
+  };
+  assert.equal(readRawAngle(), 0x0800);
+  f.project.components[1]!.properties = { angleDeg: 90 };
+  f.tick(1);
+  assert.equal(readRawAngle(), 0x0400);
+  f.project.connections = f.project.connections.filter(wire => wire.from.componentId !== "dut" || !["SDA", "SCL"].includes(wire.from.pin));
+  f.tick(2);
+  assert.equal(f.call("requestFrom", [0x36, 2], "Wire"), 0);
 });
 
 test("MPU range settings affect every raw axis and sleep suppresses data ready", () => {

@@ -45,6 +45,49 @@ test("resolves the common SHT31 model name to the supported SHT31-DIS part", () 
   assert.equal(requestedComponentCounts(prompt, definitions).get("sht31-dis"), 1);
 });
 
+test("a specifically named GY-BME/P280 breakout does not also require the bare BME280 chip", () => {
+  const counts = requestedComponentCounts(
+    "Use exactly one GY-BME/P280 BME280 breakout, not the bare-chip BME280.",
+    definitions,
+  );
+  assert.equal(counts.get("bme280-gy-bme-p280"), 1);
+  assert.equal(counts.has("bme280"), false);
+});
+
+test("matches capacitor values written as spaced or Unicode microfarads", () => {
+  for (const prompt of [
+    "Use a 1 uF timing capacitor.",
+    "Use a 1 µF timing capacitor.",
+  ]) {
+    assert.equal(requestedComponentCounts(prompt, definitions).get("capacitor-1uf"), 1, prompt);
+  }
+  assert.equal(requestedComponentCounts("Add a 100 µF electrolytic capacitor.", definitions).get("electrolytic-capacitor-100uf"), 1);
+  assert.equal(requestedComponentCounts("Add one capacitor across the supply rails.", definitions).get("capacitor-1uf"), 1);
+  assert.equal(requestedComponentCounts("Add a bulk capacitor across the supply rails.", definitions).get("electrolytic-capacitor-100uf"), 1);
+});
+
+test("counts exact MOSFET and IR receiver variants without broad-alias siblings", () => {
+  const idealMosfet = requestedComponentCounts("Switch the load with an ideal-mosfet.", definitions);
+  assert.equal(idealMosfet.get("ideal-mosfet"), 1);
+  assert.equal(idealMosfet.has("n-mosfet-2n7000"), false);
+
+  const nmos = requestedComponentCounts("Use a 2N7000 N-MOSFET to switch the load.", definitions);
+  assert.equal(nmos.get("n-mosfet-2n7000"), 1);
+  assert.equal(nmos.has("ideal-mosfet"), false);
+
+  const bothMosfets = requestedComponentCounts("Use an ideal MOSFET and one 2N7000 N-MOSFET.", definitions);
+  assert.equal(bothMosfets.get("ideal-mosfet"), 1);
+  assert.equal(bothMosfets.get("n-mosfet-2n7000"), 1);
+
+  const vs1838 = requestedComponentCounts("Use a VS1838B IR receiver module.", definitions);
+  assert.equal(vs1838.get("vs1838b-ir-receiver-module"), 1);
+  assert.equal(vs1838.has("tsop4838-ir-receiver"), false);
+
+  const tsop = requestedComponentCounts("Use a TSOP4838 IR receiver.", definitions);
+  assert.equal(tsop.get("tsop4838-ir-receiver"), 1);
+  assert.equal(tsop.has("vs1838b-ir-receiver-module"), false);
+});
+
 test("recognizes explicit ground symbols and separate motor supplies", () => {
   assert.equal(requestedComponentCounts("Connect all grounds and share a common ground.", definitions).has("ground"), false);
   assert.equal(requestedComponentCounts("Add one Ground symbol to the circuit.", definitions).get("ground"), 1);

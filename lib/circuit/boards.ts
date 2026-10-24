@@ -33,7 +33,8 @@ export interface BoardProfile {
   groundPins: readonly string[];
   i2c: readonly { sda: number; scl: number }[];
   spi: readonly { mosi: number; miso: number; sck: number; ss: number }[];
-  uart: readonly { rx: number; tx: number }[];
+  /** UART slots are indexed by the Serial suffix (slot 0 is Serial / USB). */
+  uart: readonly ({ rx: number; tx: number } | undefined)[];
   builtinLed?: number;
   documentation: string;
 }
@@ -93,6 +94,14 @@ const esp32Pins = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
   aliases: [`GPIO${pin}`],
   signals: ["digital", ...([0, 2, 4, 12, 13, 14, 15, 25, 26, 27, 32, 33, 34, 35, 36, 39].includes(pin) ? ["analog" as const] : []), ...(![6, 7, 8, 9, 10, 11, 34, 35, 36, 39].includes(pin) ? ["pwm" as const] : []), ...([1, 3, 16, 17].includes(pin) ? ["uart" as const] : []), ...([21, 22].includes(pin) ? ["i2c" as const] : []), ...([5, 18, 19, 23].includes(pin) ? ["spi" as const] : [])],
 }));
+const esp32S3Pins = [...Array.from({ length: 22 }, (_, index) => index), ...Array.from({ length: 23 }, (_, index) => index + 26)].map((pin): BoardIoPin => ({
+  id: `GPIO${pin}`, label: `GPIO ${pin}${[45, 46].includes(pin) ? " · input" : ""}`, runtimePin: pin,
+  analog: pin <= 20 || pin >= 33 && pin <= 42, pwm: ![45, 46].includes(pin), inputOnly: [45, 46].includes(pin), aliases: [`GPIO${pin}`],
+  signals: ["digital", ...([45, 46].includes(pin) ? [] : ["pwm" as const]), ...(pin <= 20 || pin >= 33 && pin <= 42 ? ["analog" as const] : []), ...([43, 44].includes(pin) ? ["uart" as const] : [])],
+}));
+const xiaoPins: BoardIoPin[] = [
+  ["D0", 1], ["D1", 2], ["D2", 3], ["D3", 4], ["D4", 5], ["D5", 6], ["D6", 43], ["D7", 44], ["D8", 7], ["D9", 8], ["D10", 9],
+].map(([id, runtimePin]) => ({ id: String(id), label: `${id} / GPIO${runtimePin}`, runtimePin: Number(runtimePin), analog: Number(runtimePin) <= 9, pwm: true, aliases: [`GPIO${runtimePin}`], signals: ["digital", "analog", "pwm", ...(id === "D4" || id === "D5" ? ["i2c" as const] : []), ...(id === "D6" || id === "D7" ? ["uart" as const] : [])] }));
 
 const esp8266D = [16, 5, 4, 0, 2, 14, 12, 13, 15].map((gpio, index): BoardIoPin => ({
   id: `D${index}`,
@@ -147,6 +156,22 @@ const definitions: Record<string, BoardProfile> = {
   "raspberry-pi-pico": {
     id: "raspberry-pi-pico", displayName: "Raspberry Pi Pico", manufacturer: "Raspberry Pi", variant: "Pico, RP2040, non-wireless", mcu: "RP2040", logicVoltage: 3.3, analogResolutionBits: 12, analogReferenceVolts: 3.3, runtimePinCount: 30,
     ioPins: picoIo, pwmPins: picoIo.map(pin => pin.runtimePin), analogPins: [26, 27, 28], constants: { LED_BUILTIN: 25, SDA: 4, SCL: 5, MOSI: 19, MISO: 16, SCK: 18, SS: 17 }, reservedPins: [], rails: { "3V3": 3.3, VBUS: 5 }, groundPins: ["GND", "GND2", "GND3"], i2c: [{ sda: 4, scl: 5 }, { sda: 0, scl: 1 }, { sda: 8, scl: 9 }, { sda: 12, scl: 13 }, { sda: 16, scl: 17 }, { sda: 20, scl: 21 }, { sda: 2, scl: 3 }, { sda: 6, scl: 7 }, { sda: 10, scl: 11 }, { sda: 14, scl: 15 }, { sda: 18, scl: 19 }, { sda: 26, scl: 27 }], spi: [{ mosi: 19, miso: 16, sck: 18, ss: 17 }, { mosi: 15, miso: 12, sck: 14, ss: 13 }], uart: [{ rx: 1, tx: 0 }, { rx: 5, tx: 4 }], builtinLed: 25, documentation: "https://datasheets.raspberrypi.com/pico/getting-started-with-pico.pdf",
+  },
+  "esp32-nodemcu-32s": {
+    id: "esp32-nodemcu-32s", displayName: "ESP32 NodeMCU-32S", manufacturer: "Ai-Thinker / NodeMCU community", variant: "NodeMCU-32S, ESP32-WROOM-32, dual-row development board", mcu: "ESP32", logicVoltage: 3.3, analogResolutionBits: 12, analogReferenceVolts: 3.3, runtimePinCount: 40,
+    ioPins: esp32Pins, pwmPins: esp32Pins.filter(pin => pin.pwm).map(pin => pin.runtimePin), analogPins: esp32Pins.filter(pin => pin.analog).map(pin => pin.runtimePin), constants: { LED_BUILTIN: 2, SDA: 21, SCL: 22, MOSI: 23, MISO: 19, SCK: 18, SS: 5 }, reservedPins: [6, 7, 8, 9, 10, 11], rails: { "3V3": 3.3, "5V": 5, VIN: 5 }, groundPins: ["GND", "GND2", "GND3", "GND4"], i2c: [{ sda: 21, scl: 22 }], spi: [{ mosi: 23, miso: 19, sck: 18, ss: 5 }, { mosi: 13, miso: 12, sck: 14, ss: 15 }], uart: [{ rx: 3, tx: 1 }, { rx: 16, tx: 17 }], builtinLed: 2, documentation: "https://docs.espressif.com/projects/esp-idf/en/stable/esp32/hw-reference/esp32/get-started-devkitc.html",
+  },
+  "esp32-devkit-v1-30pin": {
+    id: "esp32-devkit-v1-30pin", displayName: "DOIT ESP32 DevKit V1 · 30-pin", manufacturer: "DOIT", variant: "ESP32 DevKit V1, 30-pin ESP32-WROOM-32", mcu: "ESP32", logicVoltage: 3.3, analogResolutionBits: 12, analogReferenceVolts: 3.3, runtimePinCount: 40,
+    ioPins: esp32Pins, pwmPins: esp32Pins.filter(pin => pin.pwm).map(pin => pin.runtimePin), analogPins: esp32Pins.filter(pin => pin.analog).map(pin => pin.runtimePin), constants: { LED_BUILTIN: 2, SDA: 21, SCL: 22, MOSI: 23, MISO: 19, SCK: 18, SS: 5 }, reservedPins: [6, 7, 8, 9, 10, 11], rails: { "3V3": 3.3, "5V": 5, VIN: 5 }, groundPins: ["GND", "GND2", "GND3"], i2c: [{ sda: 21, scl: 22 }], spi: [{ mosi: 23, miso: 19, sck: 18, ss: 5 }], uart: [{ rx: 3, tx: 1 }, { rx: 16, tx: 17 }], builtinLed: 2, documentation: "https://docs.espressif.com/projects/arduino-esp32/en/latest/boards/ESP32/DOIT_ESP32_DEVKIT_V1.html",
+  },
+  "xiao-esp32s3-sense": {
+    id: "xiao-esp32s3-sense", displayName: "Seeed XIAO ESP32-S3 Sense", manufacturer: "Seeed Studio", variant: "XIAO ESP32-S3 Sense with OV2640 camera and microSD", mcu: "ESP32-S3", logicVoltage: 3.3, analogResolutionBits: 12, analogReferenceVolts: 3.3, runtimePinCount: 49,
+    ioPins: xiaoPins, pwmPins: xiaoPins.map(pin => pin.runtimePin), analogPins: xiaoPins.filter(pin => pin.analog).map(pin => pin.runtimePin), constants: { D0: 1, D1: 2, D2: 3, D3: 4, D4: 5, D5: 6, D6: 43, D7: 44, D8: 7, D9: 8, D10: 9, LED_BUILTIN: 21, SDA: 5, SCL: 6, MOSI: 9, MISO: 8, SCK: 7, SS: 2 }, reservedPins: [], rails: { "3V3": 3.3, "5V": 5 }, groundPins: ["GND"], i2c: [{ sda: 5, scl: 6 }], spi: [{ mosi: 9, miso: 8, sck: 7, ss: 2 }], uart: [undefined, { rx: 44, tx: 43 }], builtinLed: 21, documentation: "https://wiki.seeedstudio.com/xiao_esp32s3_sense/",
+  },
+  "freenove-esp32s3-wroom": {
+    id: "freenove-esp32s3-wroom", displayName: "Freenove ESP32-S3-WROOM", manufacturer: "Freenove", variant: "ESP32-S3-WROOM, dual-row development board", mcu: "ESP32-S3", logicVoltage: 3.3, analogResolutionBits: 12, analogReferenceVolts: 3.3, runtimePinCount: 49,
+    ioPins: esp32S3Pins, pwmPins: esp32S3Pins.filter(pin => pin.pwm).map(pin => pin.runtimePin), analogPins: esp32S3Pins.filter(pin => pin.analog).map(pin => pin.runtimePin), constants: { LED_BUILTIN: 48, SDA: 8, SCL: 9, MOSI: 11, MISO: 13, SCK: 12, SS: 10 }, reservedPins: [], rails: { "3V3": 3.3, "5V": 5, VIN: 5 }, groundPins: ["GND", "GND2", "GND3"], i2c: [{ sda: 8, scl: 9 }], spi: [{ mosi: 11, miso: 13, sck: 12, ss: 10 }], uart: [undefined, { rx: 44, tx: 43 }], builtinLed: 48, documentation: "https://docs.freenove.com/projects/fnk0085/en/latest/",
   },
 };
 
@@ -209,11 +234,18 @@ const ESP32_DEVKITC_HEADER_ROWS: BoardHeaderRows = {
   left: ["3V3", "GPIO36", "GPIO39", "GPIO34", "GPIO35", "GPIO32", "GPIO33", "GPIO25", "GPIO26", "GPIO27", "GPIO14", "GPIO12", "GND", "GPIO13", "GPIO9", "GPIO10", "GPIO11", "5V"],
   right: ["GND2", "GPIO23", "GPIO22", "GPIO1", "GPIO3", "GPIO21", "GND3", "GPIO19", "GPIO18", "GPIO5", "GPIO17", "GPIO16", "GPIO4", "GPIO0", "GPIO2", "GPIO15", "GPIO8", "GPIO7", "GPIO6"],
 };
+const SCREENSHOT_BOARD_HEADER_ROWS: Readonly<Record<string, BoardHeaderRows>> = {
+  "esp32-nodemcu-32s": { left: ["3V3", "GPIO36", "GPIO39", "GPIO34", "GPIO35", "GPIO32", "GPIO33", "GPIO25", "GPIO26", "GPIO27", "GPIO14", "GPIO12", "GND", "GPIO13", "GPIO9", "GPIO10", "GPIO11", "VIN", "GND4"], right: ["GND2", "GPIO23", "GPIO22", "GPIO1", "GPIO3", "GPIO21", "GND3", "GPIO19", "GPIO18", "GPIO5", "GPIO17", "GPIO16", "GPIO4", "GPIO0", "GPIO2", "GPIO15", "GPIO8", "GPIO7", "5V"] },
+  "esp32-devkit-v1-30pin": { left: ["3V3", "GPIO36", "GPIO39", "GPIO34", "GPIO35", "GPIO32", "GPIO33", "GPIO25", "GPIO26", "GPIO27", "GPIO14", "GPIO12", "GND", "GPIO13", "GPIO9"], right: ["VIN", "GND2", "GPIO23", "GPIO22", "GPIO1", "GPIO3", "GPIO21", "GND3", "GPIO19", "GPIO18", "GPIO5", "GPIO17", "GPIO16", "GPIO4", "GPIO0"] },
+  "xiao-esp32s3-sense": { left: ["D0", "D1", "D2", "D3", "D4", "D5", "D6"], right: ["D7", "D8", "D9", "D10", "3V3", "5V", "GND"] },
+  "freenove-esp32s3-wroom": { left: ["3V3", "GPIO0", "GPIO1", "GPIO2", "GPIO3", "GPIO4", "GPIO5", "GPIO6", "GPIO7", "GPIO8", "GPIO9", "GPIO10", "GPIO11", "GPIO12", "GPIO13", "GPIO14", "GPIO15", "GPIO16", "GPIO17", "GPIO18"], right: ["5V", "GND", "GPIO21", "GPIO20", "GPIO19", "GPIO47", "GPIO48", "GPIO45", "GPIO46", "GPIO41", "GPIO42", "GPIO40", "GPIO39", "GPIO38", "GPIO37", "GPIO36", "GPIO35", "GPIO34", "GPIO33", "GPIO32"] },
+};
 
 function boardHeaderRows(profile: BoardProfile): BoardHeaderRows {
   if (profile.id === "esp32-devkitc-v4") {
     return { left: [...ESP32_DEVKITC_HEADER_ROWS.left], right: [...ESP32_DEVKITC_HEADER_ROWS.right] };
   }
+  if (SCREENSHOT_BOARD_HEADER_ROWS[profile.id]) return { left: [...SCREENSHOT_BOARD_HEADER_ROWS[profile.id]!.left], right: [...SCREENSHOT_BOARD_HEADER_ROWS[profile.id]!.right] };
 
   const physicalIo = profile.ioPins.filter(pin => pin.runtimePin >= 0 && !pin.onboard);
   const half = Math.ceil(physicalIo.length / 2);
@@ -233,17 +265,24 @@ function boardHeaderRows(profile: BoardProfile): BoardHeaderRows {
 function boardDefinition(profile: BoardProfile): ComponentDefinition {
   const physicalIo = profile.ioPins.filter(pin => pin.runtimePin >= 0 && !pin.onboard);
   const headerRows = boardHeaderRows(profile);
+  const height = Math.max(240, Math.max(headerRows.left.length, headerRows.right.length) * 19 + 82);
+  const width = profile.id === "arduino-mega-2560" ? 340 : profile.id.includes("esp") ? 230 : 270;
   const ioById = new Map(physicalIo.map(pin => [pin.id, pin]));
   const powerById = new Map<string, Pick<ComponentPinDefinition, "id" | "label" | "direction" | "signals">>();
   for (const id of Object.keys(profile.rails)) powerById.set(id, { id, label: id, direction: "power", signals: ["power"] });
   for (const id of profile.groundPins) powerById.set(id, { id, label: "GND", direction: "power", signals: ["ground"] });
   const pinsForRow = (ids: readonly string[], side: "left" | "right") => ids.map((id, order) => {
     const ioPin = ioById.get(id);
-    return ioPin ? ioPinDefinition(ioPin, order, side) : { ...powerById.get(id)!, side, order };
+    const base = ioPin ? ioPinDefinition(ioPin, order, side) : powerById.get(id) ? { ...powerById.get(id)!, side, order } : { id, label: id, direction: "passive" as const, signals: [] as PinSignal[], side, order };
+    const customRows = SCREENSHOT_BOARD_HEADER_ROWS[profile.id];
+    if (!customRows) return base;
+    const viewHeight = profile.id === "xiao-esp32s3-sense" ? 240 : profile.id === "esp32-devkit-v1-30pin" ? 367 : profile.id === "esp32-nodemcu-32s" ? 443 : 462;
+    const artX = side === "left" ? profile.id === "xiao-esp32s3-sense" ? 55 : profile.id === "esp32-devkit-v1-30pin" ? 42 : profile.id === "esp32-nodemcu-32s" ? 35 : 29 : profile.id === "xiao-esp32s3-sense" ? 165 : profile.id === "esp32-devkit-v1-30pin" ? 178 : profile.id === "esp32-nodemcu-32s" ? 185 : 191;
+    const artY = profile.id === "xiao-esp32s3-sense" ? 43 + order * 25 : profile.id === "esp32-devkit-v1-30pin" ? 24 + order * 22.8 : profile.id === "esp32-nodemcu-32s" ? 25 + order * (390 / 18) : 23 + order * (416 / 19);
+    const scale = Math.min(width / 220, (height - 6) / viewHeight);
+    return { ...base, anchor: { x: (width - 220 * scale) / 2 + artX * scale, y: (height - viewHeight * scale) / 2 + artY * scale } };
   });
   const pinDefinitions = [...pinsForRow(headerRows.left, "left"), ...pinsForRow(headerRows.right, "right")];
-  const height = Math.max(240, Math.max(headerRows.left.length, headerRows.right.length) * 19 + 82);
-  const width = profile.id === "arduino-mega-2560" ? 340 : profile.id.includes("esp") ? 230 : 270;
   const properties: Record<string, ComponentPropertyDefinition> = profile.id.startsWith("esp") ? {
     networkSsid: { kind: "string", label: "Virtual Wi-Fi network", defaultValue: "CirkitraNet" },
     networkPassword: { kind: "string", label: "Virtual Wi-Fi password", defaultValue: "cirkitra123" },

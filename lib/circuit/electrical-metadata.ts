@@ -1,6 +1,6 @@
 import { getComponentDefinition } from "./catalog.ts";
 import type { CircuitConnection, CircuitProject, ConnectionEndpoint } from "./types.ts";
-import { getBoardProfile, isBoardType } from "./boards.ts";
+import { getBoardProfile, isBoardType, resolveBoardPin } from "./boards.ts";
 import { POWER_TERMINAL_GROUPS } from "./terminal-groups.ts";
 import { PowerRuntime } from "../simulator/power.ts";
 
@@ -352,6 +352,188 @@ export function repairMissingPowerConnections(project: CircuitProject): {
 }
 
 /**
+ * Join otherwise-isolated return nets only when the user's request explicitly
+ * calls for a common/shared ground. Generated schematics often use ground
+ * symbols consistently for peripherals but forget the physical wire back to
+ * the controller; connecting a dedicated ground endpoint to the selected
+ * board reference is safe, while joining an arbitrary net is not.
+ */
+export function repairExplicitCommonGroundWiring(project: CircuitProject, prompt: string): {
+  project: CircuitProject;
+  repairs: Array<{ componentId: string; pin: string; boardId: string; boardPin: string }>;
+} {
+  const commonGroundRequested = /\b(?:common|shared|same)(?:\s+[\w-]+){0,3}\s+(?:ground|gnd)\b|\b(?:grounds?|gnds?)\s+(?:must\s+be\s+)?(?:common|shared|joined|connected)\b|\b(?:wire|connect|join)\b.{0,80}\b(?:grounds?|gnds?)\b.{0,35}\b(?:together|common|shared|same)\b/i.test(prompt);
+  const explicitGroundReturnsJoinBoard = /\b(?:wire|connect|join)\b[\s\S]{0,90}\b(?:all|every|both|each)\s+(?:[\w-]+\s+){0,3}(?:grounds?|gnds?)\b[\s\S]{0,100}\b(?:uno|mega|nano|esp32|xiao|pico|controller|board)\b.{0,24}\b(?:gnd|ground)\b/i.test(prompt);
+  const supplyReturnExplicitlyJoinsBoard = /\b(?:supply|battery|power)\s+(?:return\s+)?(?:negative|minus|-(?=\s|\b|$)).{0,48}\b(?:uno|mega|nano|esp32|xiao|pico|controller|board)\b.{0,24}\b(?:gnd|ground)\b|\b(?:negative|minus)\b.{0,36}\b(?:uno|mega|nano|esp32|xiao|pico|controller|board)\s+(?:gnd|ground)\b/i.test(prompt);
+  const buttonTerminal2GroundRequested = /\bbutton\b[\s\S]{0,120}\bterminal\s*2\b[\s\S]{0,80}\b(?:gnd|ground)\b/i.test(prompt);
+  if (!commonGroundRequested && !explicitGroundReturnsJoinBoard && !supplyReturnExplicitlyJoinsBoard && !buttonTerminal2GroundRequested) {
+    return { project, repairs: [] };
+  }
+  const boards = project.components.filter(component => isBoardType(component.type));
+  if (!boards.length) return { project, repairs: [] };
+  const anchorBoard = boards[0]!;
+  const anchorProfile = getBoardProfile(anchorBoard.type);
+  const anchorPin = anchorProfile?.groundPins[0];
+  if (!anchorPin) return { project, repairs: [] };
+
+  const components = new Map(project.components.map(component => [component.id, component]));
+  const connections = [...project.connections];
+  const ids = new Set(connections.map(connection => connection.id));
+  const key = (componentId: string, pin: string) => `${componentId}:${pin}`;
+  const parent = new Map<string, string>();
+  const find = (node: string): string => {
+    const current = parent.get(node);
+    if (!current || current === node) { parent.set(node, node); return node; }
+    const root = find(current);
+    parent.set(node, root);
+    return root;
+  };
+  const join = (a: string, b: string) => {
+    const first = find(a); const second = find(b);
+    if (first !== second) parent.set(second, first);
+  };
+  for (const wire of connections) join(key(wire.from.componentId, wire.from.pin), key(wire.to.componentId, wire.to.pin));
+  // Even if board grounds are electrically common in hardware, generated
+  // schematics and their independent wiring checks need explicit wires so the
+  // ground path remains visible and auditable.
+  const groundSymbols = project.components.filter(component => component.type === "ground");
+  for (const component of project.components) for (const group of POWER_TERMINAL_GROUPS[component.type] ?? []) {
+    if (group.every(pin => isGroundLikePin(component, pin))) {
+      for (const pin of group.slice(1)) join(key(component.id, group[0]!), key(component.id, pin));
+    }
+  }
+
+  const anchor = key(anchorBoard.id, anchorPin);
+  const repairs: Array<{ componentId: string; pin: string; boardId: string; boardPin: string }> = [];
+  const isGroundEndpoint = (component: { id: string; type: string }, pin: string) => isGroundLikePin(component, pin)
+    || (buttonTerminal2GroundRequested && component.type === "push-button" && pin === "2");
+  const addGroundWire = (componentId: string, pin: string) => {
+    if (find(key(componentId, pin)) === find(anchor)) return;
+    const root = find(key(componentId, pin));
+    // A ground-marked pin that is already tied to a GPIO, positive rail, or
+    // other signal must remain untouched so the normal validator can explain
+    // the fault instead of turning the repair into a short.
+    const wiredEndpoints = connections.flatMap(wire => [wire.from, wire.to])
+      .filter(endpoint => find(key(endpoint.componentId, endpoint.pin)) === root);
+    if (wiredEndpoints.some(endpoint => {
+      const target = components.get(endpoint.componentId);
+      return !target || !isGroundEndpoint(target, endpoint.pin);
+    })) return;
+
+    const base = `common_ground_${componentId}_${pin}_${anchorBoard.id}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 56);
+    let id = base; let suffix = 1;
+    while (ids.has(id)) id = `${base}_${suffix++}`;
+    ids.add(id);
+    connections.push({ id, from: { componentId, pin }, to: { componentId: anchorBoard.id, pin: anchorPin }, color: "#83b8ff" });
+    join(key(componentId, pin), anchor);
+    repairs.push({ componentId, pin, boardId: anchorBoard.id, boardPin: anchorPin });
+  };
+
+  // Connect board returns and ground symbols first so a single repair makes
+  // all symbol-marked negative endpoints physically share the board return.
+  for (const board of boards) for (const pin of getBoardProfile(board.type)?.groundPins ?? []) {
+    if (connections.some(wire =>
+      (wire.from.componentId === board.id && wire.from.pin === pin)
+      || (wire.to.componentId === board.id && wire.to.pin === pin))) addGroundWire(board.id, pin);
+  }
+  for (const ground of groundSymbols) addGroundWire(ground.id, "GND");
+  for (const component of project.components) if (component.type === "dc-supply" || component.type === "battery-cell") addGroundWire(component.id, "-");
+  for (const component of project.components) for (const pin of getComponentDefinition(component.type)?.metadata?.groundPins ?? []) addGroundWire(component.id, pin);
+  if (buttonTerminal2GroundRequested) for (const component of project.components) if (component.type === "push-button") addGroundWire(component.id, "2");
+  if (/\b(?:LED\s+cathode|cathode\s+of\s+(?:the\s+)?LED)\b.{0,60}\b(?:GND|ground)\b/i.test(prompt)) {
+    for (const component of project.components) if (component.type === "led") addGroundWire(component.id, "K");
+  }
+  return repairs.length ? { project: { ...project, connections }, repairs } : { project, repairs };
+}
+
+/** Add A4988 straps only when the prompt explicitly requests full-step mode.
+ * This avoids guessing driver modes in other stepper projects. */
+export function repairExplicitA4988ModeStraps(project: CircuitProject, prompt: string): {
+  project: CircuitProject;
+  repairs: Array<{ driverId: string; pin: string; referencePin: string }>;
+} {
+  if (!/\b(?:tie|connect|wire)\s+(?:the\s+)?(?:reset|rst)\s+to\s+(?:the\s+)?(?:sleep|slp)\b/i.test(prompt)
+    || !/\bms1\b.{0,40}\bms2\b.{0,40}\bms3\b.{0,80}\b(?:low|ground|full[ -]step)\b/i.test(prompt)) {
+    return { project, repairs: [] };
+  }
+  const drivers = project.components.filter(component => component.type === "a4988-stepper-driver");
+  if (drivers.length !== 1) return { project, repairs: [] };
+  const driver = drivers[0]!;
+  const connections = [...project.connections];
+  const ids = new Set(connections.map(connection => connection.id));
+  const key = (componentId: string, pin: string) => `${componentId}:${pin}`;
+  const boardDigitalPin = (componentId: string, pin: string) => {
+    const board = project.components.find(component => component.id === componentId);
+    return !!board && isBoardType(board.type) && (getBoardProfile(board.type)?.ioPins.some(io => io.id === pin || io.aliases?.includes(pin)) ?? false);
+  };
+  // The explicit strap request supersedes generated MCU control wires on the
+  // two strap pads; those pins are not part of the requested STEP/DIR/EN map.
+  for (const pin of ["RST", "SLP"]) {
+    const controlWires = connections.filter(connection =>
+      (connection.from.componentId === driver.id && connection.from.pin === pin && boardDigitalPin(connection.to.componentId, connection.to.pin))
+      || (connection.to.componentId === driver.id && connection.to.pin === pin && boardDigitalPin(connection.from.componentId, connection.from.pin)));
+    if (controlWires.length) {
+      const idsToRemove = new Set(controlWires.map(connection => connection.id));
+      for (let index = connections.length - 1; index >= 0; index -= 1) if (idsToRemove.has(connections[index]!.id)) connections.splice(index, 1);
+    }
+  }
+  const connected = (start: string, target: string) => {
+    const graph = new Map<string, Set<string>>();
+    for (const connection of connections) {
+      const a = key(connection.from.componentId, connection.from.pin);
+      const b = key(connection.to.componentId, connection.to.pin);
+      if (!graph.has(a)) graph.set(a, new Set()); if (!graph.has(b)) graph.set(b, new Set());
+      graph.get(a)!.add(b); graph.get(b)!.add(a);
+    }
+    const pending = [start]; const seen = new Set<string>();
+    while (pending.length) {
+      const current = pending.pop()!;
+      if (current === target) return true;
+      if (seen.has(current)) continue;
+      seen.add(current); pending.push(...(graph.get(current) ?? []));
+    }
+    return false;
+  };
+  const repairs: Array<{ driverId: string; pin: string; referencePin: string }> = [];
+  const addStrap = (pin: string, referencePin: string) => {
+    const start = key(driver.id, pin); const target = key(driver.id, referencePin);
+    if (connected(start, target)) return;
+    const existing = connections.some(connection =>
+      (connection.from.componentId === driver.id && connection.from.pin === pin)
+      || (connection.to.componentId === driver.id && connection.to.pin === pin));
+    if (existing) return;
+    const base = `a4988_explicit_${driver.id}_${pin}_${referencePin}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 56);
+    let id = base; let suffix = 1; while (ids.has(id)) id = `${base}_${suffix++}`; ids.add(id);
+    connections.push({ id, from: { componentId: driver.id, pin }, to: { componentId: driver.id, pin: referencePin }, color: "#83b8ff" });
+    repairs.push({ driverId: driver.id, pin, referencePin });
+  };
+
+  addStrap("RST", "SLP");
+  if (/\b(?:reset|rst)\b[^.;\n]{0,140}\b(?:high|vdd|5\s?v)\b/i.test(prompt)
+    && !connected(key(driver.id, "RST"), key(driver.id, "VDD"))) {
+    const base = `a4988_explicit_${driver.id}_RST_VDD`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 56);
+    let id = base; let suffix = 1; while (ids.has(id)) id = `${base}_${suffix++}`; ids.add(id);
+    connections.push({ id, from: { componentId: driver.id, pin: "RST" }, to: { componentId: driver.id, pin: "VDD" }, color: "#83b8ff" });
+    repairs.push({ driverId: driver.id, pin: "RST", referencePin: "VDD" });
+  }
+  const groundedReference = ["GND_14", "GND_15"].find(pin =>
+    connections.some(connection =>
+      (connection.from.componentId === driver.id && connection.from.pin === pin)
+      || (connection.to.componentId === driver.id && connection.to.pin === pin)));
+  if (groundedReference) for (const pin of ["MS1", "MS2", "MS3"]) addStrap(pin, groundedReference);
+  return repairs.length ? { project: { ...project, connections }, repairs } : { project, repairs };
+}
+
+function isGroundLikePin(component: { id: string; type: string }, pin: string): boolean {
+  if (component.type === "ground" && pin === "GND") return true;
+  if (isBoardType(component.type) && (getBoardProfile(component.type)?.groundPins.includes(pin) ?? false)) return true;
+  if ((component.type === "dc-supply" || component.type === "battery-cell") && pin === "-") return true;
+  const metadataGrounds = getComponentDefinition(component.type)?.metadata?.groundPins ?? [];
+  if (metadataGrounds.includes(pin)) return true;
+  return /^(?:-|K|GND(?:\d+|_\w+)?|AGND|DGND|VSS(?:_\w+)?|PGND(?:_\w+)?|COM_GND)$/i.test(pin);
+}
+
+/**
  * Repair the very specific, unambiguous upstream/downstream topology for a
  * two-zone BME280 circuit behind one TCA9548A. Gemini must have explicitly
  * requested the muxed arrangement, the code must select channels 0 and 1,
@@ -469,23 +651,43 @@ export function repairExplicitTb6612StandbyWiring(project: CircuitProject, promp
   const drivers = project.components.filter(component => component.type === "tb6612fng");
   const boards = project.components.filter(component => isBoardType(component.type));
   if (drivers.length !== 1 || boards.length !== 1) return { project, repairs: [] };
-  const mapping = prompt.match(/\b(?:STBY|standby)\s*(?:pin\s*)?(?:D)?(\d+)\b|\b(?:D)?(\d+)\s*(?:pin\s*)?(?:for\s+)?(?:STBY|standby)\b/i);
-  const pinNumber = Number(mapping?.[1] ?? mapping?.[2]);
-  if (!Number.isInteger(pinNumber)) return { project, repairs: [] };
-  const pinName = `D${pinNumber}`;
+  const pinLabel = explicitBoardPinLabelForRole(prompt, "(?:STBY|standby)");
+  if (!pinLabel) return { project, repairs: [] };
   const driver = drivers[0];
   const board = boards[0];
+  const pinNumber = resolveBoardPin(board.type, pinLabel);
+  if (pinNumber === undefined) return { project, repairs: [] };
+  const pinName = getBoardProfile(board.type)?.ioPins.find(pin => pin.runtimePin === pinNumber)?.id;
   const boardPin = getBoardProfile(board.type)?.ioPins.find(pin => pin.id === pinName);
-  if (!boardPin || project.connections.some(connection =>
-    (connection.from.componentId === driver.id && connection.from.pin === "STBY")
-      || (connection.to.componentId === driver.id && connection.to.pin === "STBY"))) return { project, repairs: [] };
+  if (!pinName || !boardPin) return { project, repairs: [] };
 
-  const variableNames = [...code.matchAll(/\b(?:const\s+)?(?:int|byte|uint\d+_t)\s+([A-Za-z_]\w*)\s*=\s*(?:D)?(\d+)\s*;/gi)]
+  const variableNames = [...code.matchAll(/\b(?:const\s+)?(?:int|byte|long|uint\d+_t)\s+([A-Za-z_]\w*)\s*=\s*(?:(?:GPIO|GP|D)\s*)?(\d+)\s*;/gi)]
     .filter(match => Number(match[2]) === pinNumber && /stby|standby/i.test(match[1]))
     .map(match => match[1]);
-  const pinUsedInSketch = new RegExp(`\\b(?:pinMode|digitalWrite|analogWrite)\\s*\\(\\s*D?${pinNumber}\\b`, "i").test(code)
+  const pinUsedInSketch = new RegExp(`\\b(?:pinMode|digitalWrite|analogWrite)\\s*\\(\\s*(?:(?:GPIO|GP|D)\\s*)?${pinNumber}\\b`, "i").test(code)
     || variableNames.some(name => new RegExp(`\\b(?:pinMode|digitalWrite|analogWrite)\\s*\\(\\s*${name}\\b`, "i").test(code));
   if (!pinUsedInSketch) return { project, repairs: [] };
+
+  const stbyWires = project.connections.filter(connection =>
+    (connection.from.componentId === driver.id && connection.from.pin === "STBY")
+      || (connection.to.componentId === driver.id && connection.to.pin === "STBY"));
+  const removableStbyWires = stbyWires.filter(connection => {
+    const other = connection.from.componentId === driver.id && connection.from.pin === "STBY" ? connection.to : connection.from;
+    const otherComponent = project.components.find(component => component.id === other.componentId);
+    if (!otherComponent) return false;
+    if (other.componentId === board.id) {
+      const profile = getBoardProfile(board.type)!;
+      return profile.ioPins.some(pin => pin.id === other.pin)
+        || Object.hasOwn(profile.rails, other.pin) || profile.groundPins.includes(other.pin);
+    }
+    return otherComponent.type === "ground" && other.pin === "GND";
+  });
+  if (stbyWires.length !== removableStbyWires.length) return { project, repairs: [] };
+  if (stbyWires.length === 1) {
+    const existing = stbyWires[0]!;
+    const other = existing.from.componentId === driver.id && existing.from.pin === "STBY" ? existing.to : existing.from;
+    if (other.componentId === board.id && other.pin === pinName) return { project, repairs: [] };
+  }
 
   const net = new Set<string>([`${board.id}:${pinName}`]);
   const pending = [...net];
@@ -501,17 +703,94 @@ export function repairExplicitTb6612StandbyWiring(project: CircuitProject, promp
   const componentById = new Map(project.components.map(component => [component.id, component]));
   const activeIds = new Set([...net].map(endpoint => endpoint.slice(0, endpoint.lastIndexOf(":")))
     .filter(id => componentById.get(id)?.type !== "resistor"));
-  if ([...activeIds].some(id => id !== board.id)) return { project, repairs: [] };
+  if ([...activeIds].some(id => id !== board.id && id !== driver.id)) return { project, repairs: [] };
 
   const idBase = `explicit_stby_${driver.id}_${board.id}_${pinName}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 56);
   let id = idBase; let suffix = 1;
-  const ids = new Set(project.connections.map(connection => connection.id));
+  const ids = new Set(project.connections.filter(connection => !removableStbyWires.includes(connection)).map(connection => connection.id));
   while (ids.has(id)) id = `${idBase}_${suffix++}`;
   const connection: CircuitConnection = { id, from: { componentId: board.id, pin: pinName }, to: { componentId: driver.id, pin: "STBY" } };
   return {
-    project: { ...project, connections: [...project.connections, connection] },
+    project: { ...project, connections: [...project.connections.filter(connection => !removableStbyWires.includes(connection)), connection] },
     repairs: [{ driverId: driver.id, boardId: board.id, boardPin: pinName }],
   };
+}
+
+function explicitBoardPinLabelForRole(prompt: string, role: string): string | undefined {
+  const pinToken = "(?:GPIO|GP|D)\\s*\\d+";
+  const roleFirst = new RegExp(`\\b${role}\\b[^.;\\n]{0,80}?\\b(${pinToken})\\b`, "i").exec(prompt)?.[1];
+  const pinFirstMatch = new RegExp(`\\b(${pinToken})\\b[^.;\\n]{0,80}?\\b${role}\\b`, "i").exec(prompt)?.[0];
+  const pinFirst = pinFirstMatch?.match(new RegExp(`\\b${pinToken}\\b`, "gi"))?.at(-1);
+  return (roleFirst ?? pinFirst)?.replace(/\s+/g, "");
+}
+
+/** Repair an omitted or misassigned A4988 STEP/DIR/EN wire only when the
+ * prompt provides an ordered GPIO triple and the sketch names those same
+ * pins as the driver controls. */
+export function repairExplicitA4988ControlWiring(project: CircuitProject, prompt: string, code: string): {
+  project: CircuitProject;
+  repairs: Array<{ driverId: string; boardId: string; driverPin: string; boardPin: string }>;
+} {
+  const drivers = project.components.filter(component => component.type === "a4988-stepper-driver");
+  const boards = project.components.filter(component => isBoardType(component.type));
+  if (drivers.length !== 1 || boards.length !== 1) return { project, repairs: [] };
+  const grouped = /\bSTEP\s*(?:\/|,)\s*DIR\s*(?:\/|,)\s*EN\b[^.;\n]{0,36}?\b(?:to|on)\b([^.;,\n]+)/i.exec(prompt)?.[1];
+  const requestedLabels = grouped?.match(/\b(?:GPIO|GP|D)\s*\d+\b/gi) ?? [];
+  if (requestedLabels.length !== 3) return { project, repairs: [] };
+  const driver = drivers[0]!;
+  const board = boards[0]!;
+  const requested = requestedLabels.map(label => {
+    const number = resolveBoardPin(board.type, label.replace(/\s+/g, ""));
+    const pin = getBoardProfile(board.type)?.ioPins.find(item => item.runtimePin === number && !item.reserved);
+    return pin && number !== undefined ? { label: pin.id, number } : undefined;
+  });
+  if (requested.some(pin => !pin)) return { project, repairs: [] };
+
+  const declarations: Array<{ name: string; number: number }> = [];
+  // Accept both one declaration per statement and C++'s comma-separated
+  // declarators (e.g. `const int stepPin=2, dirPin=3, enPin=4;`).
+  for (const statement of code.matchAll(/\b(?:const\s+)?(?:int|byte|long|uint\d+_t)\s+([^;]+);/gi)) {
+    for (const declarator of statement[1]!.split(",")) {
+      const match = /^\s*([A-Za-z_]\w*)\s*=\s*(?:(?:GPIO|GP|D)\s*)?(\d+)\s*$/.exec(declarator);
+      if (match) declarations.push({ name: match[1]!, number: Number(match[2]) });
+    }
+  }
+  const roles = ["STEP", "DIR", "EN"] as const;
+  const codePins = roles.map(role => declarations.find(match => {
+    const name = match.name.toLowerCase();
+    return role === "STEP" ? /step|pulse/.test(name) : role === "DIR" ? /dir|direction/.test(name) : /enable|^en(?:$|[_a-z])|_en(?:$|_)/.test(name);
+  }));
+  if (codePins.some((match, index) => !match || match.number !== requested[index]!.number)) return { project, repairs: [] };
+
+  const connections = [...project.connections];
+  const ids = new Set(connections.map(connection => connection.id));
+  const repairs: Array<{ driverId: string; boardId: string; driverPin: string; boardPin: string }> = [];
+  for (const [index, driverPin] of ["STEP", "DIR", "EN"].entries()) {
+    const target = requested[index]!;
+    const existing = connections.filter(connection =>
+      (connection.from.componentId === driver.id && connection.from.pin === driverPin)
+        || (connection.to.componentId === driver.id && connection.to.pin === driverPin));
+    if (existing.length === 1 && (() => {
+      const other = existing[0]!.from.componentId === driver.id && existing[0]!.from.pin === driverPin ? existing[0]!.to : existing[0]!.from;
+      return other.componentId === board.id && other.pin === target.label;
+    })()) continue;
+    if (existing.some(connection => {
+      const other = connection.from.componentId === driver.id && connection.from.pin === driverPin ? connection.to : connection.from;
+      return other.componentId !== board.id || !getBoardProfile(board.type)?.ioPins.some(pin => pin.id === other.pin);
+    })) continue;
+    const targetOccupied = connections.some(connection => {
+      const endpoint = connection.from.componentId === board.id && connection.from.pin === target.label ? connection.to
+        : connection.to.componentId === board.id && connection.to.pin === target.label ? connection.from : undefined;
+      return endpoint !== undefined && !(endpoint.componentId === driver.id && endpoint.pin === driverPin);
+    });
+    if (targetOccupied) continue;
+    for (let wireIndex = connections.length - 1; wireIndex >= 0; wireIndex -= 1) if (existing.includes(connections[wireIndex]!)) connections.splice(wireIndex, 1);
+    const base = `explicit_a4988_${driver.id}_${driverPin}_${board.id}_${target.label}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 56);
+    let id = base; let suffix = 1; while (ids.has(id)) id = `${base}_${suffix++}`; ids.add(id);
+    connections.push({ id, from: { componentId: board.id, pin: target.label }, to: { componentId: driver.id, pin: driverPin }, color: "#83b8ff" });
+    repairs.push({ driverId: driver.id, boardId: board.id, driverPin, boardPin: target.label });
+  }
+  return repairs.length ? { project: { ...project, connections }, repairs } : { project, repairs };
 }
 
 /** Tie only floating address/mode straps to the local validated rails for the
@@ -574,16 +853,66 @@ export function repairExplicitI2cPeripheralBus(project: CircuitProject, prompt: 
 } {
   const descriptors: Record<string, { sda: string; scl: string; pullups: boolean }> = {
     "ssd1306-oled-128x64": { sda: "SDA", scl: "SCL", pullups: true },
+    "sh1107-oled-128x128": { sda: "SDA", scl: "SCL", pullups: true },
     "ds3231-rtc": { sda: "SDA", scl: "SCL", pullups: false },
     "bh1750-sen0097": { sda: "SDA", scl: "SCL", pullups: false },
     "sht31-dis": { sda: "SDA", scl: "SCL", pullups: false },
     "mpu-6050": { sda: "SDA", scl: "SCL", pullups: true },
+    "mpu-6050-breakout": { sda: "SDA", scl: "SCL", pullups: true },
     "mcp23017": { sda: "SDA", scl: "SCL", pullups: true },
     "tca9548a": { sda: "SDA", scl: "SCL", pullups: true },
     "bme280": { sda: "SDI", scl: "SCK", pullups: true },
     "bmp280": { sda: "SDI", scl: "SCK", pullups: true },
+    "bme280-gy-bme-p280": { sda: "SDA", scl: "SCL", pullups: true },
+    "bme680-gas-sensor": { sda: "SDA", scl: "SCL", pullups: true },
+    "sgp40-voc-sensor": { sda: "SDA", scl: "SCL", pullups: true },
+    "scd41-co2-sensor": { sda: "SDA", scl: "SCL", pullups: true },
+    "veml7700-light-sensor": { sda: "SDA", scl: "SCL", pullups: false },
+    "apds-9960-proximity-gesture": { sda: "SDA", scl: "SCL", pullups: true },
+    "vl53l0x-tof-distance": { sda: "SDA", scl: "SCL", pullups: true },
+    "as5600-magnetic-encoder": { sda: "SDA", scl: "SCL", pullups: true },
   };
-  const i2cParts = project.components.filter(component => descriptors[component.type]);
+  const parts = project.components.filter(component => descriptors[component.type]);
+  const hasDualBmeMux = project.components.some(component => component.type === "tca9548a")
+    && parts.filter(component => ["bme280", "bmp280", "bme280-gy-bme-p280"].includes(component.type)).length > 1;
+  if (!parts.length || hasDualBmeMux) return { project, repairs: [] };
+
+  let repairedProject = project;
+  const repairs: Array<{ componentId: string; pin: string; boardId: string; boardPin: string }> = [];
+  for (const part of parts) {
+    const result = repairExplicitI2cPeripheralForPart(repairedProject, prompt, part.id);
+    repairedProject = result.project;
+    repairs.push(...result.repairs);
+  }
+  return repairs.length ? { project: repairedProject, repairs } : { project, repairs };
+}
+
+function repairExplicitI2cPeripheralForPart(project: CircuitProject, prompt: string, peripheralId: string): {
+  project: CircuitProject;
+  repairs: Array<{ componentId: string; pin: string; boardId: string; boardPin: string }>;
+} {
+  const descriptors: Record<string, { sda: string; scl: string; pullups: boolean }> = {
+    "ssd1306-oled-128x64": { sda: "SDA", scl: "SCL", pullups: true },
+    "sh1107-oled-128x128": { sda: "SDA", scl: "SCL", pullups: true },
+    "ds3231-rtc": { sda: "SDA", scl: "SCL", pullups: false },
+    "bh1750-sen0097": { sda: "SDA", scl: "SCL", pullups: false },
+    "sht31-dis": { sda: "SDA", scl: "SCL", pullups: false },
+    "mpu-6050": { sda: "SDA", scl: "SCL", pullups: true },
+    "mpu-6050-breakout": { sda: "SDA", scl: "SCL", pullups: true },
+    "mcp23017": { sda: "SDA", scl: "SCL", pullups: true },
+    "tca9548a": { sda: "SDA", scl: "SCL", pullups: true },
+    "bme280": { sda: "SDI", scl: "SCK", pullups: true },
+    "bmp280": { sda: "SDI", scl: "SCK", pullups: true },
+    "bme280-gy-bme-p280": { sda: "SDA", scl: "SCL", pullups: true },
+    "bme680-gas-sensor": { sda: "SDA", scl: "SCL", pullups: true },
+    "sgp40-voc-sensor": { sda: "SDA", scl: "SCL", pullups: true },
+    "scd41-co2-sensor": { sda: "SDA", scl: "SCL", pullups: true },
+    "veml7700-light-sensor": { sda: "SDA", scl: "SCL", pullups: false },
+    "apds-9960-proximity-gesture": { sda: "SDA", scl: "SCL", pullups: true },
+    "vl53l0x-tof-distance": { sda: "SDA", scl: "SCL", pullups: true },
+    "as5600-magnetic-encoder": { sda: "SDA", scl: "SCL", pullups: true },
+  };
+  const i2cParts = project.components.filter(component => component.id === peripheralId && descriptors[component.type]);
   if (i2cParts.length !== 1) {
     return { project, repairs: [] };
   }
@@ -592,12 +921,14 @@ export function repairExplicitI2cPeripheralBus(project: CircuitProject, prompt: 
   if (project.components.some(component => component.type === "tca9548a") && peripheral.type !== "tca9548a") return { project, repairs: [] };
   const descriptor = descriptors[peripheral.type];
   const definition = getComponentDefinition(peripheral.type);
-  if (!definition?.metadata?.libraries.length) return { project, repairs: [] };
+  if (!definition?.metadata?.interfaces.includes("I2C")) return { project, repairs: [] };
   const promptCompact = prompt.toLowerCase().replace(/[^a-z0-9]/g, "");
   const programs = project.components.filter(component => isBoardType(component.type)).flatMap(board => {
     const code = project.programs?.[board.id] ?? (board.type === project.board ? project.code : "");
     const profile = getBoardProfile(board.type);
-    if (!code || !profile || !definition.metadata!.libraries.some(library => library.headers.some(header => code.includes(header)))) return [];
+    const usesI2c = /\bWire\s*\./.test(code)
+      || definition.metadata!.libraries.some(library => library.headers.some(header => code.includes(header)));
+    if (!code || !profile || !usesI2c) return [];
     const profileName = profile.displayName.toLowerCase().replace(/[^a-z0-9]/g, "");
     const profileId = profile.id.toLowerCase().replace(/[^a-z0-9]/g, "");
     if (!promptCompact.includes(profileName) && !promptCompact.includes(profileId)) return [];
@@ -661,8 +992,27 @@ export function repairExplicitI2cPeripheralBus(project: CircuitProject, prompt: 
   };
 
   for (const [devicePin, boardPin] of [[descriptor.sda, boardSda], [descriptor.scl, boardScl]] as const) {
-    // Refuse to repair either line if the other line is already actively
-    // connected somewhere incompatible. No endpoint is rerouted here.
+    // When a model puts both I2C lines on one board GPIO (or swaps them), an
+    // additive-only repair preserves the short and makes the device remain
+    // unreachable. Correct only a direct wire between this explicitly
+    // requested peripheral pin and a different GPIO on the same named board.
+    // Other active nets, pull-ups, and unrelated GPIO wiring remain untouched.
+    for (let index = connections.length - 1; index >= 0; index -= 1) {
+      const wire = connections[index]!;
+      const boardEndpoint = wire.from.componentId === board.id ? wire.from
+        : wire.to.componentId === board.id ? wire.to : undefined;
+      const deviceEndpoint = wire.from.componentId === peripheral.id ? wire.from
+        : wire.to.componentId === peripheral.id ? wire.to : undefined;
+      const isDirectI2cWire = boardEndpoint && deviceEndpoint
+        && deviceEndpoint.pin === devicePin
+        && profile.ioPins.some(pin => pin.id === boardEndpoint.pin)
+        && boardEndpoint.pin !== boardPin;
+      if (isDirectI2cWire) connections.splice(index, 1);
+    }
+
+    // Refuse to add a missing line if its current net already contains an
+    // active, incompatible signal. Only the direct wrong-board-GPIO mapping
+    // above is eligible for deterministic correction.
     const net = getNet(peripheral.id, devicePin);
     const active = [...net].map(endpoint => endpoint.slice(0, endpoint.lastIndexOf(":")))
       .filter(id => project.components.find(component => component.id === id)?.type !== "resistor");

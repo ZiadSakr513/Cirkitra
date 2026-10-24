@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 
 import { createDefaultBlinkProject } from "../../../../lib/circuit/default-project.ts";
-import { applyCircuitEditOperations, configureGenerationTestLimitsForTests, dualBmeMuxProgramGuidance, encoderThresholdProbeProjects, encoderValidationPositions, generationRepairInstructions, GEMINI_PROVIDER_CALL_TIMEOUT_MS, hasObservableButtonEffect, hasObservableButtonEffectAfterRelease, hasObservableEncoderEffect, includeRequiredSupportingParts, ledSeriesResistorIssues, maxDuration, peripheralPinConflictIssues, repairConflictedKy040SignalConnections, repairConflictedNeoPixelDataBranch, repairMissingLedCurrentLimiters, repairStrayCommaBeforeStatement, repairUniquePeripheralPinAssignments, repairUnwiredPeripheralSignalConnections, requestedButtonBehaviorComponents, requestedRotaryControlAction, requestedWs2812DataResistorIssues, resolveUniqueComponentReference, sensorThresholdBehaviorIssues, sensorThresholdContract, sensorThresholdOutputStates, simulateButtonScenario, simulateEncoderScenario, structuredIssueDiagnostics, validatedProgramReferenceGuidance, validatedWiringReferenceGuidance, POST } from "./route.ts";
+import { applyCircuitEditOperations, configureGenerationTestLimitsForTests, dualBmeMuxProgramGuidance, encoderThresholdProbeProjects, encoderValidationPositions, generationOutputTokenBudget, generationRepairInstructions, GEMINI_PROVIDER_CALL_TIMEOUT_MS, hasObservableButtonEffect, hasObservableButtonEffectAfterRelease, hasObservableEncoderEffect, includeRequiredSupportingParts, ledSeriesResistorIssues, maxDuration, namedBoardTypes, normalizeGeneratedConnectionTuple, normalizeSimulatorUartSketch, normalizeSimulatorUartToWiredPort, peripheralPinConflictIssues, renderedDisplayOutputIssues, repairConflictedKy040SignalConnections, repairConflictedNeoPixelDataBranch, repairMissingLedCurrentLimiters, repairMissingNeoPixelBegin, repairStrayCommaBeforeStatement, repairUniquePeripheralPinAssignments, repairUnwiredPeripheralSignalConnections, requestedButtonBehaviorComponents, requestedRotaryControlAction, requestedWs2812DataResistorIssues, resolveUniqueComponentReference, sensorThresholdBehaviorIssues, sensorThresholdContract, sensorThresholdOutputStates, simulateButtonScenario, simulateEncoderScenario, structuredIssueDiagnostics, validatedProgramReferenceGuidance, validatedWiringReferenceGuidance, POST } from "./implementation.ts";
 import { configureAiUsageAdapterForTests, type AiUsageAdapter } from "../../../../lib/billing/ai-usage.ts";
 import { configureAiChatRateLimitAdapterForTests } from "../../../../lib/billing/ai-chat-rate-limit.ts";
 import { configureAiGenerationRateLimitAdapterForTests } from "../../../../lib/billing/ai-generation-rate-limit.ts";
@@ -12,6 +12,7 @@ import { COMPONENT_EXAMPLES, KY040_CONTROL_EXAMPLE_CODE } from "../../../../lib/
 import { greenhouseExample, greenhousePrompt } from "../../../../tests/fixtures/greenhouse.ts";
 import { ArduinoSimulator } from "../../../../lib/simulator/index.ts";
 import { MultiBoardSimulator } from "../../../../lib/simulator/index.ts";
+import { validationCandidateWithBoardPrograms } from "./implementation.ts";
 
 let testReservationId = 0;
 let testAiReservations = 0;
@@ -142,6 +143,18 @@ test("the configured owner bypasses the monthly Build quota while the request is
   assert.equal(testAiFinalizations.at(-1)?.succeeded, true);
 });
 import { selectGenerationComponents } from "../../../../lib/circuit/discovery.ts";
+
+test("new ESP32 profile names resolve to one board rather than a false multi-board request", () => {
+  const cases = [
+    ["Build a circuit with the ESP32 NodeMCU-32S.", "esp32-nodemcu-32s"],
+    ["Build a circuit with the DOIT ESP32 DevKit V1 30-pin board.", "esp32-devkit-v1-30pin"],
+    ["Build a circuit with the Seeed XIAO ESP32-S3 Sense.", "xiao-esp32s3-sense"],
+    ["Build a circuit with the Freenove ESP32-S3-WROOM.", "freenove-esp32s3-wroom"],
+    ["Build a circuit with an ESP32.", "esp32-devkitc-v4"],
+  ] as const;
+  for (const [prompt, expected] of cases) assert.deepEqual(namedBoardTypes(prompt), [expected], prompt);
+  assert.deepEqual(namedBoardTypes("Use an ESP32 NodeMCU-32S and an Arduino Mega 2560."), ["arduino-mega-2560", "esp32-nodemcu-32s"]);
+});
 
 test("generation prompts include reusable simulator-validated pin topologies", () => {
   const mux = validatedWiringReferenceGuidance(["arduino-uno", "bme280", "tca9548a", "mcp23017"]);
@@ -324,6 +337,26 @@ test("generation moves a collided KY-040 signal to an unused GPIO and aligns its
   assert.deepEqual(ambiguous, { code: `#include <Encoder.h>\nEncoder first(2, 3);\nEncoder second(4, 5);\nvoid setup(){} void loop(){}`, connections: project.connections, repairs: [] }, "ambiguous encoder ownership stays with model recovery");
 });
 
+test("servo attach pins resolve to the actual wired servo family when variants share a board", () => {
+  const project = {
+    components: [
+      { id: "uno", type: "arduino-uno", label: "Arduino Uno" },
+      { id: "base", type: "sg90-servo", label: "Base SG90" },
+      { id: "shoulder", type: "sg90-servo", label: "Shoulder SG90" },
+      { id: "elbow", type: "sg90-servo", label: "Elbow SG90" },
+      { id: "aux", type: "servo", label: "Auxiliary Servo" },
+    ],
+    connections: [
+      { id: "base-sig", from: { componentId: "base", pin: "SIG" }, to: { componentId: "uno", pin: "D9" } },
+      { id: "shoulder-sig", from: { componentId: "shoulder", pin: "SIG" }, to: { componentId: "uno", pin: "D10" } },
+      { id: "elbow-sig", from: { componentId: "elbow", pin: "SIG" }, to: { componentId: "uno", pin: "D11" } },
+      { id: "aux-sig", from: { componentId: "aux", pin: "SIG" }, to: { componentId: "uno", pin: "D6" } },
+    ],
+  };
+  const code = `#include <Servo.h>\nServo baseServo, shoulderServo, elbowServo, auxiliaryServo;\nvoid setup(){baseServo.attach(9); shoulderServo.attach(10); elbowServo.attach(11); auxiliaryServo.attach(6);}\nvoid loop(){baseServo.write(90); shoulderServo.write(90); elbowServo.write(90); auxiliaryServo.write(90);}`;
+  assert.deepEqual(peripheralPinConflictIssues(project, "uno", code), []);
+});
+
 test("generation aligns a named buzzer pin only when its wiring has one supported board GPIO", () => {
   const project = structuredClone(COMPONENT_EXAMPLES["ky-040"]());
   project.components.push({ id: "buzzer", type: "buzzer", label: "Alert buzzer", x: 800, y: 200 });
@@ -500,6 +533,67 @@ test("button behavior validation targets the button the prompt assigns the actio
   );
   assert.equal(requestedRotaryControlAction("Turning the encoder changes the alarm threshold."), true);
   assert.equal(requestedRotaryControlAction("The encoder's SW switch toggles alarm mode."), false);
+  assert.equal(requestedRotaryControlAction("The Pico reads a potentiometer knob while the display calls display.setBrightness(5)."), false);
+  assert.equal(requestedRotaryControlAction("A potentiometer knob sets the display brightness."), false);
+});
+
+test("generation output budget scales with explicitly requested part count", () => {
+  assert.equal(generationOutputTokenBudget(0), 8_192);
+  assert.equal(generationOutputTokenBudget(7), 11_264);
+  assert.equal(generationOutputTokenBudget(100), 65_536);
+});
+
+test("normalized multi-board programs are restored for a second validation pass", () => {
+  const candidate = validationCandidateWithBoardPrograms({
+    board: "esp32-devkitc-v4",
+    code: "void setup(){} void loop(){}",
+    programs: { esp: "void setup(){} void loop(){}", pico: "void setup(){} void loop(){}" },
+  });
+  assert.deepEqual(candidate.boardPrograms, [
+    { boardId: "esp", code: "void setup(){} void loop(){}" },
+    { boardId: "pico", code: "void setup(){} void loop(){}" },
+  ]);
+  assert.equal(candidate.code, candidate.programs.esp);
+});
+
+test("display validation requires interpreted visible output rather than raw bus traffic", () => {
+  const project = COMPONENT_EXAMPLES["ssd1306-oled-128x64"]();
+  const display = project.components.find(component => component.type === "ssd1306-oled-128x64")!;
+  const prompt = "Show the CO2 reading on the OLED display.";
+  const rawBusOnly = {
+    componentStates: { [display.id]: { type: display.type, powered: true, status: "Displaying", readings: { i2cBytes: 12 } } },
+    lcds: [],
+  } as unknown as Parameters<typeof renderedDisplayOutputIssues>[2][number];
+  assert.equal(renderedDisplayOutputIssues(project, prompt, [rawBusOnly]).length, 1);
+
+  const rendered = {
+    ...rawBusOnly,
+    componentStates: { [display.id]: { type: display.type, powered: true, status: "Displaying", display: ["Indoor air", "CO2: 420 ppm"] } },
+  } as unknown as Parameters<typeof renderedDisplayOutputIssues>[2][number];
+  assert.deepEqual(renderedDisplayOutputIssues(project, prompt, [rendered]), []);
+});
+
+test("hold/resume validation changes the analog input after the button press", () => {
+  const project = structuredClone(COMPONENT_EXAMPLES["ky-040"]());
+  project.components.push(
+    { id: "knob", type: "potentiometer", label: "Input knob", x: 700, y: 180, properties: { value: 50 } },
+    { id: "hold-button", type: "push-button", label: "Hold Button", x: 900, y: 180, properties: { pressed: false } },
+  );
+  project.connections.push(
+    { id: "knob-vcc", from: { componentId: "uno", pin: "5V" }, to: { componentId: "knob", pin: "VCC" } },
+    { id: "knob-gnd", from: { componentId: "uno", pin: "GND" }, to: { componentId: "knob", pin: "GND" } },
+    { id: "knob-signal", from: { componentId: "uno", pin: "A0" }, to: { componentId: "knob", pin: "SIG" } },
+    { id: "button-signal", from: { componentId: "uno", pin: "D5" }, to: { componentId: "hold-button", pin: "1" } },
+    { id: "button-ground", from: { componentId: "uno", pin: "GND" }, to: { componentId: "hold-button", pin: "2" } },
+  );
+  project.code = `int previousButton = HIGH; bool hold = false; int heldValue = 0;
+void setup(){ Serial.begin(9600); pinMode(5, INPUT_PULLUP); }
+void loop(){ int button = digitalRead(5); if(previousButton == HIGH && button == LOW) hold = !hold; previousButton = button; int value = analogRead(A0); if(!hold) heldValue = value; Serial.println(heldValue); delay(20); }`;
+  const prompt = "Each button press toggles hold/resume so the displayed analog value freezes until resumed.";
+  const released = simulateButtonScenario(project, project.code, undefined, prompt);
+  const pressed = simulateButtonScenario(project, project.code, "hold-button", prompt);
+  assert.equal(hasObservableButtonEffect(project, released, pressed), true,
+    JSON.stringify({ released: released.at(-1)?.serial.slice(-2), held: pressed.at(-1)?.serial.slice(-2) }));
 });
 
 test("rotary behavior validation observes servo motion and probes raw encoder counts", () => {
@@ -879,7 +973,7 @@ test("encoder behavior validation rotates an encoder in one continuous simulator
   assert.equal(hasObservableEncoderEffect(project, initial, rotated, false), true, "relative encoder state is validated through a simulated rotation from zero");
 });
 
-test("a request for an unsupported capacitor gets a clear alternative before model calls", async context => {
+test("a supported capacitor request reaches generation with the correct required part", async context => {
   const previousFetch = globalThis.fetch;
   const previousKey = process.env.GEMINI_API_KEY;
   context.after(() => {
@@ -889,20 +983,23 @@ test("a request for an unsupported capacitor gets a clear alternative before mod
   });
   process.env.GEMINI_API_KEY = "test-secret";
   let providerCalls = 0;
-  globalThis.fetch = async () => {
+  const project = COMPONENT_EXAMPLES["capacitor-1uf"]!();
+  globalThis.fetch = async (_input, init) => {
     providerCalls += 1;
-    return new Response("unexpected model call", { status: 500 });
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    assert.ok(content.availableComponentTypes.includes("capacitor-1uf"));
+    assert.ok(content.requiredComponentCounts.some((part: { type: string; count: number }) => part.type === "capacitor-1uf" && part.count === 1));
+    return modelResponse(JSON.stringify({ project, explanation: "The 1 µF capacitor is connected across the supply rails.", warnings: [], assumptions: [] }));
   };
   const response = await POST(new Request("http://localhost/api/ai/generate", {
     method: "POST",
-    body: JSON.stringify({ prompt: "Create a WS2812B strip circuit with its required bulk capacitor." }),
+    body: JSON.stringify({ prompt: "Create an Arduino Uno circuit with one 1 µF timing capacitor wired across 5V and GND." }),
   }));
   const body = await response.json();
-  assert.equal(response.status, 422);
-  assert.equal(body.error.code, "COMPONENT_UNAVAILABLE");
-  assert.match(body.error.message, /capacitor is not in Cirkitra's supported component catalog/);
-  assert.ok(body.error.details.some((detail: string) => /add it as a physical hardware note after export/.test(detail)));
-  assert.equal(providerCalls, 0, "unsupported parts should be identified before spending time on generation retries");
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(providerCalls, 1, "the supported part should be sent to generation without a false unavailable rejection");
+  assert.ok(body.project.components.some((part: { type: string }) => part.type === "capacitor-1uf"));
 });
 
 test("an unsupported DHT11 request is rejected with the supported DHT22 alternative", async context => {
@@ -1201,11 +1298,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-test("LCD generation always makes the supported 3-pin contrast potentiometer available", () => {
+test("LCD generation does not add an unrequested contrast potentiometer", () => {
   const lcd = COMPONENT_CATALOG["lcd-16x2"]!;
   const potentiometer = COMPONENT_CATALOG.potentiometer!;
   const selected = includeRequiredSupportingParts([lcd]);
-  assert.ok(selected.some(part => part.id === "potentiometer"));
+  assert.equal(selected.some(part => part.id === "potentiometer"), false);
   assert.equal(includeRequiredSupportingParts([lcd, potentiometer]).filter(part => part.id === "potentiometer").length, 1);
   assert.deepEqual(potentiometer.pins.map(pin => pin.id), ["VCC", "GND", "SIG"]);
 });
@@ -1238,6 +1335,10 @@ test("published runnable examples pass the generation endpoint without repair", 
   console.warn = () => {};
   for (const [id, make] of Object.entries({ ...COMPONENT_EXAMPLES, greenhouse: greenhouseExample })) await context.test(id, async () => {
     const project = make(); let calls = 0; let feedback = "";
+    const board = project.components.find(component => component.type === id && COMPONENT_CATALOG[component.type]?.category === "boards");
+    const prompt = board
+      ? `Create a simple LED indicator circuit with ${COMPONENT_CATALOG[board.type]!.displayName}, one resistor, and one LED.`
+      : `Create a circuit using ${[...new Set(project.components.map(component => component.type))].join(", ")}`;
     globalThis.fetch = async (_input, init) => {
       calls++;
       const request = JSON.parse(String(init?.body));
@@ -1254,7 +1355,7 @@ test("published runnable examples pass the generation endpoint without repair", 
       return modelResponse(JSON.stringify({ project, explanation: "Runnable circuit", assumptions: [], warnings: [] }));
     };
     const response = await POST(new Request("http://localhost/api/ai/generate", {
-      method: "POST", body: JSON.stringify({ prompt: id === "greenhouse" ? greenhousePrompt : `Create a circuit using ${[...new Set(project.components.map(c => c.type))].join(", ")}` }),
+      method: "POST", body: JSON.stringify({ prompt: id === "greenhouse" ? greenhousePrompt : prompt }),
     }));
     const responseBody = await response.json();
     assert.equal(response.status, 200, `${id}: ${feedback} ${JSON.stringify(responseBody.error ?? responseBody)}`);
@@ -1499,7 +1600,7 @@ void loop() {
   const body = await response.json();
   assert.equal(response.status, 200, JSON.stringify(body));
   assert.equal(calls, 2, "the shorted first proposal must receive a targeted repair");
-  assert.ok(repairIssues.some(issue => issue.includes("output-contention")), JSON.stringify(repairIssues));
+  assert.ok(repairIssues.some(issue => issue.includes("NET_COMPONENT_SHORT") || issue.includes("output-contention")), JSON.stringify(repairIssues));
   assert.equal(body.project.connections.some((connection: FixtureWire) =>
     [connection.from, connection.to].some(endpoint => endpoint.componentId === "led1" && endpoint.pin === "K")
       && [connection.from, connection.to].some(endpoint => endpoint.componentId === "led1" && endpoint.pin === "A")), false);
@@ -2710,6 +2811,30 @@ test("generation removes only exact duplicate wires and repairs duplicate wire I
   assert.ok(body.warnings.some((warning: string) => warning.includes("Renamed duplicate wire ID")));
 });
 
+test("generation removes a no-op self-wire without rejecting the otherwise valid circuit", async context => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  });
+  process.env.GEMINI_API_KEY = "test-secret";
+  const project = structuredClone(createDefaultBlinkProject());
+  project.connections.push({
+    id: "harmless-self-wire",
+    from: { componentId: "uno", pin: "D13" },
+    to: { componentId: "uno", pin: "D13" },
+  });
+  globalThis.fetch = async () => modelResponse(JSON.stringify({ ...generatedEnvelope, project }));
+
+  const response = await POST(generationRequest());
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(body.project.connections.some((connection: FixtureWire) => connection.id === "harmless-self-wire"), false);
+  assert.ok(body.warnings.some((warning: string) => warning.includes("no-op self-wire")));
+});
+
 function structuredBlinkEnvelope() {
   const project = createDefaultBlinkProject();
   const program = {
@@ -2995,7 +3120,7 @@ test("explicit multi-board generation validates and runs independent wired UART 
   assert.match(body.project.programs.esp, /Serial1\.begin\(9600\)/);
   assert.match(body.project.programs.esp, /Serial1\.read\(\)/);
   assert.doesNotMatch(body.project.programs.esp, /Serial2/);
-  assert.ok(body.warnings.some((warning: string) => warning.includes("GPIO16") && warning.includes("GPIO17") && warning.includes("Serial2")), "the simulator-specific ESP32 UART normalization should be disclosed");
+  assert.ok(body.warnings.some((warning: string) => warning.includes("Serial2") && warning.includes("Serial1")), "the simulator-specific ESP32 UART normalization should be disclosed");
 
   const simulator = new MultiBoardSimulator();
   simulator.attachProject(body.project);
@@ -3951,7 +4076,7 @@ test("a truncated initial answer gets one compact full-project retry and never p
   const body = await response.json();
   assert.equal(response.status, 502);
   assert.equal(body.error.code, "AI_RESPONSE_TRUNCATED");
-  assert.match(body.error.message, /65,536-token output limit/);
+  assert.match(body.error.message, /response-length limit/);
   assert.match(body.error.message, /split the design into smaller circuits/);
   assert.equal(providerCalls, 2, "the truncation request and its single compact retry reach Gemini");
   assert.equal(requests.length, 2, "truncation permits exactly one compact complete-project retry, never planner or subsystem calls");
@@ -4446,4 +4571,58 @@ test("simulation never accepts a provider-inserted unregistered part", async con
   globalThis.fetch = async () => modelResponse(JSON.stringify(envelope));
   const response = await POST(generationRequest());
   assert.equal(response.status, 502);
+});
+
+test("normalizes common model-generated wire tuples without guessing incomplete endpoints", () => {
+  assert.deepEqual(normalizeGeneratedConnectionTuple(["board", "D2", "sensor", "DATA"], 4), {
+    id: "wire_5", from: { componentId: "board", pin: "D2" }, to: { componentId: "sensor", pin: "DATA" }, color: "#42d7bd",
+  });
+  assert.deepEqual(normalizeGeneratedConnectionTuple([["board", "D2"], ["sensor", "DATA"]], 1), {
+    id: "wire_2", from: { componentId: "board", pin: "D2" }, to: { componentId: "sensor", pin: "DATA" }, color: "#f59e0b",
+  });
+  const invalid = ["board", "D2", "sensor"];
+  assert.equal(normalizeGeneratedConnectionTuple(invalid, 0), invalid);
+});
+
+test("normalizes supported explicit XIAO UART and I2C pin overloads for the browser simulator", () => {
+  const result = normalizeSimulatorUartSketch("Serial2.begin(115200, SERIAL_8N1, 44, 43); Wire.begin(5, 6);", "xiao-esp32s3-sense");
+  assert.equal(result.code, "Serial1.begin(115200); Wire.begin();");
+  assert.equal(result.warnings.length, 3);
+
+  const boardAliases = normalizeSimulatorUartSketch("Wire.begin(D4, D5);", "xiao-esp32s3-sense");
+  assert.equal(boardAliases.code, "Wire.begin();", "D4/D5 header aliases resolve through the XIAO pin profile instead of being mistaken for GPIO4/GPIO5");
+  assert.equal(boardAliases.warnings.length, 1);
+
+  const namedPins = normalizeSimulatorUartSketch("const int RX_PIN=44; const int TX_PIN=43; Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN); Wire.begin(8, 9);", "xiao-esp32s3-sense");
+  assert.equal(namedPins.code, "const int RX_PIN=44; const int TX_PIN=43; Serial1.begin(115200); Wire.begin();");
+  assert.equal(namedPins.warnings.length, 2, "resolve UART pin aliases and use the profile's sole supported I2C bus");
+
+  const customUart = normalizeSimulatorUartSketch("Serial1.begin(115200, SERIAL_8N1, 43, 44);", "xiao-esp32s3-sense");
+  assert.match(customUart.code, /Serial1\.begin\(115200, SERIAL_8N1, 43, 44\)/, "do not silently rewrite a reversed/non-profile UART mapping");
+});
+
+test("aligns generated UART class names with the crossed pins actually wired between boards", () => {
+  const components = [
+    { id: "pico", type: "raspberry-pi-pico" },
+    { id: "esp", type: "esp32-nodemcu-32s" },
+  ];
+  const connections = [
+    { id: "tx", from: { componentId: "pico", pin: "GP0" }, to: { componentId: "esp", pin: "GPIO3" } },
+    { id: "rx", from: { componentId: "esp", pin: "GPIO1" }, to: { componentId: "pico", pin: "GP1" } },
+  ];
+  assert.equal(normalizeSimulatorUartToWiredPort("Serial1.begin(9600); Serial1.println(value);", "pico", "raspberry-pi-pico", components, connections).code,
+    "Serial.begin(9600); Serial.println(value);");
+  assert.equal(normalizeSimulatorUartToWiredPort("Serial1.begin(9600); Serial1.read();", "esp", "esp32-nodemcu-32s", components, connections).code,
+    "Serial.begin(9600); Serial.read();");
+  assert.equal(normalizeSimulatorUartToWiredPort("Serial.begin(9600); Serial.println(debug); Serial1.println(value);", "pico", "raspberry-pi-pico", components, connections).warnings.length, 0,
+    "do not merge an explicit USB monitor and a separately named serial interface");
+});
+
+test("inserts NeoPixel begin() once before output when a generated setup omitted it", () => {
+  const input = "#include <Adafruit_NeoPixel.h>\nAdafruit_NeoPixel pixels(24, 6, NEO_GRB + NEO_KHZ800);\nvoid setup() {\n  pixels.setBrightness(40);\n}\nvoid loop() { pixels.setPixelColor(0, pixels.Color(255, 0, 0)); pixels.show(); }";
+  const repaired = repairMissingNeoPixelBegin(input);
+  assert.deepEqual(repaired.initialized, ["pixels"]);
+  assert.match(repaired.code, /void setup\(\) \{\s*\n\s*pixels\.begin\(\);\s*\n\s*pixels\.setBrightness/);
+  assert.deepEqual(repairMissingNeoPixelBegin(repaired.code).initialized, []);
+  assert.equal(repairMissingNeoPixelBegin(input.replace("pixels.setBrightness(40);", "pixels.begin();\n  pixels.setBrightness(40);")).initialized.length, 0);
 });

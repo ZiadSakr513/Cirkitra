@@ -27,6 +27,10 @@ const DRIVER_CHANNELS: Readonly<Record<string, readonly DriverChannel[]>> = {
     { outputs: [["OUT1"], ["OUT2"]], supplyPin: "VS", returnPin: "GND" },
     { outputs: [["OUT3"], ["OUT4"]], supplyPin: "VS", returnPin: "GND" },
   ],
+  "l298n-driver-module": [
+    { outputs: [["OUT1"], ["OUT2"]], supplyPin: "VS", returnPin: "GND" },
+    { outputs: [["OUT3"], ["OUT4"]], supplyPin: "VS", returnPin: "GND" },
+  ],
 };
 
 const endpoint = (componentId: string, pin: string) => `${componentId}:${pin}`;
