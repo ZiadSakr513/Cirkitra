@@ -143,7 +143,12 @@ export function importCircuitProject(
     }
   }
 
-  const migration = migrateCircuitProject(decoded);
+  // Scene data is legacy UI metadata, not part of a circuit project. Strip
+  // only that top-level field before validation, preserving all circuit data.
+  const circuitPayload = isRecord(decoded) && Object.hasOwn(decoded, "scene")
+    ? Object.fromEntries(Object.entries(decoded).filter(([key]) => key !== "scene"))
+    : decoded;
+  const migration = migrateCircuitProject(circuitPayload);
   const validation = safeParseCircuitProject(migration.value);
   if (!validation.success) {
     return {
@@ -160,6 +165,26 @@ export function importCircuitProject(
     project: normalized,
     migratedFrom: migration.migratedFrom,
     diagnostics: diagnoseCircuit(normalized),
+  };
+}
+
+/**
+ * Load a project stored in an account row. The row identity and display name
+ * are authoritative; payload metadata may be stale or user-edited.
+ */
+export function importStoredCircuitProject(
+  input: string | unknown,
+  identity: { id: string; name: string },
+): CircuitProjectImportResult {
+  const imported = importCircuitProject(input);
+  if (!imported.ok) return imported;
+  return {
+    ...imported,
+    project: {
+      ...imported.project,
+      id: identity.id,
+      name: identity.name,
+    },
   };
 }
 

@@ -88,6 +88,18 @@ test("all expanded H-bridge families transfer active motor demand to their suppl
   }
 });
 
+test("L298N module transfers its driven motor demand to the separate motor supply", () => {
+  const project = COMPONENT_EXAMPLES["l298n-driver-module"]();
+  project.components.find(component => component.id === "motor")!.properties = { currentAtFullDrive: 0.4 };
+  const simulator = new ArduinoSimulator(project.code);
+  simulator.attachProject(project); simulator.run(); simulator.advance(0);
+  const snapshot = simulator.getSnapshot();
+  assert.equal(snapshot.componentStates.motor.direction, "forward");
+  assert.equal(snapshot.componentStates.motor.speed, 1);
+  assert.ok(Math.abs((snapshot.componentStates["motor-supply"].readings?.current ?? 0) - 0.4) < 0.002, JSON.stringify(snapshot.componentStates["motor-supply"]));
+  assert.deepEqual(snapshot.diagnostics.filter(diagnostic => diagnostic.severity === "error"), []);
+});
+
 test("one grounded L293D leg powers both motor channels but warns about physical wiring", () => {
   const {project, simulator} = fixture();
   project.connections = project.connections.filter(w =>

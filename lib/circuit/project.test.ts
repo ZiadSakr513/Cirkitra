@@ -107,6 +107,24 @@ test("spreads ground returns across Uno pins and uses one ground symbol per over
   assert.deepEqual(normalizeGroundReturns(normalized), normalized, "normalization must be idempotent");
 });
 
+test("preserves explicit common-ground links when the board's named ground pads are already occupied", () => {
+  const project = createDefaultBlinkProject();
+  project.components.push(
+    { id: "supply", type: "dc-supply", label: "Servo Supply", x: 300, y: 100, properties: { voltage: 5, enabled: true } },
+    { id: "servo", type: "sg90-servo", label: "Servo", x: 400, y: 100 },
+    { id: "ground", type: "ground", label: "GND", x: 350, y: 150 },
+  );
+  project.connections.push(
+    { id: "servo-positive", from: { componentId: "supply", pin: "+" }, to: { componentId: "servo", pin: "VCC" } },
+    { id: "servo-return", from: { componentId: "servo", pin: "GND" }, to: { componentId: "ground", pin: "GND" } },
+    { id: "common_ground_supply_return_uno_GND", from: { componentId: "supply", pin: "-" }, to: { componentId: "uno", pin: "GND" } },
+    { id: "common_ground_ground_GND_uno_GND", from: { componentId: "ground", pin: "GND" }, to: { componentId: "uno", pin: "GND" } },
+  );
+
+  const normalized = normalizeGroundReturns(project);
+  assert.deepEqual(normalized.connections.filter(connection => connection.id.startsWith("common_ground_")), project.connections.filter(connection => connection.id.startsWith("common_ground_")));
+});
+
 test("preserves a manually placed ground component", () => {
   const project = createDefaultBlinkProject();
   project.components.push({ id: "manual-ground", type: "ground", label: "GND", x: 500, y: 300 });

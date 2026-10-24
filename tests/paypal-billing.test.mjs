@@ -89,7 +89,7 @@ test("only authenticated checkout starts an intent; browser approval cannot gran
     readFile(file("../app/api/billing/paypal/confirm/route.ts"), "utf8"),
     readFile(file("../lib/billing/paypal-store.ts"), "utf8"),
     readFile(file("../lib/billing/ai-usage.ts"), "utf8"),
-    readFile(file("../app/api/ai/generate/route.ts"), "utf8"),
+    readFile(file("../app/api/ai/generate/implementation.ts"), "utf8"),
   ]);
   assert.match(checkout, /authenticateAiRequest\(request\)/);
   assert.match(checkout, /config\?\.checkoutEnabled/);

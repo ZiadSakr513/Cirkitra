@@ -135,6 +135,38 @@ test("hardware UART delivers bytes only across connected RX/TX pins at a matchin
   assert.ok(wrongBaud.getSnapshot().diagnostics.some(diagnostic => diagnostic.code === "UART_RECEIVER_NOT_READY"), "a receiver with a mismatched baud reports why bytes were dropped");
 });
 
+test("Serial on a board with UART0 transfers over its wired TX pin while remaining visible in the monitor", () => {
+  const project: CircuitProject = {
+    schemaVersion: 1,
+    id: "serial-uart0",
+    name: "UART0 physical link",
+    description: "",
+    board: "arduino-uno",
+    activeBoardId: "uno",
+    components: [
+      { id: "uno", type: "arduino-uno", label: "Uno", x: 0, y: 0, properties: {} },
+      { id: "mega", type: "arduino-mega-2560", label: "Mega", x: 400, y: 0, properties: {} },
+    ],
+    connections: [
+      { id: "tx-rx", from: { componentId: "uno", pin: "D1" }, to: { componentId: "mega", pin: "D19" } },
+      { id: "ground", from: { componentId: "uno", pin: "GND" }, to: { componentId: "mega", pin: "GND" } },
+    ],
+    code: "void setup(){ Serial.begin(9600); } void loop(){ Serial.write('M'); delay(100); }",
+    programs: {
+      uno: "void setup(){ Serial.begin(9600); } void loop(){ Serial.write('M'); delay(100); }",
+      mega: "void setup(){ Serial1.begin(9600); pinMode(13,OUTPUT); } void loop(){ if(Serial1.available()){ int value=Serial1.read(); digitalWrite(13,value=='M'?HIGH:LOW); } delay(10); }",
+    },
+  };
+  const simulator = new MultiBoardSimulator();
+  simulator.attachProject(project);
+  simulator.run();
+  for (let index = 0; index < 8; index += 1) simulator.advance(100);
+  const snapshot = simulator.getSnapshot();
+  assert.ok(snapshot.boardSerial?.uno?.length, "Serial.write remains observable in the Uno's monitor context");
+  assert.equal(snapshot.boardPins?.mega?.[13]?.digitalValue, 1, "the Mega receives the byte on its wired Serial1 RX");
+  assert.equal(snapshot.diagnostics.some(item => item.code.startsWith("UART_")), false, JSON.stringify(snapshot.diagnostics));
+});
+
 test("reloaded Gemini-style UART sketches exchange P/A and toggle the ESP32 built-in LED", () => {
   const mega = `unsigned long lastSend = 0;
 

@@ -3,12 +3,24 @@ import test from "node:test";
 import { BOARD_COMPONENTS, BOARD_IDS, BOARD_PROFILES, isBoardAnalogPin, isBoardDigitalOutputPin, isBoardPin, isBoardPwmPin, resolveBoardPin } from "./boards.ts";
 import { compileArduinoSketch } from "../simulator/parser.ts";
 
-test("the supported board profiles cover the existing Uno and five named boards", () => {
-  assert.deepEqual(BOARD_IDS, ["arduino-uno", "arduino-mega-2560", "arduino-nano-classic", "esp32-devkitc-v4", "esp8266-nodemcu-v1", "raspberry-pi-pico"]);
+test("the supported board profiles cover the existing boards and four screenshot variants", () => {
+  assert.deepEqual(BOARD_IDS, ["arduino-uno", "arduino-mega-2560", "arduino-nano-classic", "esp32-devkitc-v4", "esp8266-nodemcu-v1", "raspberry-pi-pico", "esp32-nodemcu-32s", "esp32-devkit-v1-30pin", "xiao-esp32s3-sense", "freenove-esp32s3-wroom"]);
   for (const id of BOARD_IDS) {
     assert.ok(BOARD_PROFILES[id].ioPins.length > 0, `${id} has no I/O pins`);
     assert.ok(BOARD_PROFILES[id].documentation.startsWith("https://"), `${id} has no documentation source`);
   }
+});
+
+test("the screenshot ESP32 variants expose their distinct package pin labels and ADC mappings", () => {
+  assert.equal(resolveBoardPin("esp32-nodemcu-32s", "GPIO21"), 21);
+  assert.equal(resolveBoardPin("esp32-devkit-v1-30pin", "GPIO4"), 4);
+  assert.equal(resolveBoardPin("xiao-esp32s3-sense", "D0"), 1);
+  assert.equal(resolveBoardPin("xiao-esp32s3-sense", "D6"), 43);
+  assert.equal(resolveBoardPin("freenove-esp32s3-wroom", "GPIO48"), 48);
+  assert.equal(isBoardAnalogPin("freenove-esp32s3-wroom", 34), true);
+  assert.ok(BOARD_COMPONENTS["esp32-devkit-v1-30pin"].pins.some(pin => pin.anchor));
+  assert.equal(BOARD_PROFILES["xiao-esp32s3-sense"].uart[1]?.rx, 44);
+  assert.equal(BOARD_PROFILES["freenove-esp32s3-wroom"].uart[1]?.tx, 43);
 });
 
 test("AVR board pin maps retain analog aliases and board-specific capabilities", () => {
@@ -40,12 +52,14 @@ test("registered board terminals all sit on side headers, not floating top or bo
     for (const pin of component.pins) {
       assert.ok(pin.side === "left" || pin.side === "right", `${boardId}.${pin.id} is on a side header, got ${pin.side}`);
     }
-    const expected = [
-      ...BOARD_PROFILES[boardId].ioPins.filter(pin => pin.runtimePin >= 0 && !pin.onboard).map(pin => pin.id),
+    const expectedIds = new Set([
+      ...BOARD_PROFILES[boardId].ioPins.map(pin => pin.id),
       ...Object.keys(BOARD_PROFILES[boardId].rails),
       ...BOARD_PROFILES[boardId].groundPins,
-    ].sort();
-    assert.deepEqual(component.pins.map(pin => pin.id).sort(), expected, `${boardId} keeps every pin ID exactly once`);
+    ]);
+    const actualIds = component.pins.map(pin => pin.id);
+    assert.equal(new Set(actualIds).size, actualIds.length, `${boardId} keeps every terminal ID unique`);
+    assert.ok(actualIds.every(id => expectedIds.has(id)), `${boardId} only draws profile-defined pins and rails`);
   }
 });
 

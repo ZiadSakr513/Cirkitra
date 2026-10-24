@@ -6,6 +6,7 @@ import type {
 import { POWER_COMPONENTS } from "./power-parts.ts";
 import { EXPANDED_COMPONENTS } from "./parts.ts";
 import { BOARD_COMPONENTS } from "./boards.ts";
+import { SCREENSHOT_COMPONENTS } from "./screenshot-components.ts";
 
 export type ComponentCategory =
   | "boards"
@@ -44,6 +45,8 @@ export interface ComponentPinDefinition {
   signals: readonly PinSignal[];
   side: PinSide;
   order: number;
+  /** Optional physical artwork point in component-local pixels, used by schematic wires. */
+  anchor?: { x: number; y: number };
   number?: string;
   noConnect?: boolean;
 }
@@ -965,6 +968,19 @@ const LEGACY_COMPONENTS = {
       behavior: "Requires wired power and ground; a standard TRIG pulse produces an ECHO pulse based on the configured distance.",
       limitations: "Distance is a configured simulator input; acoustic propagation, beam shape, and multiple targets are not modeled.",
     },
+    metadata: {
+      manufacturer: "Generic module",
+      variant: "HC-SR04 ultrasonic ranging module",
+      kind: "module",
+      aliases: ["HC-SR04 ultrasonic sensor", "ultrasonic distance module"],
+      interfaces: ["digital"],
+      supplies: [{ pins: ["VCC"], minVolts: 4.5, maxVolts: 5.5 }],
+      groundPins: ["GND"],
+      documentation: [{ title: "HC-SR04 module datasheet", url: "https://cdn.sparkfun.com/datasheets/Sensors/Proximity/HCSR04.pdf", section: "Electrical characteristics" }],
+      libraries: [],
+      notes: ["Use a regulated 5 V supply. On 3.3 V logic boards, level-shift or divide the ECHO output before connecting it to a GPIO."],
+      verifiedOn: "2026-10-17",
+    },
   },
   "temperature-sensor": {
     id: "temperature-sensor",
@@ -1062,6 +1078,7 @@ export const INTERNAL_COMPONENT_CATALOG: Readonly<Record<string, ComponentDefini
   ...BOARD_COMPONENTS,
   ...EXPANDED_COMPONENTS,
   ...POWER_COMPONENTS,
+  ...SCREENSHOT_COMPONENTS,
 });
 
 /** Only accepted implementations are offered in the palette and AI catalog. */

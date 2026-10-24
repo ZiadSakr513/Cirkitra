@@ -173,9 +173,14 @@ export class MultiBoardSimulator {
           if (!target) return [];
           const pinNumber = resolveBoardPin(target.type, endpoint.pin);
           const ports = getBoardProfile(target.type)?.uart ?? [];
-          return ports.flatMap((port, index) => index > 0 && port.rx === pinNumber ? [{ id: target.id, index }] : []);
+          return ports.flatMap((port, index) => port && port.rx === pinNumber ? [{ id: target.id, index }] : []);
         });
         if (recipients.length === 0) {
+          // Serial is also the user-facing USB monitor on UART0-capable boards.
+          // Monitor text is still logged by the board runtime; only report a
+          // physical-link fault for the explicit secondary UART ports, where
+          // an unconnected transmission cannot be confused with USB output.
+          if (transmission.port === 0) continue;
           this.uartFaults.set(key, {
             severity: "warning",
             code: "UART_RECEIVER_DISCONNECTED",

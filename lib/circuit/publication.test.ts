@@ -5,6 +5,7 @@ import { COMPONENT_CATALOG, getComponentDefinition } from "./catalog.ts";
 import { COMPONENT_ACCEPTANCE, publicationIssues } from "./publication.ts";
 import { COMPONENT_EXAMPLES } from "./component-examples.ts";
 import { EXPANDED_COMPONENTS } from "./parts.ts";
+import { SCREENSHOT_COMPONENT_CONFIG } from "./screenshot-components.ts";
 import { exportCircuitProject, importCircuitProject } from "./import.ts";
 import { ArduinoSimulator, solveCircuit } from "../simulator/index.ts";
 
@@ -340,6 +341,98 @@ for (const [id, make] of Object.entries(COMPONENT_EXAMPLES)) test(`${id} publica
     assert.equal(simulator.getSnapshot().boardPins?.[board!.id]?.some(pin => pin.mode === "OUTPUT" && pin.digitalValue === 1), true);
     simulator.advance(500);
     assert.equal(solveCircuit(project, simulator.getSnapshot()).componentStates.device.powered, false, `${id} output toggles low on simulated time`);
+  } else if (fixture === `screenshot-${id}-simulates-wired-behavior`) {
+    const family = SCREENSHOT_COMPONENT_CONFIG[id]?.family;
+    assert.ok(family, `${id} has a screenshot-model acceptance family`);
+    simulator.advance(250);
+    const state = simulator.getSnapshot().componentStates.device;
+    assert.ok(state, `${id} publishes a simulator state`);
+    if (family === "breadboard") {
+      assert.equal(state.status, "Continuity mapped", id);
+      assert.ok((state.readings?.rowGroups ?? 0) > 0 && (state.readings?.railSegments ?? 0) > 0, id);
+      assert.equal(solveCircuit(project, simulator.getSnapshot()).componentStates.indicator.powered, true, `${id} carries the LED path through its named row groups`);
+      const isolatedRow = { ...project, connections: project.connections.filter(connection => ![connection.from, connection.to].some(endpoint => endpoint.componentId === "device" && endpoint.pin === "F1-J1")) };
+      const broken = new ArduinoSimulator(isolatedRow.code); broken.attachProject(isolatedRow); broken.run(); broken.advance(0);
+      assert.equal(solveCircuit(isolatedRow, broken.getSnapshot()).componentStates.indicator.powered, false, `${id} keeps the isolated half of the terminal strip electrically separate`);
+    } else if (family === "pixel") {
+      assert.equal(state.powered, true, id);
+      assert.ok((state.pixels?.length ?? 0) > 0 && (state.readings?.litPixels ?? 0) > 0, `${id} applies sketch pixel writes`);
+    } else if (family === "display") {
+      assert.equal(state.powered, true, id);
+      assert.ok(state.status === "Displaying" || (state.readings?.spiBytes ?? 0) > 0 || Number.isFinite(state.readings?.value), `${id} consumes its wired display protocol`);
+    } else if (family === "i2c-sensor") {
+      assert.equal(state.status, "I²C ready", id);
+      assert.equal(state.powered, true, `${id} has valid supply and ground`);
+      assert.ok(simulator.getSnapshot().serial.length > 0, `${id} sketch reads the sensor through I²C`);
+    } else if (family === "sensor") {
+      assert.equal(state.powered, true, id);
+      if (id === "jsn-sr04t-ultrasonic") {
+        assert.ok(Number(simulator.getSnapshot().serial[0]?.text) > 0, "the wired ECHO pulse reflects the configured distance");
+      } else {
+        assert.ok(Object.keys(state.readings ?? {}).length > 0 || Object.keys(state.channels ?? {}).length > 0, `${id} exposes an environmental or pin-level reading`);
+      }
+      if (id === "yf-s201-water-flow-sensor") {
+        assert.ok((state.readings?.frequencyHz ?? 0) > 0, "flow rate drives the documented pulse frequency");
+        assert.ok(Number(simulator.getSnapshot().serial[0]?.text) > 0, "wired pulseIn observes a nonzero high pulse");
+      }
+      if (id === "tsop4838-ir-receiver" || id === "vs1838b-ir-receiver-module") {
+        assert.equal(state.readings?.output, 0, "received IR activity is active low");
+        assert.equal(simulator.getSnapshot().serial[0]?.text, "0");
+      }
+    } else if (family === "actuator") {
+      assert.ok(state.powered, `${id} has a valid powered actuator path`);
+      if (id === "sg90-servo" || id === "mg996r-servo") {
+        assert.equal(state.status, "Tracking sketch command", id);
+        assert.ok(state.readings?.signal === 1 && simulator.getSnapshot().servos.some(servo => servo.attached && servo.angle === 35), id);
+      } else if (id === "r385-water-pump" || id === "solenoid-valve-12v") {
+        assert.ok((state.readings?.current ?? 0) > 0, `${id} load draws current only through the closed relay path`);
+      } else {
+        const motor = id === "stepper-28byj-48" || id === "nema17-stepper-17hs4401s" ? state : simulator.getSnapshot().componentStates["stepper-motor"];
+        assert.ok(Number(motor?.readings?.steps) > 0, `${id} follows powered driver phase changes`);
+      }
+    } else if (family === "driver") {
+      assert.equal(state.powered, true, `${id}: ${JSON.stringify({ state, diagnostics: simulator.getSnapshot().diagnostics })}`);
+      if (id === "l298n-driver-module") {
+        assert.equal(state.status, "H-bridge ready");
+        assert.ok((state.readings?.OUT1 ?? 0) > 0);
+        const motor = solveCircuit(project, simulator.getSnapshot()).componentStates.motor;
+        assert.equal(motor.direction, "forward", "the wired motor follows the active bridge outputs");
+        assert.ok((simulator.getSnapshot().componentStates["motor-supply"].readings?.current ?? 0) > 0, "the bridge transfers motor demand to its external supply");
+      } else {
+        assert.ok(state.status !== "Unpowered", id);
+        assert.ok(Number(simulator.getSnapshot().componentStates["stepper-motor"]?.readings?.steps) > 0, `${id} energizes a wired stepper phase`);
+      }
+    } else if (family === "passive") {
+      if (id === "diode-1n4007") assert.equal(state.readings?.forwardBiased, 1, "the current-limited example is forward biased");
+      else {
+        assert.ok((state.readings?.capacitanceUf ?? 0) > 0, id);
+        assert.ok((state.readings?.voltage ?? 0) > 0, `${id} accumulates charge in simulated time`);
+      }
+    } else if (family === "power") {
+      assert.equal(state.readings?.voltage, 9, "the enabled PP3 source exposes its nominal voltage");
+      assert.ok(solveCircuit(project, simulator.getSnapshot()).componentStates.uno.powered, "the 9 V source can reach the wired circuit return");
+    } else if (family === "logic") {
+      if (id === "ne555-timer") assert.match(state.status ?? "", /^Output (HIGH|LOW)$/);
+      else {
+        const load = solveCircuit(project, simulator.getSnapshot()).componentStates["switch-load"];
+        assert.ok((load.readings?.current ?? 0) > 0, `${id} switches the load through its base/gate wiring: ${JSON.stringify({ state, load, diagnostics: simulator.getSnapshot().diagnostics })}`);
+      }
+    } else if (family === "switch") {
+      assert.equal(state.readings?.switch1, 0, "the example begins with the contact open");
+      assert.equal(simulator.getSnapshot().serial.at(-1)?.text, "1", "the open contact leaves INPUT_PULLUP high");
+      const closed = { ...project, components: project.components.map(component => component.id === "device" ? { ...component, properties: { ...component.properties, switch1: true } } : component) };
+      simulator.attachProject(closed); simulator.advance(100);
+      assert.equal(simulator.getSnapshot().componentStates.device.readings?.switch1, 1, "the interactive contact closes");
+      assert.equal(simulator.getSnapshot().serial.at(-1)?.text, "0", "the closed contact pulls INPUT_PULLUP low");
+    } else if (family === "input") {
+      if (id === "ir-remote-controller") {
+        assert.equal(state.readings?.output, 1, "the selected remote key creates an output event");
+        assert.equal(simulator.getSnapshot().serial[0]?.text, "1");
+      } else {
+        assert.ok(state.powered && (state.readings?.analogX ?? 0) > 0 && (state.readings?.analogY ?? 0) > 0, `${id} supplies both joystick axes`);
+        assert.ok(simulator.getSnapshot().serial.length > 0, `${id} readings reach the sketch`);
+      }
+    } else assert.fail(`No executable screenshot-family assertion for ${id} (${family})`);
   } else assert.fail(`Missing executable assertion for ${fixture}`);
   simulator.pause(); const time = simulator.getSnapshot().timeMs;
   simulator.advance(1000); assert.equal(simulator.getSnapshot().timeMs, time);

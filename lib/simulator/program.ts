@@ -1,4 +1,4 @@
-import { boardApiConstants } from "../circuit/boards.ts";
+import { boardApiConstants, getBoardProfile } from "../circuit/boards.ts";
 import { SIMULATOR_CAPABILITY_REGISTRY } from "./capabilities.ts";
 import { compileArduinoSketch } from "./parser.ts";
 import type { SimulatorDiagnostic } from "./types.ts";
@@ -80,8 +80,9 @@ export function sketchProgramHeaders(boardId: string, parts?: readonly SketchHea
   }
   for (const api of SIMULATOR_CAPABILITY_REGISTRY.deviceApis) {
     if (boardId !== "all" && api.boards && !api.boards.includes(boardId)) continue;
-    const relevant = api.component
-      ? partTypes.has(api.component)
+    const supportedComponents = [api.component, ...(api.components ?? [])].filter((component): component is string => Boolean(component));
+    const relevant = supportedComponents.length
+      ? supportedComponents.some(component => partTypes.has(component))
       : declaredHeaders.has(api.header) || (api.header === "Wire.h" && declaredInterfaces.has("I2C")) || (api.header === "SPI.h" && declaredInterfaces.has("SPI")) || (api.header === "SoftwareSerial.h" && declaredInterfaces.has("UART"));
     if (relevant) headers.add(api.header);
   }
@@ -252,7 +253,8 @@ export function normalizeSketchProgramForSimulator(value: SketchProgram, boardId
   if (boardId === "arduino-uno") {
     for (let pin = 0; pin <= 13; pin += 1) replacements[`D${pin}`] = String(pin);
   }
-  if (boardId === "esp32-devkitc-v4") replacements.Serial2 = "Serial1";
+  const boardProfile = getBoardProfile(boardId);
+  if (boardProfile?.mcu.toLowerCase().includes("esp32") && boardProfile.uart[1] && !boardProfile.uart[2]) replacements.Serial2 = "Serial1";
   const normalizeExpression = (expression: string): string => {
     if (typeof expression !== "string") return expression;
     const result = replaceExpressionIdentifiers(expression, replacements);
@@ -275,7 +277,7 @@ export function normalizeSketchProgramForSimulator(value: SketchProgram, boardId
         args = [JSON.stringify(args[0]!)];
         warnings.add("An unquoted multiword label in a Serial or display print call was rendered as a C++ string literal.");
       }
-      if (boardId === "esp32-devkitc-v4" && callee === "Serial1.begin" && args.length === 4) {
+      if (callee === "Serial1.begin" && args.length === 4) {
         const profile = SIMULATOR_CAPABILITY_REGISTRY.boards[boardId];
         const parsePin = (expression: string) => {
           const token = expression.trim();
@@ -286,6 +288,19 @@ export function normalizeSketchProgramForSimulator(value: SketchProgram, boardId
         if (uart && parsePin(args[2]!) === uart.rx && parsePin(args[3]!) === uart.tx) {
           args = [args[0]!];
           warnings.add("The simulator's ESP32 UART1 adapter uses GPIO16 for RX and GPIO17 for TX; a matching explicit begin() pin overload was simplified to Serial1.begin(baud).");
+        }
+      }
+      if (callee === "Wire.begin" && args.length === 2 && boardProfile) {
+        const parsePin = (expression: string) => {
+          const token = expression.trim();
+          if (/^\d+$/.test(token)) return Number(token);
+          return boardApiConstants(boardId)[token];
+        };
+        const sda = parsePin(args[0]!);
+        const scl = parsePin(args[1]!);
+        if (boardProfile.i2c.some(bus => (bus.sda === sda && bus.scl === scl) || (bus.sda === scl && bus.scl === sda))) {
+          args = [];
+          warnings.add("Simplified Wire.begin(sda, scl) to Wire.begin() because the explicit pins match the selected board profile's wired I2C bus.");
         }
       }
       return { ...statement, callee, arguments: args };

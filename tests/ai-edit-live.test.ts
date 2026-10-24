@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import nextEnv from "@next/env";
 
-import { POST, configureGenerationTestLimitsForTests, hasObservableButtonEffect, hasObservableButtonEffectAfterRelease, hasObservableEncoderEffect, simulateButtonScenario, simulateEncoderScenario } from "../app/api/ai/generate/route.ts";
+import { POST } from "../app/api/ai/generate/route.ts";
+import { configureGenerationTestLimitsForTests, hasObservableButtonEffect, hasObservableButtonEffectAfterRelease, hasObservableEncoderEffect, simulateButtonScenario, simulateEncoderScenario } from "../app/api/ai/generate/implementation.ts";
 import { configureAiUsageAdapterForTests, type AiUsageAdapter } from "../lib/billing/ai-usage.ts";
 import { safeParseCircuitProject } from "../lib/circuit/index.ts";
 import { createDefaultBlinkProject } from "../lib/circuit/default-project.ts";

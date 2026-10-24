@@ -47,7 +47,7 @@ export class OneWireRuntime {
   }
   tick(project: CircuitProject, wiring: DeviceWiring, time: number) {
     this.project = project; this.wiring = wiring; this.time = time;
-    for (const c of project.components.filter(c => c.type === "ds18b20")) {
+    for (const c of project.components.filter(c => ["ds18b20", "ds18b20-waterproof"].includes(c.type))) {
       const s = this.state(c.id);
       if (!this.powered(c)) { this.devices.delete(c.id); continue; }
       if (s.pending !== undefined) {
@@ -57,7 +57,7 @@ export class OneWireRuntime {
     }
   }
   parts(pin: number) {
-    return this.project?.components.filter(c => c.type === "ds18b20" && this.powered(c) && this.wiring!.boardConnected(c.id, "DQ", pin) && this.wiring!.pullup(c.id, "DQ")) ?? [];
+    return this.project?.components.filter(c => ["ds18b20", "ds18b20-waterproof"].includes(c.type) && this.powered(c) && this.wiring!.boardConnected(c.id, "DQ", pin) && this.wiring!.pullup(c.id, "DQ")) ?? [];
   }
   addressed(pin: number, address: readonly number[]) { return this.parts(pin).find(c => sensorRom(c.id).every((byte, i) => byte === address[i])); }
   resolution(c: CircuitComponent, value?: number) {
@@ -70,7 +70,7 @@ export class OneWireRuntime {
     for (const c of parts) {
       const s = this.state(c.id), duration = 750 / (1 << (12 - s.resolution));
       const scale = 1 << (s.resolution - 8);
-      s.pending = Math.round(Math.max(-55, Math.min(125, Number(c.properties?.temperature ?? 25))) * scale) / scale;
+      s.pending = Math.round(Math.max(-55, Math.min(125, Number(c.properties?.temperatureC ?? c.properties?.temperature ?? 25))) * scale) / scale;
       s.readyAt = this.time + duration; s.strong = strong; s.failed = this.parasite(c) && !strong;
       delay = Math.max(delay, duration);
     }

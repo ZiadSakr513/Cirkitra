@@ -60,6 +60,8 @@ import { spaceGeneratedComponents } from "../lib/schematic/generated-layout.ts";
 import { isLatestWireRouteResponse, type WireRouteRequest, type WireRouteResponse } from "../lib/schematic/route-worker-core.ts";
 import { DeviceFeedback } from "./device-feedback";
 import { SchematicSymbol } from "./schematic-symbols";
+import { hasHardwareArtwork } from "../lib/circuit/hardware-artwork.ts";
+import { HardwareArtworkPreview } from "./component-artwork";
 import { accountProjectCacheKey } from "../lib/circuit/account-storage";
 import { generationFailureNextStep } from "../lib/circuit/generation-error-guidance";
 import { createClient as createSupabaseClient } from "../lib/supabase/client";
@@ -1554,7 +1556,7 @@ export function CircuitStudio({ initialProject: loadedProject, projectUpdatedAt,
           <div className="parts-list">
             {parts.map((part) => (
               <button className="part-card" key={part.id} onClick={() => { addPart(part.id); setMobilePanel(null); }} title={`Add ${part.displayName}`}>
-                <span className="part-glyph" style={{ "--part-accent": part.accent } as React.CSSProperties}>{PART_GLYPHS[part.id] ?? "IC"}</span>
+                <span className={`part-glyph${hasHardwareArtwork(part.id) ? " has-hardware-artwork" : ""}`} style={{ "--part-accent": part.accent } as React.CSSProperties}>{hasHardwareArtwork(part.id) ? <HardwareArtworkPreview type={part.id} /> : PART_GLYPHS[part.id] ?? "IC"}</span>
                 <span><strong>{part.displayName}</strong><small>{CATEGORY_LABELS[part.category]}</small></span>
                 <i>+</i>
               </button>
@@ -1689,13 +1691,16 @@ export function CircuitStudio({ initialProject: loadedProject, projectUpdatedAt,
                   buzzerCircuitBindings.get(component.id),
                   snapshot,
                 );
-                const servoState = component.type === "servo"
-                  ? snapshot.servos.find((servo) => resolveComponentBoardPinEndpoints(project, component.id, "SIG").some((pin) => pin.boardId === (servo.boardId ?? project.board) && pin.componentId === (servo.boardComponentId ?? activeBoard?.id) && resolveBoardPin(pin.boardId, pin.pin) === servo.pin))
+                const isServo = ["servo", "sg90-servo", "mg996r-servo"].includes(component.type);
+                const servoState = isServo
+                  ? snapshot.servos.find((servo) => servo.attached && resolveComponentBoardPinEndpoints(project, component.id, "SIG").some((pin) => pin.boardId === (servo.boardId ?? project.board) && pin.componentId === (servo.boardComponentId ?? activeBoard?.id) && resolveBoardPin(pin.boardId, pin.pin) === servo.pin))
                   : undefined;
                 const lcdState = component.type === "lcd-16x2" ? snapshot.lcds[0] : undefined;
                 const electricalState = snapshot.componentStates[component.id];
-                const symbolProperties = component.type === "servo" && servoState
-                  ? { ...component.properties, angle: servoState.angle }
+                const servoCommandActive = Boolean(servoState && electricalState?.powered);
+                const servoAngle = servoCommandActive ? servoState!.angle : Number(component.properties?.angle ?? 90);
+                const symbolProperties = isServo
+                  ? { ...component.properties, angle: servoAngle, __servoCommandActive: servoCommandActive }
                   : component.type === "lcd-16x2" && lcdState
                     ? { ...component.properties, text: lcdState.lines.join("\n") }
                     : { ...component.properties, __electricalState: JSON.stringify(electricalState ?? null) };
@@ -1709,7 +1714,7 @@ export function CircuitStudio({ initialProject: loadedProject, projectUpdatedAt,
                 return (
                   <article
                     key={component.id}
-                    className={`circuit-node schematic-component component-${component.type} ${isSelected ? "selected" : ""} ${isPowered ? "powered" : ""} ${isDragging ? "dragging" : ""}`}
+                    className={`circuit-node schematic-component schematic-pin-group component-${component.type} ${isBoardType(component.type) ? "is-board-component" : ""} ${hasHardwareArtwork(component.type) ? "has-hardware-artwork" : ""} ${isSelected ? "selected" : ""} ${isPowered ? "powered" : ""} ${isDragging ? "dragging" : ""}`}
                     style={{ 
                       left: component.x, 
                       top: component.y, 
@@ -1723,6 +1728,7 @@ export function CircuitStudio({ initialProject: loadedProject, projectUpdatedAt,
                   >
                     <div className="symbol-caption"><strong>{component.label}</strong><small>{component.type === "arduino-uno" ? "ARDUINO UNO R3" : definition?.displayName}</small></div>
                     <SchematicSymbol type={component.type} properties={symbolProperties} powered={isPowered || isBoardType(component.type)} simulationStatus={snapshot.status} playbackSpeed={snapshot.speed} zoom={zoom} />
+                    {(() => { const isBoard = isBoardType(component.type); const hasArtwork = hasHardwareArtwork(component.type); const showLabels = !definition?.symbol || isBoard || hasArtwork; return <div className="schematic-pin-layer">
                     {definition?.pins.map((pin) => {
                         const localPoint = pinPosition({ ...component, x: 0, y: 0, rotation: 0 }, pin.id, definition);
                         if (!localPoint) return null;
@@ -1730,8 +1736,9 @@ export function CircuitStudio({ initialProject: loadedProject, projectUpdatedAt,
                         const connectedWires = connectedWiresByPin.get(`${component.id}\u0000${pin.id}`) ?? [];
                         const highlightedWire = connectedWires.find((connection) => connection.id === highlightedWireId);
                         const displayWire = highlightedWire ?? connectedWires[0];
-                        return <button key={pin.id} className={`schematic-pin side-${pin.side} ${active ? "active" : ""} ${displayWire ? "connected" : ""} ${highlightedWire ? "wire-highlighted" : ""}`} style={{ left: localPoint.x, top: localPoint.y, "--pin-wire-color": displayWire?.color ?? "#47b86b" } as React.CSSProperties} aria-label={pin.number ? `${pin.label}, pin ${pin.number}` : pin.label} title={`${pin.number ? `Pin ${pin.number} · ` : ""}${pin.label}${displayWire ? " · connected" : ""} · click to wire`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); connectPin({ componentId: component.id, pin: pin.id }); }}><i />{(!definition.symbol || isBoardType(component.type)) && <span>{pin.label}</span>}</button>;
+                        return <button key={pin.id} className={`schematic-pin side-${pin.side} ${active ? "active" : ""} ${displayWire ? "connected" : ""} ${highlightedWire ? "wire-highlighted" : ""}`} style={{ left: localPoint.x, top: localPoint.y, "--pin-wire-color": displayWire?.color ?? "#47b86b" } as React.CSSProperties} aria-label={pin.number ? `${pin.label}, pin ${pin.number}` : pin.label} title={`${pin.number ? `Pin ${pin.number} · ` : ""}${pin.label}${displayWire ? " · connected" : ""} · click to wire`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); connectPin({ componentId: component.id, pin: pin.id }); }}><i />{showLabels && <span>{pin.label}</span>}</button>;
                       })}
+                    </div>; })()}
                   </article>
                 );
               })}
