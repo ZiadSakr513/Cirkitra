@@ -38,6 +38,10 @@ function explicitlyRequestsLogicGate(componentId: string, prompt: string): boole
  * addressable-strip pixel numbers as separate hardware. */
 export function requestedComponentCounts(prompt: string, definitions: readonly ComponentDefinition[]): Map<string, number> {
   const normalizedPrompt = ` ${normalize(prompt)} `;
+  const namedParts = definitions.map(part => ({
+    id: part.id,
+    names: [part.id, part.displayName, ...(part.requestAliases ?? []), ...(part.metadata?.aliases ?? [])].map(normalize),
+  }));
   const explicitlyNamesIdealMosfet = /\bideal\s+(?:n\s+)?mosfet\b|\bideal\s+n\s+mos\s+switch\b/.test(normalizedPrompt);
   const explicitlyNames2n7000 = /\b2n7000\b/.test(normalizedPrompt);
   const explicitlyNamesTsop = /\btsop4838\b/.test(normalizedPrompt);
@@ -61,14 +65,29 @@ export function requestedComponentCounts(prompt: string, definitions: readonly C
       .filter(name => name.length > 2 && !GENERIC_ALIASES.has(name));
     if (definition.id === "led" && /\b(?:built in|on board|onboard|integrated)\s+(?:status\s+)?led\b/.test(normalizedPrompt)) continue;
     let matchedName: string | undefined;
+    let matchedPrompt = normalizedPrompt;
     for (const name of names.sort((a, b) => b.length - a.length)) {
-      if (normalizedPrompt.includes(` ${name} `) || normalizedPrompt.includes(` ${name}s `)) { matchedName = name; break; }
+      if (!normalizedPrompt.includes(` ${name} `) && !normalizedPrompt.includes(` ${name}s `)) continue;
+      // A model's full name owns its embedded generic alias. Keep separately
+      // requested generic parts, but do not add a second part for that alias.
+      const specificNames = namedParts.filter(part => part.id !== definition.id)
+        .flatMap(part => part.names)
+        .filter(specific => specific.length > name.length && ` ${specific} `.includes(` ${name} `));
+      const candidatePrompt = specificNames.reduce((text, specific) => text.replace(
+        new RegExp(`\\b${escapeRegex(specific).replace(/\ /g, "\\s+")}s?\\b`, "g"),
+        match => " ".repeat(match.length),
+      ), normalizedPrompt);
+      if (candidatePrompt.includes(` ${name} `) || candidatePrompt.includes(` ${name}s `)) {
+        matchedName = name;
+        matchedPrompt = candidatePrompt;
+        break;
+      }
     }
     if (!matchedName) continue;
     if (definition.id === "led" && /\brgb\s+led\b/.test(normalizedPrompt)
       && !/\b(?:separate|additional|discrete|another)\b[\s\S]{0,24}\bled\b/.test(normalizedPrompt)) continue;
     const escapedName = escapeRegex(matchedName).replace(/\ /g, "\\s+");
-    const quantity = new RegExp(`(?:^|\\s)(\\d+|${Object.keys(NUMBER_WORDS).join("|")})\\s+(?:x\\s+)?${escapedName}s?(?:\\s|$)`, "i").exec(normalizedPrompt);
+    const quantity = new RegExp(`(?:^|\\s)(\\d+|${Object.keys(NUMBER_WORDS).join("|")})\\s+(?:x\\s+)?${escapedName}s?(?:\\s|$)`, "i").exec(matchedPrompt);
     const parsedQuantity = quantity ? Number(quantity[1]) || NUMBER_WORDS[quantity[1].toLowerCase()] || 1 : 1;
     const quantityPosition = quantity ? normalizedPrompt.indexOf(quantity[1], quantity.index + 1) : -1;
     if (definition.id === "led" && mentionsAddressableLedStrip && quantityPosition < 0
