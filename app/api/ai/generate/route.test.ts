@@ -1002,7 +1002,7 @@ test("a supported capacitor request reaches generation with the correct required
   assert.ok(body.project.components.some((part: { type: string }) => part.type === "capacitor-1uf"));
 });
 
-test("an unsupported DHT11 request is rejected with the supported DHT22 alternative", async context => {
+test("a supported DHT11 request reaches generation without substituting a DHT22", async context => {
   const previousFetch = globalThis.fetch;
   const previousKey = process.env.GEMINI_API_KEY;
   context.after(() => {
@@ -1012,20 +1012,24 @@ test("an unsupported DHT11 request is rejected with the supported DHT22 alternat
   });
   process.env.GEMINI_API_KEY = "test-secret";
   let providerCalls = 0;
-  globalThis.fetch = async () => {
+  const project = COMPONENT_EXAMPLES["dht11"]!();
+  globalThis.fetch = async (_input, init) => {
     providerCalls += 1;
-    return new Response("unexpected model call", { status: 500 });
+    const request = JSON.parse(String(init?.body));
+    const content = JSON.parse(request.contents[0].parts[0].text);
+    assert.ok(content.availableComponentTypes.includes("dht11"));
+    assert.ok(content.requiredComponentCounts.some((part: { type: string; count: number }) => part.type === "dht11" && part.count === 1));
+    return modelResponse(JSON.stringify({ project, explanation: "Read the wired DHT11 temperature and humidity sensor.", warnings: [], assumptions: [] }));
   };
   const response = await POST(new Request("http://localhost/api/ai/generate", {
     method: "POST",
-    body: JSON.stringify({ prompt: "Build a temperature and humidity monitor using a DHT11 and LCD." }),
+    body: JSON.stringify({ prompt: "Build an Arduino Uno temperature and humidity monitor using one DHT11 and print its readings to Serial." }),
   }));
   const body = await response.json();
-  assert.equal(response.status, 422);
-  assert.equal(body.error.code, "COMPONENT_UNAVAILABLE");
-  assert.match(body.error.message, /DHT11 is not in Cirkitra's supported component catalog/);
-  assert.ok(body.error.details.some((detail: string) => /DHT22 \(AM2302\)/.test(detail)));
-  assert.equal(providerCalls, 0, "an unavailable sensor must not be silently replaced by a different part");
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(providerCalls, 1);
+  assert.ok(body.project.components.some((part: { type: string }) => part.type === "dht11"));
+  assert.ok(!body.project.components.some((part: { type: string }) => part.type === "dht22"));
 });
 
 test("LED current-limit validation catches an output that bypasses its resistor without flagging an input", () => {
@@ -1347,7 +1351,7 @@ test("published runnable examples pass the generation endpoint without repair", 
         const schema = request.generationConfig.responseJsonSchema.properties;
         assert.ok(schema.project.properties.code);
         assert.ok(schema.project.properties.components);
-        assert.equal(request.generationConfig.maxOutputTokens, 65_536);
+        assert.ok(request.generationConfig.maxOutputTokens > 8_192 && request.generationConfig.maxOutputTokens <= 65_536, "a complex circuit receives a larger bounded output budget");
         assert.equal("projectId" in schema, false, "generation no longer makes a separate plan request");
       }
       if (id === "soil-moisture-sen0193") assert.match(request.systemInstruction?.parts?.[0]?.text ?? "", /SEN0193.*dry reading.*high ADC value/i, "the model must follow the simulator's actual soil-sensor polarity");
@@ -1459,7 +1463,7 @@ test("normalizes schematic-style D pin names in generated Arduino code", async c
   });
   process.env.GEMINI_API_KEY = "test-secret";
   const project = structuredClone(generatedEnvelope.project);
-  project.code = `// D12 in a comment stays text\n#define LED_PIN D13\nvoid setup(){ pinMode(LED_PIN, OUTPUT); }\nvoid loop(){ digitalWrite(LED_PIN, HIGH); Serial.println("D11 stays text"); delay(10); }`;
+  project.code = `// D12 in a comment stays text\n#define LED_PIN D13\nvoid setup(){ pinMode(LED_PIN, OUTPUT); Serial.begin(9600); }\nvoid loop(){ digitalWrite(LED_PIN, HIGH); Serial.println("D11 stays text"); delay(10); }`;
   globalThis.fetch = async () => modelResponse(JSON.stringify({ project, explanation: "Blink circuit", assumptions: [], warnings: [] }));
 
   const response = await POST(generationRequest());
@@ -1700,9 +1704,9 @@ test("generation repairs a rotary sketch that prints encoder position without ch
     ? { ...component, properties: { ...component.properties, position: 0, pressed: false } }
     : component);
   const broken = structuredClone(project);
-  broken.code = `#include <Encoder.h>\n#include <Adafruit_NeoPixel.h>\nEncoder knob(2,3); Adafruit_NeoPixel strip(8,6,NEO_GRB + NEO_KHZ800);\nvoid setup(){ strip.begin(); }\nvoid loop(){ int temperature=analogRead(A0); int position=knob.read(); uint32_t color=strip.Color(0,255,0); for(int i=0;i<8;i++) strip.setPixelColor(i,color); strip.show(); Serial.println(position); delay(20); }`;
+  broken.code = `#include <Encoder.h>\n#include <Adafruit_NeoPixel.h>\nEncoder knob(2,3); Adafruit_NeoPixel strip(8,6,NEO_GRB + NEO_KHZ800);\nvoid setup(){ strip.begin(); Serial.begin(9600); }\nvoid loop(){ int temperature=analogRead(A0); int position=knob.read(); uint32_t color=strip.Color(0,255,0); for(int i=0;i<8;i++) strip.setPixelColor(i,color); strip.show(); Serial.println(position); delay(20); }`;
   const repaired = structuredClone(project);
-  repaired.code = `#include <Encoder.h>\n#include <Adafruit_NeoPixel.h>\nEncoder knob(2,3); Adafruit_NeoPixel strip(8,6,NEO_GRB + NEO_KHZ800);\nvoid setup(){ strip.begin(); }\nvoid loop(){ int temperature=analogRead(A0); int position=constrain(knob.read(),0,15); int threshold=map(position,0,15,20,35); int thresholdAdc=map(threshold,20,35,143,174); uint32_t color=strip.Color(0,255,0); if(temperature>thresholdAdc) color=strip.Color(255,0,0); for(int i=0;i<8;i++) strip.setPixelColor(i,color); strip.show(); Serial.println(threshold); delay(20); }`;
+  repaired.code = `#include <Encoder.h>\n#include <Adafruit_NeoPixel.h>\nEncoder knob(2,3); Adafruit_NeoPixel strip(8,6,NEO_GRB + NEO_KHZ800);\nvoid setup(){ strip.begin(); Serial.begin(9600); }\nvoid loop(){ int temperature=analogRead(A0); int position=constrain(knob.read(),0,15); int threshold=map(position,0,15,20,35); int thresholdAdc=map(threshold,20,35,143,174); uint32_t color=strip.Color(0,255,0); if(temperature>thresholdAdc) color=strip.Color(255,0,0); for(int i=0;i<8;i++) strip.setPixelColor(i,color); strip.show(); Serial.println(threshold); delay(20); }`;
 
   let calls = 0;
   let repairIssues: string[] = [];
@@ -2014,7 +2018,7 @@ test("generation makes one complete-project request without planner or subsystem
   assert.match(systemInstructionText, /single Li-ion cell is at most 4\.2 V/);
   assert.equal("plan" in (requestContent ?? {}), false);
   assert.equal("subsystem" in (requestContent ?? {}), false);
-  assert.equal(generationConfig?.maxOutputTokens, 65_536);
+  assert.equal(generationConfig?.maxOutputTokens, 8_192);
   const schema = generationConfig?.responseJsonSchema as { properties?: Record<string, unknown> } | undefined;
   const projectSchema = schema?.properties?.project as { properties?: Record<string, unknown> } | undefined;
   assert.ok(projectSchema?.properties?.components && projectSchema.properties.connections && projectSchema.properties.code);
@@ -3032,7 +3036,7 @@ test("Gemini schema rejection retries in JSON mode and still validates the compl
     const request = JSON.parse(String(init?.body));
     if (calls === 1) {
       assert.ok(request.generationConfig.responseJsonSchema.properties.project.properties.code, "the one-shot schema requests executable source with the complete topology");
-      assert.equal(request.generationConfig.maxOutputTokens, 65_536);
+      assert.equal(request.generationConfig.maxOutputTokens, 8_192);
       assert.ok(JSON.stringify(request.generationConfig.responseJsonSchema).length < 12_000, "the complete-project schema stays within a compact provider-safe size");
       return Response.json({ error: { code: 400, status: "INVALID_ARGUMENT", message: "Request contains an invalid argument." } }, { status: 400 });
     }
@@ -4036,7 +4040,7 @@ test("forwards only the default and selected Gemini models", async (context) => 
     const headers = new Headers(request.init?.headers);
     const body = JSON.parse(String(request.init?.body));
     assert.equal(headers.get("x-goog-api-key"), "test-secret");
-    assert.equal(body.generationConfig.maxOutputTokens, 65_536);
+    assert.equal(body.generationConfig.maxOutputTokens, 8_192);
     assert.equal(body.generationConfig.responseMimeType, "application/json");
     assert.equal(body.generationConfig.responseJsonSchema.type, "object");
     assert.ok(body.generationConfig.responseJsonSchema.properties.project.properties.code);
@@ -4077,7 +4081,7 @@ test("a truncated initial answer gets one compact full-project retry and never p
   assert.equal(response.status, 502);
   assert.equal(body.error.code, "AI_RESPONSE_TRUNCATED");
   assert.match(body.error.message, /response-length limit/);
-  assert.match(body.error.message, /split the design into smaller circuits/);
+  assert.match(body.error.message, /split (?:the design|it) into smaller circuits/);
   assert.equal(providerCalls, 2, "the truncation request and its single compact retry reach Gemini");
   assert.equal(requests.length, 2, "truncation permits exactly one compact complete-project retry, never planner or subsystem calls");
   assert.equal(contents[1]?.compactRetry, true);
@@ -4086,7 +4090,7 @@ test("a truncated initial answer gets one compact full-project retry and never p
   assert.equal(contents[1]?.mode, contents[0]?.mode);
   for (const request of requests) {
     const providerRequest = JSON.parse(String(request.body));
-    assert.equal(providerRequest.generationConfig.maxOutputTokens, 65_536);
+    assert.equal(providerRequest.generationConfig.maxOutputTokens, 8_192);
     assert.ok(providerRequest.generationConfig.responseJsonSchema.properties.project.properties.components);
     assert.ok(providerRequest.generationConfig.responseJsonSchema.properties.project.properties.connections);
   }
@@ -4112,7 +4116,7 @@ test("a compact complete-project retry after output truncation is validated befo
     const content = JSON.parse(request.contents[0].parts[0].text);
     if (calls === 1) return Response.json({ candidates: [{ finishReason: "MAX_TOKENS", content: { parts: [{ text: "" }] } }] });
     assert.equal(content.compactRetry, true);
-    assert.equal(request.generationConfig.maxOutputTokens, 65_536);
+    assert.equal(request.generationConfig.maxOutputTokens, 8_192);
     return modelResponse(JSON.stringify({ project: createDefaultBlinkProject(), explanation: "Blinking LED.", assumptions: [], warnings: [] }));
   };
 
