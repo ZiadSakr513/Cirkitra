@@ -392,8 +392,6 @@
 .schematic-symbol--dc-motor.schematic-symbol--powered .symbol-motor__rotor i { background:#43e0be; }
 .schematic-symbol--dc-motor[data-motion="running"] .symbol-motor__rotor { animation-play-state:running; }
 .schematic-symbol--dc-motor[data-direction="reverse"] .symbol-motor__rotor { animation-direction:reverse; }
-.symbol-motor__status { position:absolute; top:84px; left:50%; transform:translateX(-50%) scale(var(--motor-badge-scale,1)); transform-origin:top center; white-space:nowrap; padding:3px 6px; border:1px solid #526876; border-radius:5px; background:#0b1925; color:#c5d3df; font:600 11px/1.3 var(--font-mono); pointer-events:none; }
-.schematic-symbol--dc-motor.schematic-symbol--powered .symbol-motor__status { color:#85f5d8; border-color:#36b79e; background:#0b2524; }
 @keyframes motor-spin { to { transform:rotate(360deg); } }
 @media (prefers-reduced-motion:reduce) { .symbol-motor__rotor { animation:none !important; } }
 
@@ -453,10 +451,6 @@
 .wire-trace-card small { color: #ffd18b; margin-top: 5px; }
 .wire-trace-card button { flex-shrink: 0; font-size: 11px; }
 
-.symbol-registry__state { position: absolute; z-index: 2; top: calc(100% + 8px); left: 50%; transform-origin: top center; display: grid; gap: 3px; min-width: 112px; max-width: 230px; padding: 5px 9px; border: 1px solid #617f92; border-radius: 5px; background: #0b1c27; color: #f0f8ff; text-align: center; pointer-events: none; }
-.symbol-registry__state strong { font: 600 12px/1.3 var(--font-body, sans-serif); white-space: nowrap; }
-.symbol-registry__state small { color: #b7d8e8; font: 10px/1.4 var(--font-mono, monospace); }
-.symbol-registry__state small:empty { display: none; }
 
 /* Board artwork for the non-Uno profiles. Pin labels remain in the foreground. */
 .schematic-symbol--board { position:absolute; inset:0; }
@@ -574,3 +568,21 @@
 .symbol-load__body i { width:4px; height:29px; background:#392c26; box-shadow:0 1px #e6cf99; }.symbol-load__body b { position:absolute; bottom:-15px; color:#e6c99c; font:6px var(--font-mono); }.symbol-power-art--load small { position:absolute; top:10px; left:50%; transform:translateX(-50%); color:#ffd998; font:7px var(--font-mono); white-space:nowrap; }
 .symbol-power-art--mosfet .symbol-mosfet__case { position:absolute; top:19px; left:50%; display:flex; flex-direction:column; align-items:center; justify-content:center; width:54px; height:46px; transform:translateX(-50%); border:2px solid #849395; border-radius:5px 5px 12px 12px; background:linear-gradient(90deg,#202a2e,#556267 45%,#202a2e); box-shadow:inset 0 0 7px #000,0 4px 7px #0008; color:#c0cecb; }
 .symbol-mosfet__case b { font:700 12px var(--font-mono); }.symbol-mosfet__case small { font:5px var(--font-mono); }.symbol-mosfet__lead { position:absolute; top:63px; width:3px; height:28px; background:linear-gradient(90deg,#929e9d,#d1d6ce,#7b8a8c); }.symbol-mosfet__lead--gate { left:28%; }.symbol-mosfet__lead--drain { left:50%; }.symbol-mosfet__lead--source { left:72%; }.symbol-power-art--mosfet.is-on .symbol-mosfet__case { border-color:#47e0bb; box-shadow:0 0 13px #37d6b077,inset 0 0 7px #000; }
+
+/* Shared SVG hardware artwork and wireable physical terminal overlay. */
+.hardware-part-artwork { position:absolute; inset:0; width:100%; height:100%; overflow:visible; pointer-events:none; }
+.hardware-board-artwork { position:absolute; inset:0; width:100%; height:100%; overflow:visible; pointer-events:none; }
+.hardware-part-artwork--preview { position:relative; inset:auto; display:block; width:100%; height:100%; }
+.hardware-part-artwork--running .hardware-artwork__rotor.is-energized { animation-play-state:running; }
+.schematic-pin-layer { position:absolute; z-index:8; inset:0; pointer-events:none; }
+.schematic-pin-layer .schematic-pin { pointer-events:auto; }
+.schematic-pin-group.has-hardware-artwork .schematic-pin { z-index:9; }
+.schematic-pin-group.has-hardware-artwork .schematic-pin.side-bottom span { font-size:6.5px; }
+.component-breadboard-half .schematic-pin.side-left { flex-direction: row-reverse; }
+.component-breadboard-half .schematic-pin.side-right { flex-direction: row; transform: translate(0, -50%); }
+.component-freenove-esp32s3-wroom .schematic-pin.side-left { flex-direction: row-reverse; }
+.schematic-pin-group.is-board-component .schematic-pin.side-left { flex-direction: row-reverse; transform: translate(-100%, -50%); }
+.schematic-pin-group.is-board-component .schematic-pin.side-right { transform: translate(0, -50%); }
+.part-glyph.has-hardware-artwork { padding:2px; }
+.part-glyph.has-hardware-artwork svg { position:relative; display:block; width:100%; height:100%; overflow:visible; }
+@media (prefers-reduced-motion: reduce) { .hardware-part-artwork--running .hardware-artwork__rotor { animation:none !important; } }

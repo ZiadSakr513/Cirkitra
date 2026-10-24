@@ -554,7 +554,7 @@ export class ArduinoSimulator {
       ...this.networkBoardPins,
       ...(this.boardComponentId ? { [this.boardComponentId]: this.pins } : {}),
     };
-    this.devices.tick(this.timeMs, this.pins, this.motorLoads, boardPins);
+    this.devices.tick(this.timeMs, this.pins, this.motorLoads, boardPins, [...this.servos.values()]);
     const solve = () => solveCircuit(project, { ...snapshot, pins: this.pins, boardPins, primaryBoardId: this.boardComponentId, primaryBoardType: this.boardId, timeMs: this.timeMs, componentStates: devices.states, deviceDrives: devices.drives, deviceBridges: devices.bridges });
     let solution = solve();
     const nextMotorLoads = deriveMotorSupplyLoads(project, solution.componentStates);
@@ -562,7 +562,7 @@ export class ArduinoSimulator {
       this.motorLoads = nextMotorLoads;
       // Re-solve DC power at the same simulated instant so the supply meter
       // and battery charge see motor demand immediately, without advancing time.
-      devices.tick(this.timeMs, this.pins, this.motorLoads, boardPins);
+      devices.tick(this.timeMs, this.pins, this.motorLoads, boardPins, [...this.servos.values()]);
       solution = solve();
     }
     const digitalInputs = this.boardComponentId ? solution.boardDigitalInputs[this.boardComponentId] : solution.digitalInputs;
@@ -573,19 +573,21 @@ export class ArduinoSimulator {
     this.componentStates = { ...solution.componentStates, ...this.devices.states };
   }
 
-  /** Bind a powered HC-SR04's configured distance to its wired board ECHO pin.
+  /** Bind powered ultrasonic echoes and YF-S201 flow pulses to wired board inputs.
    * Explicit setPulseInput() values remain overrides for interactive tests. */
   private replaceCircuitPulseInputs(project: CircuitProject, componentStates: Readonly<Record<string, SimulatedComponentState>>) {
     const next = new Map<number, number>();
     const conflictingPins = new Set<number>();
     const boards = project.components.filter(component => isBoardType(component.type)
       && (!this.boardComponentId || component.id === this.boardComponentId));
-    for (const sensor of project.components.filter(component => component.type === "hc-sr04")) {
+    for (const sensor of project.components.filter(component => ["hc-sr04", "jsn-sr04t-ultrasonic", "yf-s201-water-flow-sensor"].includes(component.type))) {
+      const flowMeter = sensor.type === "yf-s201-water-flow-sensor";
+      const sensorPin = flowMeter ? "SIGNAL" : "ECHO";
       if (!componentStates[sensor.id]?.powered) continue;
       const echoWire = project.connections.find(connection => {
-        const endpoint = connection.from.componentId === sensor.id && connection.from.pin === "ECHO"
+        const endpoint = connection.from.componentId === sensor.id && connection.from.pin === sensorPin
           ? connection.to
-          : connection.to.componentId === sensor.id && connection.to.pin === "ECHO" ? connection.from : undefined;
+          : connection.to.componentId === sensor.id && connection.to.pin === sensorPin ? connection.from : undefined;
         if (!endpoint) return false;
         const board = boards.find(candidate => candidate.id === endpoint.componentId);
         return !!board && !!getBoardProfile(board.type)?.ioPins.some(pin => pin.id === endpoint.pin);
@@ -598,7 +600,13 @@ export class ArduinoSimulator {
       if (pin === undefined || conflictingPins.has(pin)) continue;
       const sensorState = componentStates[sensor.id];
       const distance = Number(sensorState?.readings?.distanceCm ?? sensor.properties?.distanceCm ?? 100);
-      const duration = Math.max(0, Math.min(400, Number.isFinite(distance) ? distance : 100)) * 58.3;
+      const flowLpm = Number(sensorState?.readings?.flowLpm ?? sensor.properties?.flowLpm ?? 0);
+      const frequencyHz = Math.max(0, Math.min(225, Number.isFinite(flowLpm) ? flowLpm : 0)) * 7.5;
+      // YF-S201 pulses at approximately 7.5 Hz per L/min. pulseIn(HIGH)
+      // observes the high half-cycle; the model intentionally omits jitter.
+      const duration = flowMeter
+        ? frequencyHz > 0 ? 1_000_000 / (2 * frequencyHz) : 0
+        : Math.max(0, Math.min(400, Number.isFinite(distance) ? distance : 100)) * 58.3;
       if (next.has(pin) && Math.abs(next.get(pin)! - duration) > 1) {
         next.delete(pin);
         conflictingPins.add(pin);
@@ -607,7 +615,7 @@ export class ArduinoSimulator {
     this.circuitPulseInputs = next;
   }
   private execute(instruction: SketchInstruction) {
-    const isSerialCall = instruction.kind === "deviceCall" && /^Serial[1-3]$/.test(instruction.instance);
+    const isSerialCall = instruction.kind === "deviceCall" && /^Serial[0-3]?$/.test(instruction.instance);
     const readsPins = /\b(?:digitalRead|analogRead|pulseIn)\s*\(/.test(JSON.stringify(instruction));
     const writesPin = instruction.kind === "pinMode" || instruction.kind === "digitalWrite" || instruction.kind === "digitalWriteExpression" || instruction.kind === "analogWrite" || instruction.kind === "analogWriteExpression";
     const pinBefore = writesPin ? { ...this.pins[instruction.pin] } : undefined;
@@ -647,7 +655,7 @@ export class ArduinoSimulator {
       return;
     }
     if (instruction.kind === "deviceCall") {
-      const serialPrint = /^Serial[1-3]$/.test(instruction.instance) && ["print", "println"].includes(instruction.method);
+      const serialPrint = /^Serial[0-3]?$/.test(instruction.instance) && ["print", "println"].includes(instruction.method);
       const args = instruction.args.map((arg, index) => serialPrint && index === 0 ? this.serialText(arg) : this.deviceValue(arg));
       if (instruction.instance === "__core" && instruction.method === "shiftOut") {
         const [data, clock, order, value] = args.map(Number);
@@ -661,8 +669,11 @@ export class ArduinoSimulator {
         }
       } else {
         this.devices?.invoke(instruction.instance, instruction.method, args, text => this.deviceValue(text));
-        if (/^Serial[1-3]$/.test(instruction.instance) && ["print", "println"].includes(instruction.method)) {
-          this.serial.push({ id: this.nextSerialId++, timestampMs: this.timeMs, text: String(args[0] ?? ""), newline: instruction.method === "println" });
+        if (/^Serial[0-3]?$/.test(instruction.instance) && ["print", "println", "write"].includes(instruction.method)) {
+          const value = instruction.method === "write" && typeof args[0] === "number"
+            ? String.fromCharCode(Math.max(0, Math.min(255, Math.trunc(args[0]))))
+            : String(args[0] ?? "");
+          this.serial.push({ id: this.nextSerialId++, timestampMs: this.timeMs, text: value, newline: instruction.method === "println" });
           this.serial = this.serial.slice(-this.maxSerialEntries);
         }
         if (this.devices?.pendingDelayMs) { this.waitRemainingMs = this.devices.pendingDelayMs; this.devices.pendingDelayMs = 0; }
@@ -812,11 +823,15 @@ export class ArduinoSimulator {
 
   private deviceValue(text: string): DeviceValue {
     const value = text.trim();
-    const indexed = /^((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*)\s*\[([^\]]+)\]$/.exec(value);
+    const indexed = /^((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*)((?:\s*\[[^\]]+\])+)$/.exec(value);
     if (indexed) {
-      const collection = this.deviceValue(indexed[1]);
-      const index = Math.trunc(this.evaluate(indexed[2]) ?? -1);
-      return Array.isArray(collection) ? collection[index] ?? NaN : NaN;
+      let selected = this.deviceValue(indexed[1]);
+      for (const match of indexed[2].matchAll(/\[([^\]]+)\]/g)) {
+        const index = Math.trunc(this.evaluate(match[1]!) ?? -1);
+        if (!Array.isArray(selected)) return NaN;
+        selected = selected[index] ?? NaN;
+      }
+      return selected;
     }
     if (/^"[\s\S]*"$/.test(value)) { try { return JSON.parse(value) as string; } catch { return value.slice(1, -1); } }
     if (/^'.'$/.test(value)) return value.charCodeAt(1);
@@ -947,9 +962,9 @@ export class ArduinoSimulator {
       const placeholder = `__deviceResult${values.size}`; values.set(placeholder, Number(result));
       expanded = expanded.slice(0, match.index) + placeholder + expanded.slice(end); callPattern.lastIndex = 0;
     }
-    expanded = expanded.replace(/\b((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*)\s*\[([^\]]+)\]/g, (_whole, name: string, index: string) => {
+    expanded = expanded.replace(/\b((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*)((?:\s*\[[^\]]+\])+)/g, (_whole, name: string, indices: string) => {
       const placeholder = `__bufferResult${values.size}`;
-      values.set(placeholder, Number(this.deviceValue(`${name}[${index}]`))); return placeholder;
+      values.set(placeholder, Number(this.deviceValue(`${name}${indices}`))); return placeholder;
     });
     expanded = expanded.replace(/\b([A-Za-z_]\w*)(\.[A-Za-z_]\w*)+/g, (path: string) => {
       if (!this.devices?.values.has(path.split(".")[0])) return path;

@@ -43,19 +43,35 @@ export class DeviceWiring {
     });
   }
   voltage(id: string, pin: string): number | undefined {
-    const net = this.net(id, pin); const values: number[] = [];
-    for (const part of this.project.components) {
-      const has = (p: string) => net.has(endpoint(part.id, p));
-      if (part.type === "ground" && has("GND")) values.push(0);
-      if (isBoardType(part.type)) {
+    const dcVoltage = this.dcVoltage?.(id, pin);
+    if (dcVoltage !== undefined) return dcVoltage;
+    const pending = [this.net(id, pin)]; const visited = new Set<string>(); const values: number[] = [];
+    while (pending.length) {
+      const net = pending.pop()!;
+      const terminals = [...net].sort().join("|");
+      if (visited.has(terminals)) continue;
+      visited.add(terminals);
+      const has = (componentId: string, terminal: string) => net.has(endpoint(componentId, terminal));
+      for (const part of this.project.components) {
+        if (part.type === "ground" && has(part.id, "GND")) values.push(0);
+        if (!isBoardType(part.type)) continue;
         const profile = getBoardProfile(part.type)!;
-        if (profile.groundPins.some(has)) values.push(0);
-        Object.entries(profile.rails).forEach(([rail, volts]) => { if (has(rail)) values.push(volts); });
+        if (profile.groundPins.some(terminal => has(part.id, terminal))) values.push(0);
+        Object.entries(profile.rails).forEach(([rail, volts]) => { if (has(part.id, rail)) values.push(volts); });
         const boardPins = this.boardPins?.[part.id] ?? (part.type === this.project.board ? this.pins : []);
-        boardPins.filter(p => p.mode === "OUTPUT" && has(p.label)).forEach(p => values.push(profile.logicVoltage * p.pwmValue / 255));
+        boardPins.filter(state => state.mode === "OUTPUT" && has(part.id, state.label)).forEach(state => values.push(profile.logicVoltage * state.pwmValue / 255));
+      }
+      // A resistor preserves a voltage path without making protocol/connectivity
+      // checks treat its two terminals as the same net. The DC solver supplies
+      // actual drops where available; this fallback covers GPIO-driven bases,
+      // gates, and inputs that are outside the DC source solver.
+      for (const component of this.project.components) {
+        if (component.type !== "resistor") continue;
+        if (has(component.id, "1")) pending.push(this.net(component.id, "2"));
+        if (has(component.id, "2")) pending.push(this.net(component.id, "1"));
       }
     }
-    return values.length ? Math.max(...values) - Math.min(...values) < 0.01 ? values[0] : undefined : this.dcVoltage?.(id, pin);
+    return values.length ? Math.max(...values) - Math.min(...values) < 0.01 ? values[0] : undefined : undefined;
   }
   powered(c: CircuitComponent): boolean {
     const meta = getComponentDefinition(c.type)?.metadata;
@@ -75,11 +91,11 @@ export class DeviceWiring {
     });
     return wired && (!requireExternalPullups || (this.pullup(c.id, sda) && this.pullup(c.id, scl)));
   }
-  spi(c: CircuitComponent, cs: number | undefined, names = { mosi: "MOSI", miso: "MISO", sck: "SCK", cs: "NSS" }): boolean {
+  spi(c: CircuitComponent, cs: number | undefined, names: { mosi: string; miso?: string | null; sck: string; cs: string } = { mosi: "MOSI", miso: "MISO", sck: "SCK", cs: "NSS" }): boolean {
     return this.controllers().some(board => {
       const profile = isBoardType(board.type) ? getBoardProfile(board.type) : undefined;
       if (!profile) return false;
-      const bus = profile.spi.find(candidate => this.connected(c.id, names.mosi, board.id, boardPinLabel(profile.id, candidate.mosi)) && this.connected(c.id, names.miso, board.id, boardPinLabel(profile.id, candidate.miso)) && this.connected(c.id, names.sck, board.id, boardPinLabel(profile.id, candidate.sck)));
+      const bus = profile.spi.find(candidate => this.connected(c.id, names.mosi, board.id, boardPinLabel(profile.id, candidate.mosi)) && (!names.miso || this.connected(c.id, names.miso, board.id, boardPinLabel(profile.id, candidate.miso))) && this.connected(c.id, names.sck, board.id, boardPinLabel(profile.id, candidate.sck)));
       const chipSelectPins = cs === undefined ? profile.ioPins.filter(pin => !pin.reserved && (pin.signals ?? ["digital"]).includes("digital")).map(pin => pin.runtimePin) : [cs];
       return !!bus && chipSelectPins.some(runtimePin => this.connected(c.id, names.cs, board.id, boardPinLabel(profile.id, runtimePin)));
     });

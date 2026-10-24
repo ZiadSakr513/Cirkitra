@@ -5,9 +5,14 @@ import { readFile, writeFile } from "node:fs/promises";
 
 import type { AiUsageAdapter } from "../lib/billing/ai-usage.ts";
 import { configureAiUsageAdapterForTests } from "../lib/billing/ai-usage.ts";
+import { configureAiGenerationRateLimitAdapterForTests } from "../lib/billing/ai-generation-rate-limit.ts";
 import { isBoardType } from "../lib/circuit/boards.ts";
-import { configureGenerationTestLimitsForTests, POST } from "../app/api/ai/generate/route.ts";
+import type { CircuitProject } from "../lib/circuit/types.ts";
+import { POST } from "../app/api/ai/generate/route.ts";
+import { configureGenerationTestLimitsForTests } from "../app/api/ai/generate/implementation.ts";
 import { REMAINING_COMPONENT_CASES, REMAINING_COMPONENT_SUITE_ID } from "./ai-generation-remaining-cases.ts";
+import { CATALOG_RELIABILITY_30_CASES, CATALOG_RELIABILITY_30_SUITE_ID } from "./ai-generation-catalog-30-cases.ts";
+import { simulateCatalogProject, verifyCatalogGeneration } from "./ai-generation-catalog-live-assertions.ts";
 
 type TestCase = {
   id: string;
@@ -16,6 +21,9 @@ type TestCase = {
   baseCaseId?: string;
   minimumBoards: number;
   expectedComponentTypes?: readonly string[];
+  expectedBoardTypes?: readonly string[];
+  requiredNets?: readonly (readonly { componentType: string; pins: readonly string[]; occurrence?: number; labelIncludes?: string }[])[];
+  behavior?: { description: string; requiredSketchPatterns: readonly string[]; evidence: string };
 };
 
 type ProviderCall = {
@@ -94,22 +102,29 @@ const suiteArgumentIndex = process.argv.indexOf("--suite");
 const suiteId = suiteArgumentIndex >= 0 ? process.argv[suiteArgumentIndex + 1] : "reliability-20-v1";
 const caseArgumentIndex = process.argv.indexOf("--case-id");
 const caseId = caseArgumentIndex >= 0 ? process.argv[caseArgumentIndex + 1] : undefined;
-const cases = suiteId === REMAINING_COMPONENT_SUITE_ID
+const cases: readonly TestCase[] = suiteId === CATALOG_RELIABILITY_30_SUITE_ID
+  ? CATALOG_RELIABILITY_30_CASES
+  : suiteId === REMAINING_COMPONENT_SUITE_ID
   ? [...REMAINING_COMPONENT_CASES]
   : suiteId === "reliability-20-v1" ? reliabilityCases : [];
 const reportPath = resolve(process.env.CIRKITRA_STRESS_REPORT ?? join(
   tmpdir(),
-  suiteId === REMAINING_COMPONENT_SUITE_ID ? "cirkitra-ai-generation-remaining-components-v1.json" : "cirkitra-ai-generation-stress.json",
+  suiteId === CATALOG_RELIABILITY_30_SUITE_ID ? "cirkitra-ai-generation-catalog-reliability-30-v1.json"
+    : suiteId === REMAINING_COMPONENT_SUITE_ID ? "cirkitra-ai-generation-remaining-components-v1.json"
+      : "cirkitra-ai-generation-stress.json",
 ));
 
 if (!cases.length) {
-  console.error(`Unknown generation suite ${JSON.stringify(suiteId)}. Use reliability-20-v1 or ${REMAINING_COMPONENT_SUITE_ID}.`);
+  console.error(`Unknown generation suite ${JSON.stringify(suiteId)}. Use reliability-20-v1, ${REMAINING_COMPONENT_SUITE_ID}, or ${CATALOG_RELIABILITY_30_SUITE_ID}.`);
   process.exitCode = 1;
 } else if (caseId && (!rerunFailures || !cases.some(testCase => testCase.id === caseId))) {
   console.error("--case-id requires --rerun-failures and a case ID from the selected suite.");
   process.exitCode = 1;
 } else if (!cli.has("--live")) {
   console.error("Refusing to contact Gemini. Pass --live to run the explicitly billable live test suite.");
+  process.exitCode = 1;
+} else if (suiteId === CATALOG_RELIABILITY_30_SUITE_ID && process.env.CIRKITRA_GEMINI_KEY_ROTATED !== "true") {
+  console.error("Refusing the 30-prompt live suite until the previously exposed Gemini key has been rotated. After rotating and replacing it locally, set CIRKITRA_GEMINI_KEY_ROTATED=true to confirm; the runner never prints or compares secret values.");
   process.exitCode = 1;
 } else {
   nextEnv.loadEnvConfig(process.cwd());
@@ -180,7 +195,12 @@ async function runSuite() {
   };
 
   configureAiUsageAdapterForTests(usageAdapter);
-  configureGenerationTestLimitsForTests({ maxRepairs: 1, maxTransientRetries: 0, maxTruncatedRetries: 0 });
+  configureAiGenerationRateLimitAdapterForTests(async () => ({
+    allowed: true,
+    remaining: Number.MAX_SAFE_INTEGER,
+    resetsAt: new Date(Date.now() + 60_000).toISOString(),
+  }));
+  configureGenerationTestLimitsForTests({ maxRepairs: suiteId === CATALOG_RELIABILITY_30_SUITE_ID ? 2 : 1, maxTransientRetries: 0, maxTruncatedRetries: 0 });
   const originalFetch = globalThis.fetch;
   let currentCalls: ProviderCall[] = [];
   globalThis.fetch = async (input, init) => {
@@ -216,7 +236,7 @@ async function runSuite() {
       ? selectedCases.filter(testCase => lastById.get(testCase.id)?.status !== "passed")
       : selectedCases;
     if (!pending.length) {
-      console.log("All 20 cases already passed; nothing to rerun.");
+      console.log(`All ${cases.length} cases already passed; nothing to rerun.`);
       return;
     }
     console.log(`${rerunFailures ? "Rerunning failed" : "Running"} ${pending.length} live prompt cases for ${suiteId}. Report: ${reportPath}`);
@@ -280,7 +300,7 @@ async function runSuite() {
         kind?: string;
         message?: string;
         generationMode?: string;
-        project?: { id?: string; components?: Array<{ id?: string; type?: string }>; connections?: unknown[] };
+        project?: CircuitProject;
         error?: { code?: string; message?: string; details?: string[] };
       };
       const project = body.project;
@@ -341,10 +361,37 @@ async function runSuite() {
         providerCalls: [...currentCalls],
         ...(inputProject ? { inputProject } : {}),
       };
+      if (response.ok && project && testCase.expectedBoardTypes && testCase.requiredNets && testCase.behavior) {
+        try {
+          // Short tones and digital output edges can start and stop between
+          // ordinary 1 s samples. Oversample those behaviors so the evidence
+          // reflects the actual output transitions rather than lucky timing.
+          const sampleIntervalMs = testCase.behavior.evidence === "range-buzzer"
+            ? 20
+            : testCase.behavior.evidence === "digital-output" ? 250 : 1_000;
+          const simulationRuns = simulateCatalogProject(project, sampleIntervalMs);
+          const verificationIssues = verifyCatalogGeneration(project, testCase as Parameters<typeof verifyCatalogGeneration>[1], simulationRuns);
+          if (verificationIssues.length) {
+            result.status = "failed";
+            result.validationOutcome = "invalid";
+            result.failureStage = verificationIssues.some(issue => /net|wire|connected endpoint/i.test(issue)) ? "wiring/code" : "simulation";
+            result.category = result.failureStage === "wiring/code" ? "independent-wiring-or-code-assertion" : "independent-simulation-assertion";
+            result.message = `${verificationIssues.length} independent check(s) failed.`;
+            result.details = [...(result.details ?? []), ...verificationIssues].slice(0, 12);
+          }
+        } catch (error) {
+          result.status = "failed";
+          result.validationOutcome = "invalid";
+          result.failureStage = "simulation";
+          result.category = "independent-simulation-crash";
+          result.message = error instanceof Error ? error.message : "Independent simulation could not complete.";
+        }
+      }
       lastById.set(testCase.id, result);
       const finalized = finalizations.slice().reverse().find(item => item.reservationId === `local-stress-${reservationBefore + 1}`);
       const totalTokens = finalized ? finalized.inputTokens + finalized.outputTokens : 0;
-      console.log(`${String(index + 1).padStart(2, "0")}/${pending.length} ${testCase.id}: ${status.toUpperCase()} mode=${body.generationMode ?? body.kind ?? "?"} parts=${result.componentCount ?? 0} wires=${result.wireCount ?? 0} boards=${boardTypes.length} repairs=${result.repairCount} providerCalls=${currentCalls.length} tokens=${totalTokens}${message ? ` reason=${message}` : ""}`);
+      console.log(`${String(index + 1).padStart(2, "0")}/${pending.length} ${testCase.id}: ${result.status.toUpperCase()} mode=${body.generationMode ?? body.kind ?? "?"} parts=${result.componentCount ?? 0} wires=${result.wireCount ?? 0} boards=${boardTypes.length} repairs=${result.repairCount} providerCalls=${currentCalls.length} tokens=${totalTokens}${result.message ? ` reason=${result.message}` : ""}`);
+      for (const detail of result.details ?? []) console.log(`    CHECK: ${detail}`);
       await persistReport(report, lastById);
     }
 
@@ -354,11 +401,19 @@ async function runSuite() {
     const coveredTypes = new Set(finalResults.filter(result => result.status === "passed").flatMap(result => result.observedComponentTypes ?? []));
     const expectedTypes = new Set(cases.flatMap(testCase => testCase.expectedComponentTypes ?? []));
     const missingCoverage = [...expectedTypes].filter(type => !coveredTypes.has(type)).sort();
-    console.log(`Passed ${finalResults.filter(result => result.status === "passed").length}/${cases.length}. Component coverage ${coveredTypes.size}/${expectedTypes.size}${missingCoverage.length ? `; missing ${missingCoverage.join(", ")}` : ""}. Report saved locally: ${reportPath}`);
+    const passedCount = finalResults.filter(result => result.status === "passed").length;
+    const tokenTotals = finalResults.flatMap(result => result.providerCalls).reduce((totals, call) => ({
+      calls: totals.calls + 1,
+      input: totals.input + call.inputTokens,
+      output: totals.output + call.outputTokens,
+    }), { calls: 0, input: 0, output: 0 });
+    console.log(`Passed ${passedCount}/${cases.length}. Component coverage ${coveredTypes.size}/${expectedTypes.size}${missingCoverage.length ? `; missing ${missingCoverage.join(", ")}` : ""}. Gemini calls=${tokenTotals.calls}, input tokens=${tokenTotals.input}, output tokens=${tokenTotals.output}. Report saved locally: ${reportPath}`);
+    if (passedCount !== cases.length || missingCoverage.length) process.exitCode = 1;
   } finally {
     globalThis.fetch = originalFetch;
     configureGenerationTestLimitsForTests(undefined);
     configureAiUsageAdapterForTests(undefined);
+    configureAiGenerationRateLimitAdapterForTests(undefined);
   }
 }
 

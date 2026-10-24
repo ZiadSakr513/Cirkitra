@@ -143,7 +143,12 @@ export function ProjectsDashboard({ userId, email, displayName }: { userId: stri
     } catch (loadError) {
       initialized.current = false;
       setLoading(false);
-      setError(loadError instanceof Error ? loadError.message : "Could not load your account. Check the Supabase migration and try again.");
+      const message = loadError && typeof loadError === "object" && "message" in loadError
+        ? (loadError as { message?: unknown }).message
+        : null;
+      setError(typeof message === "string" && message.trim()
+        ? message
+        : "Could not load your account. Check your connection and try again.");
     }
   }, [loadProjects, userId]);
 

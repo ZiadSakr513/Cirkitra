@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { ArduinoSimulator } from "./engine.ts";
 import { normalizeSketchProgramForSimulator, sketchProgramHeaders, sketchProgramSchema, validateSketchProgram, type SketchProgram } from "./program.ts";
+import { compileArduinoSketch } from "./parser.ts";
 
 const baseProgram = (): SketchProgram => ({
   headers: [],
@@ -53,6 +54,12 @@ test("normalizes only bare multiword print labels into escaped C++ text literals
   if (label.kind === "call") assert.deepEqual(label.arguments, ['"Sensor Fault Detected"']);
   assert.equal(expression.kind, "call");
   if (expression.kind === "call") assert.deepEqual(expression.arguments, ["temperature > 32"]);
+});
+
+test("accepts the standard zero-argument HardwareSerial parseInt overload", () => {
+  const result = compileArduinoSketch("void setup(){ Serial.begin(9600); long value=Serial.parseInt(); Serial.println(value); } void loop(){ delay(10); }", "esp8266-nodemcu-v1");
+  assert.equal(result.valid, true, result.diagnostics.map(diagnostic => diagnostic.message).join("\n"));
+  assert.equal(result.diagnostics.some(diagnostic => diagnostic.code === "UNSUPPORTED_LIBRARY_OVERLOAD"), false);
 });
 
 test("renders an editable sketch and simulates its requested output", () => {
