@@ -42,6 +42,13 @@ export function normalizeGroundReturns(project: CircuitProject): CircuitProject 
     const side = fromGroundPins.includes(original.from.pin) ? "from" : toGroundPins.includes(original.to.pin) ? "to" : null;
     if (!side) return original;
 
+    // Explicit common-ground repairs create a real wire from an external
+    // return/symbol to a controller ground pad. Keep that joining wire intact
+    // even when all the board's named GND pads already have other returns;
+    // converting the overflow endpoint back to a floating symbol would break
+    // the very common reference the wire was added to establish.
+    if (original.id.startsWith("common_ground_")) return original;
+
     const board = side === "from" ? fromBoard! : toBoard!;
     const boardGroundPins = side === "from" ? fromGroundPins : toGroundPins;
     const groundReturnIndex = groundReturnIndexes.get(board.id) ?? 0;

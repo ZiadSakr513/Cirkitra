@@ -4,12 +4,15 @@ import { COMPONENT_EXAMPLES } from "./component-examples.ts";
 import { STATEFUL_MODEL_REGISTRY } from "../simulator/stateful-models.ts";
 import { POWER_MODEL_REGISTRY } from "../simulator/power-models.ts";
 import { BOARD_PROFILE_MODEL_REGISTRY } from "./boards.ts";
+import { SCREENSHOT_PART_IDS } from "./screenshot-components.ts";
 
 /** Each named fixture must be executed by publication.test.ts, not merely documented. */
-export const COMPONENT_ACCEPTANCE: Readonly<Record<string, string>> = {
+const BASE_COMPONENT_ACCEPTANCE: Readonly<Record<string, string>> = {
   "arduino-mega-2560": "board-profile-gpio-blink", "arduino-nano-classic": "board-profile-gpio-blink",
   "esp32-devkitc-v4": "board-profile-gpio-blink", "esp8266-nodemcu-v1": "board-profile-gpio-blink",
   "raspberry-pi-pico": "board-profile-gpio-blink",
+  "esp32-nodemcu-32s": "board-profile-gpio-blink", "esp32-devkit-v1-30pin": "board-profile-gpio-blink",
+  "xiao-esp32s3-sense": "board-profile-gpio-blink", "freenove-esp32s3-wroom": "board-profile-gpio-blink",
   cd74hc4067: "mux-switches-reading", cd74hc4051: "mux-switches-reading", "74hc138": "decoder-switches-led",
   tb6612fng: "independent-opposite-motors", drv8833: "independent-opposite-motors", l298: "independent-opposite-motors",
   bme280: "wired-temperature-pressure-humidity", bmp280: "wired-temperature-pressure", "sht31-dis": "timed-temperature-humidity",
@@ -40,6 +43,10 @@ export const COMPONENT_ACCEPTANCE: Readonly<Record<string, string>> = {
   "dc-supply": "wired-supply-powers-switched-load", "battery-cell": "wired-cell-supplies-load",
   "dc-load": "wired-load-draws-current", "ideal-mosfet": "wired-gate-switches-load",
 };
+export const COMPONENT_ACCEPTANCE: Readonly<Record<string, string>> = Object.freeze({
+  ...BASE_COMPONENT_ACCEPTANCE,
+  ...Object.fromEntries(SCREENSHOT_PART_IDS.map(id => [id, `screenshot-${id}-simulates-wired-behavior`])),
+});
 export function publicationIssues(definition: ComponentDefinition): string[] {
   const issues: string[] = [];
   if (!definition.simulated || definition.simulation?.capability !== "simulated") issues.push("Simulation is unfinished.");

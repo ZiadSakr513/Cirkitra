@@ -12,8 +12,10 @@ import { PowerRuntime, type PowerResult } from "./power.ts";
 import type { MotorSupplyLoad } from "./motor-loads.ts";
 import { STATEFUL_MODEL_TYPES } from "./stateful-models.ts";
 import { getBoardProfile } from "../circuit/boards.ts";
+import { SCREENSHOT_COMPONENT_CONFIG } from "../circuit/screenshot-components.ts";
+import type { ServoState } from "./types.ts";
 
-export type DeviceValue = number | string | boolean | number[] | { [key: string]: DeviceValue };
+export type DeviceValue = number | string | boolean | DeviceValue[] | { [key: string]: DeviceValue };
 export interface UartTransmission { port: number; baud: number; data: readonly number[] }
 export interface I2cPeerEndpoint {
   address(): number | undefined;
@@ -31,6 +33,8 @@ export interface DeviceMemory {
   displayBuffer: string[]; displayText: string[]; cursorColumn: number; cursorRow: number; textSize: number; displayOn: boolean;
   pixelBuffer: Array<{ r: number; g: number; b: number }>; pixels: Array<{ r: number; g: number; b: number }>; brightness: number;
   rtcEpochSeconds?: number; rtcSetAtMs?: number;
+  capacitorVoltage: number;
+  displayValue: number;
   stepCount: number; stepIntervalMs: number; lastStepAt: number;
 }
 interface SdFileHandle { componentId: string; path: string; position: number; mode: number; open: boolean }
@@ -39,10 +43,25 @@ const numeric = (c: CircuitComponent, property: string, fallback: number) => Num
 const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
 const fromBcd = (value: number) => ((value >> 4) & 0x0f) * 10 + (value & 0x0f);
 const toBcd = (value: number) => ((Math.floor(value / 10) << 4) | (value % 10)) & 0xff;
-const bytes = (value: DeviceValue): number[] => Array.isArray(value) ? value.map(v => v & 255) : typeof value === "string" ? [...new TextEncoder().encode(value)] : [Number(value) & 255];
+const bytes = (value: DeviceValue): number[] => Array.isArray(value) ? value.map(v => Number(v) & 255) : typeof value === "string" ? [...new TextEncoder().encode(value)] : [Number(value) & 255];
+function parseNumericInitializer(input: string): DeviceValue[] | undefined {
+  const value = input.trim();
+  if (!value.startsWith("{") || !value.endsWith("}")) return undefined;
+  const entries = splitDeviceArguments(value.slice(1, -1));
+  const result: DeviceValue[] = [];
+  for (const entry of entries) {
+    const nested = entry.trim().startsWith("{") ? parseNumericInitializer(entry) : undefined;
+    if (nested) { result.push(nested); continue; }
+    const literal = entry.trim().replace(/[uUlLfF]+$/, "");
+    const number = literal === "HIGH" ? 1 : literal === "LOW" ? 0 : Number(literal);
+    if (!Number.isFinite(number)) return undefined;
+    result.push(number);
+  }
+  return result;
+}
 function memory(): DeviceMemory {
   const registers = new Uint8Array(256); registers[0] = 255; registers[1] = 255;
-  return { registers, pointer: 0, initialized: false, sleeping: false, readyAt: 0, sampleAt: -Infinity, resolution: 12, heater: false, shift: 0, latch: 0, clock: false, latchClock: false, tx: [], rx: [], packets: [], frequency: 915000000, spreading: 7, bandwidth: 125000, coding: 5, sync: 0x12, crc: false, receiving: false, lastInterrupt: 255, captured: 0, previousInputs: 0, displayBuffer: Array(8).fill(""), displayText: Array(8).fill(""), cursorColumn: 0, cursorRow: 0, textSize: 1, displayOn: false, pixelBuffer: Array.from({ length: 8 }, () => ({ r: 0, g: 0, b: 0 })), pixels: Array.from({ length: 8 }, () => ({ r: 0, g: 0, b: 0 })), brightness: 255, stepCount: 0, stepIntervalMs: 0, lastStepAt: -1 };
+  return { registers, pointer: 0, initialized: false, sleeping: false, readyAt: 0, sampleAt: -Infinity, resolution: 12, heater: false, shift: 0, latch: 0, clock: false, latchClock: false, tx: [], rx: [], packets: [], frequency: 915000000, spreading: 7, bandwidth: 125000, coding: 5, sync: 0x12, crc: false, receiving: false, lastInterrupt: 255, captured: 0, previousInputs: 0, displayBuffer: Array(8).fill(""), displayText: Array(8).fill(""), cursorColumn: 0, cursorRow: 0, textSize: 1, displayOn: false, pixelBuffer: Array.from({ length: 8 }, () => ({ r: 0, g: 0, b: 0 })), pixels: Array.from({ length: 8 }, () => ({ r: 0, g: 0, b: 0 })), brightness: 255, capacitorVoltage: 0, displayValue: 0, stepCount: 0, stepIntervalMs: 0, lastStepAt: -1 };
 }
 
 /** One instance per running project. All mutation happens on the simulator clock. */
@@ -118,17 +137,14 @@ export class DeviceRuntime {
     this.states = {}; this.drives = []; this.bridges = []; this.time = 0; this.diagnostics.length = 0;
     this.power.reset(); this.powerControls = {}; this.charging = {}; this.protectionSince.clear(); this.protectionLatched.clear(); this.chargerElapsed.clear(); this.chargerLastTick.clear(); this.chargerModes.clear(); this.chargerEnabled.clear(); this.pendingDelayMs = 0;
     this.wireTx = []; this.wireRx = []; this.wireMasterTransmitting = false; this.wirePeripheralAddress = undefined; this.wirePeripheralTx = []; this.wirePeripheralRx = []; this.wireOnReceive = false; this.wireOnRequest = false; this.spiAddress = undefined; this.spiSelected = undefined; this.uartRx.clear(); this.uartTx = []; this.wifiConnected = false; this.udpSockets.clear(); this.udpPackets = []; this.radioPins = [10, 9, 2]; this.oneWire.reset(); this.shtSensors.clear(); this.radios.clear(); this.zigbees.clear(); this.responseDecoders.clear(); this.gauges.clear(); this.sdMounted = undefined; this.sdHandles.clear(); this.pendingSdFile = undefined;
-    for (const c of this.project.components) if (STATEFUL_PARTS.includes(c.type)) { const m = memory(); if (c.type !== "mcp23017") m.registers.fill(0); this.memory.set(c.id, m); }
+    for (const c of this.project.components) if (STATEFUL_PARTS.includes(c.type)) { const m = memory(); if (c.type !== "mcp23017") m.registers.fill(0); const count = Number(SCREENSHOT_COMPONENT_CONFIG[c.type]?.details.pixelCount ?? 8); if (SCREENSHOT_COMPONENT_CONFIG[c.type]?.family === "pixel") { m.pixelBuffer = Array.from({ length: count }, () => ({ r: 0, g: 0, b: 0 })); m.pixels = Array.from({ length: count }, () => ({ r: 0, g: 0, b: 0 })); } this.memory.set(c.id, m); }
     for (const match of source.matchAll(/\b(?:const\s+)?(?:unsigned\s+)?(byte|u?int(?:8|16|32|64)_t|int|long|short|size_t|float|double|char)\s+([A-Za-z_]\w*)\s*((?:\[[^\]]*\]\s*)+)\s*=\s*([^;]+);/g)) {
       const [, type, name, , initializer] = match;
       if (type === "char") {
         this.values.set(name, [...initializer.matchAll(/'(?:\\.|[^'\\])'/g)].map(([character]) => character.slice(1, -1).charCodeAt(0)));
       } else {
-        const contents = initializer.slice(initializer.indexOf("{") + 1, initializer.lastIndexOf("}"));
-        const numberPattern = /(?:0[xX][\da-fA-F]+|\d+(?:\.\d+)?)(?:[uUlLfF]+)?/g;
-        const entries = [...contents.matchAll(numberPattern)].map(([item]) => Number(item.replace(/[uUlLfF]+$/, "")));
-        const residue = contents.replace(numberPattern, "").replace(/[\s,{}]/g, "");
-        this.values.set(name, residue.length === 0 && entries.length > 0 ? entries : []);
+        const parsed = parseNumericInitializer(initializer);
+        this.values.set(name, parsed ?? []);
       }
     }
     for (const match of source.matchAll(/\bDeviceAddress\s+([A-Za-z_]\w*)\s*(?:=\s*\{([^}]*)\})?\s*;/g)) this.values.set(match[1], match[2] ? splitDeviceArguments(match[2]).map(Number) : Array(8).fill(0));
@@ -253,8 +269,11 @@ export class DeviceRuntime {
     if (c.type === "mpu-6050") return 0x68 + bit("AD0");
     if (c.type === "bh1750-sen0097") return this.high(c, "ADD") ? 0x5c : 0x23;
     if (c.type === "ssd1306-oled-128x64") return 0x3c;
+    if (c.type === "sh1107-oled-128x128") return 0x3c;
     if (c.type === "mcp23017" || c.type === "tca9548a") return (c.type === "mcp23017" ? 0x20 : 0x70) + bit("A0") + 2 * bit("A1") + 4 * bit("A2");
     if (c.type === "ds3231-rtc") return 0x68;
+    const screenshotAddress = SCREENSHOT_COMPONENT_CONFIG[c.type]?.details.i2cAddress;
+    if (typeof screenshotAddress === "number") return screenshotAddress;
     return c.type === "bq27441-g1" ? 0x55 : 0x08;
   }
   private configureBh1750(c: CircuitComponent, command: number): boolean {
@@ -368,16 +387,18 @@ export class DeviceRuntime {
     if (c.type === "sht31-dis" && (!this.high(c, "nRESET") || this.wiring.voltage(c.id, "ADDR") === undefined)) return false;
     if (c.type === "bh1750-sen0097") return this.wiring.i2c(c, "SDA", "SCL", false);
     if (c.type === "ssd1306-oled-128x64") return this.wiring.i2c(c);
+    if (c.type === "sh1107-oled-128x128") return this.wiring.i2c(c, "SDA", "SCL", false);
+    if (SCREENSHOT_COMPONENT_CONFIG[c.type]?.family === "i2c-sensor") return this.wiring.i2c(c, "SDA", "SCL", true);
     if (["bme280", "bmp280"].includes(c.type)) return this.high(c, "CSB") && this.wiring.i2c(c, "SDI", "SCK");
     if (c.type === "ds3231-rtc") return this.wiring.i2c(c, "SDA", "SCL", false);
     return this.wiring.i2c(c);
   }
   private byAddress(address: number): CircuitComponent | undefined {
-    const candidates = this.project.components.filter(c => ["bme280", "bmp280", "sht31-dis", "mpu-6050", "mcp23017", "tca9548a", "bq27441-g1", "bq76920", "bh1750-sen0097", "ssd1306-oled-128x64", "ds3231-rtc"].includes(c.type) && this.address(c) === address && this.busPresent(c));
+    const candidates = this.project.components.filter(c => ["bme280", "bmp280", "sht31-dis", "mpu-6050", "mcp23017", "tca9548a", "bq27441-g1", "bq76920", "bh1750-sen0097", "ssd1306-oled-128x64", "ds3231-rtc", "sh1107-oled-128x128"].includes(c.type) || SCREENSHOT_COMPONENT_CONFIG[c.type]?.family === "i2c-sensor").filter(c => this.address(c) === address && this.busPresent(c));
     if (candidates.length > 1) { this.error("I2C_ADDRESS_CONFLICT", `Multiple connected devices respond at 0x${address.toString(16)}. Change address straps or isolate a mux channel.`); return undefined; }
     return candidates[0];
   }
-  tick(timeMs: number, pins: readonly UnoPinState[], motorLoads: readonly MotorSupplyLoad[] = [], boardPins?: SimulatorSnapshot["boardPins"]) {
+  tick(timeMs: number, pins: readonly UnoPinState[], motorLoads: readonly MotorSupplyLoad[] = [], boardPins?: SimulatorSnapshot["boardPins"], servos: readonly ServoState[] = []) {
     this.time = timeMs;
     // A switch's own upstream connection is checked before publishing downstream bridges.
     this.powerResult = this.power.solve(this.project, timeMs, this.powerControls, this.charging, motorLoads);
@@ -403,6 +424,40 @@ export class DeviceRuntime {
         ? { componentId: c.id, from: "COM", to: "NO" }
         : { componentId: c.id, from: "COM", to: "NC" });
     }
+    for (const c of this.project.components.filter(component => component.type === "dip-switch-8")) {
+      for (let index = 1; index <= 8; index++) if (c.properties?.[`switch${index}`] === true) this.bridges.push({ componentId: c.id, from: `${index}A`, to: `${index}B` });
+    }
+    for (const c of this.project.components.filter(component => ["2n2222-transistor", "pnp-transistor-2n3906", "n-mosfet-2n7000"].includes(component.type))) {
+      const gate = this.wiring.voltage(c.id, c.type === "n-mosfet-2n7000" ? "G" : "B");
+      const source = this.wiring.voltage(c.id, c.type === "pnp-transistor-2n3906" ? "E" : c.type === "n-mosfet-2n7000" ? "S" : "E");
+      const active = c.type === "pnp-transistor-2n3906" ? gate !== undefined && source !== undefined && source - gate >= 0.65
+        : gate !== undefined && gate - (source ?? 0) >= (c.type === "n-mosfet-2n7000" ? 2 : 0.65);
+      if (active) this.bridges.push({ componentId: c.id, from: c.type === "n-mosfet-2n7000" ? "D" : "C", to: c.type === "pnp-transistor-2n3906" ? "E" : c.type === "n-mosfet-2n7000" ? "S" : "E" });
+    }
+    for (const c of this.project.components.filter(component => component.type === "uln2003-stepper-driver")) {
+      for (let index = 1; index <= 7; index++) {
+        if (this.high(c, `IN${index}`)) this.bridges.push({ componentId: c.id, from: `OUT${index}`, to: "GND" });
+      }
+    }
+    for (const c of this.project.components.filter(component => component.type === "diode-1n4007")) {
+      const anode = this.wiring.voltage(c.id, "A"), cathode = this.wiring.voltage(c.id, "K");
+      if (anode !== undefined && cathode !== undefined && anode - cathode >= 0.7) this.bridges.push({ componentId: c.id, from: "A", to: "K" });
+    }
+    // H-bridge output contacts are included in the DC solve so powered loads
+    // and high-current actuators depend on the control pins, not just labels.
+    for (const c of this.project.components.filter(component => component.type === "l298n-driver-module")) {
+      if (!this.powered(c)) continue;
+      for (const [enable, first, second, outA, outB] of [["ENA", "IN1", "IN2", "OUT1", "OUT2"], ["ENB", "IN3", "IN4", "OUT3", "OUT4"]] as const) {
+        if (!this.high(c, enable)) continue;
+        const a = this.wiring.voltage(c.id, first), b = this.wiring.voltage(c.id, second);
+        if (a === undefined || b === undefined || a === b) continue;
+        this.bridges.push({ componentId: c.id, from: a > b ? outA : outB, to: "VS" }, { componentId: c.id, from: a > b ? outB : outA, to: "GND" });
+      }
+    }
+    // Re-solve once at the same simulated instant with relay, switch, diode,
+    // transistor, and driver contacts folded into the actual supply network.
+    this.powerResult = this.power.solve(this.project, timeMs, this.powerControls, this.charging, motorLoads, this.bridges);
+    for (const diagnostic of this.powerResult.diagnostics) this.error(diagnostic.code, diagnostic.message);
     this.wiring = new DeviceWiring(this.project, pins, this.bridges, this.powerResult.voltage, boardPins, this.boardComponentId, this.boardId);
     this.oneWire.tick(this.project, this.wiring, timeMs);
     if (this.spiSelected) {
@@ -436,13 +491,14 @@ export class DeviceRuntime {
     for (const c of this.project.components.filter(c => STATEFUL_PARTS.includes(c.type))) {
       // The AHCT buffer state was resolved above alongside its output drive.
       if (c.type === "sn74ahct1g125") continue;
-      const m = this.m(c); const powered = c.type === "ds18b20" ? this.oneWire.powered(c) : this.powered(c);
+      const m = this.m(c); const powered = c.type === "ds18b20" || c.type === "ds18b20-waterproof" ? this.oneWire.powered(c) : this.powered(c);
       if (!powered) { m.initialized = false; m.rx = []; m.tx = []; }
       const readings: Record<string, number> = {};
-      if (["bme280", "bmp280", "sht31-dis", "dht22", "ds18b20", "mpu-6050"].includes(c.type)) {
+      if (["bme280", "bmp280", "bme280-gy-bme-p280", "bme680-gas-sensor", "sht31-dis", "dht22", "dht11", "ds18b20", "ds18b20-waterproof", "mpu-6050"].includes(c.type)) {
         readings.temperature = numeric(c, "temperature", 25);
-        if (["bme280", "sht31-dis", "dht22"].includes(c.type)) readings.humidity = clamp(numeric(c, "humidity", 50), 0, 100);
-        if (["bme280", "bmp280"].includes(c.type)) readings.pressure = numeric(c, "pressure", 101325);
+        if (["bme280", "bme280-gy-bme-p280", "bme680-gas-sensor", "sht31-dis", "dht22"].includes(c.type)) readings.humidity = clamp(numeric(c, "humidity", 50), 0, 100);
+        if (["bme280", "bmp280", "bme280-gy-bme-p280", "bme680-gas-sensor"].includes(c.type)) readings.pressure = numeric(c, "pressure", 101325);
+        if (c.type === "bme680-gas-sensor") readings.gasResistance = numeric(c, "gasOhms", 120000);
         if (c.type === "mpu-6050") for (const [key, fallback] of Object.entries({ ax: 0, ay: 0, az: 9.80665, gx: 0, gy: 0, gz: 0 })) readings[key] = numeric(c, key, fallback);
       }
       if (c.type === "sht31-dis") {
@@ -537,6 +593,7 @@ export class DeviceRuntime {
       const rtcConnected = rtc && this.busPresent(c);
       this.states[c.id] = { type: c.type, powered: statePowered, readings: statePowered && powered && !m.sleeping && readyForReading && (!rtc || rtcConnected) && (!sd || cardPresent && sdConnected) && (!rfid || rfidConnected) ? readings : {}, status: !powered ? "Unpowered" : rtc ? rtcConnected ? "Running" : "I2C disconnected" : sd ? !cardPresent ? "No card" : !sdConnected ? "SPI disconnected" : this.sdMounted === c.id ? "Mounted" : "Ready" : rfid ? rfidStatus : encoder ? !encoderPinsPresent ? "Connect CLK and DT" : `Position ${numeric(c, "position", 0)}` : keypad ? !keypadWired ? "Wire all row and column pins" : keyName ? `Key ${keyName} pressed` : "Ready" : relay ? relayInput === undefined ? "Control floating" : relayInput < 0.8 ? "Energized · COM–NO" : "Released · COM–NC" : m.sleeping ? "Sleeping" : m.readyAt > timeMs ? "Measuring" : c.type === "bh1750-sen0097" && !m.initialized ? "Standby" : display ? !m.initialized ? "Standby" : m.displayOn ? "Displaying" : "Ready" : pixelStrip ? !m.initialized ? "Ready" : !dataConnected ? "Data disconnected" : m.pixels.some(pixel => pixel.r || pixel.g || pixel.b) ? "Displaying" : "Ready" : m.initialized ? "Ready" : "Powered", packets: m.packets.map(p => ({ ...p })), ...(display ? { display: powered && m.initialized && m.displayOn ? [...m.displayText] : [] } : {}), ...(pixelStrip ? { pixels: powered && m.initialized && dataConnected ? m.pixels.map(pixel => ({ ...pixel })) : m.pixels.map(() => ({ r: 0, g: 0, b: 0 })) } : {}) };
     }
+    this.tickScreenshotModels(timeMs, servos);
     this.stepperDrivers();
     for (const c of this.project.components.filter(c => c.type === "rfm95w")) {
       const model = this.lora(c), powered = this.powered(c);
@@ -584,35 +641,224 @@ export class DeviceRuntime {
     this.drive(c, "Q7S", (m.shift >> 7) & 1);
     if (this.wiring.voltage(c.id, "OE") === 0) for (let i = 0; i < 8; i++) this.drive(c, `Q${i}`, (m.latch >> i) & 1);
   }
+  private tickScreenshotModels(timeMs: number, servos: readonly ServoState[]) {
+    for (const c of this.project.components) {
+      const config = SCREENSHOT_COMPONENT_CONFIG[c.type];
+      if (!config) continue;
+      const m = this.m(c), family = config.family, details = config.details;
+      const powered = family === "breadboard" || family === "passive" || family === "switch" || family === "logic" ? true
+        : c.type === "ds18b20-waterproof" ? this.oneWire.powered(c) : this.powered(c);
+      const readings: Record<string, number> = {};
+      let status = powered ? "Ready" : "Unpowered";
+      let display: string[] | undefined;
+      let pixels: Array<{ r: number; g: number; b: number }> | undefined;
+
+      if (family === "breadboard") {
+        status = "Continuity mapped";
+        readings.rowGroups = Number(config.details.rows) * 2;
+        readings.railSegments = config.details.rows === 63 ? 8 : 4;
+      } else if (family === "passive") {
+        if (c.type === "capacitor-1uf" || c.type === "electrolytic-capacitor-100uf") {
+          const target = Math.max(0, (this.wiring.voltage(c.id, "1") ?? 0) - (this.wiring.voltage(c.id, "2") ?? 0));
+          const elapsed = Number.isFinite(m.sampleAt) ? Math.max(0, timeMs - m.sampleAt) : 0;
+          const capacitance = Number(details.capacitanceUf ?? 1) * 1e-6;
+          const resistance = 1_000;
+          const alpha = 1 - Math.exp(-elapsed / Math.max(1e-9, resistance * capacitance));
+          m.capacitorVoltage += (target - m.capacitorVoltage) * alpha;
+          m.sampleAt = timeMs;
+          readings.voltage = Number(m.capacitorVoltage.toFixed(4)); readings.capacitanceUf = capacitance * 1e6;
+          status = m.capacitorVoltage >= target * 0.95 && target > 0 ? "Charged" : m.capacitorVoltage > 0.01 ? "Charging" : "Discharged";
+        } else if (c.type === "diode-1n4007") {
+          const anode = this.wiring.voltage(c.id, "A"), cathode = this.wiring.voltage(c.id, "K");
+          const conducting = this.bridges.some(bridge => bridge.componentId === c.id && bridge.from === "A" && bridge.to === "K");
+          const forward = conducting || (anode !== undefined && cathode !== undefined && anode - cathode >= 0.7);
+          if (forward) status = "Forward biased"; else if (anode !== undefined && cathode !== undefined) status = "Reverse biased";
+          readings.forwardBiased = Number(forward); readings.forwardVoltage = conducting ? 0.7 : Math.max(0, (anode ?? 0) - (cathode ?? 0));
+        }
+      } else if (family === "sensor" || family === "i2c-sensor" || family === "input") {
+        for (const key of ["temperatureC", "humidityPct", "pressurePa", "lux", "motion", "presence", "gasLevel", "vocIndex", "gasOhms", "co2ppm", "ax", "ay", "az", "gx", "gy", "gz", "proximity", "gesture", "distanceMm", "angleDeg", "distanceCm", "flowLpm", "lightLux", "irCode"]) {
+          const value = c.properties?.[key];
+          if (typeof value === "number") readings[key] = value;
+          else if (typeof value === "boolean") readings[key] = Number(value);
+        }
+        if (c.type === "dht11") { readings.temperature = numeric(c, "temperatureC", 25); readings.humidity = clamp(numeric(c, "humidityPct", 50), 0, 100); }
+        if (c.type === "ds18b20-waterproof") readings.temperature = numeric(c, "temperatureC", numeric(c, "temperature", 25));
+        if (c.type === "ntc-thermistor-10k") {
+          const temp = numeric(c, "temperatureC", 25), kelvin = temp + 273.15, beta = Number(details.beta ?? 3950);
+          const resistance = 10_000 * Math.exp(beta * (1 / kelvin - 1 / 298.15));
+          readings.temperatureC = temp; readings.resistanceOhms = resistance;
+          const analog = clamp(10_000 / (10_000 + resistance), 0, 1);
+          if (this.wiring.wired(c.id, "1")) this.drive(c, "1", analog);
+        }
+        if (c.type === "photoresistor-gl5528") {
+          const lux = clamp(numeric(c, "lightLux", 500), 0, 100_000), analog = clamp(lux / (lux + 200), 0, 1);
+          readings.lightLux = lux; readings.resistanceOhms = Math.round(1_000_000 / Math.max(1, lux));
+          if (this.wiring.wired(c.id, "1")) this.drive(c, "1", analog);
+        }
+        if (c.type === "ky-023-joystick") {
+          const x = clamp(numeric(c, "x", 50), 0, 100) / 100, y = clamp(numeric(c, "y", 50), 0, 100) / 100;
+          const pressed = c.properties?.pressed === true;
+          readings.analogX = x; readings.analogY = y; readings.buttonPressed = Number(pressed);
+          if (powered && this.wiring.wired(c.id, "VRX")) this.drive(c, "VRX", x);
+          if (powered && this.wiring.wired(c.id, "VRY")) this.drive(c, "VRY", y);
+          if (powered && this.wiring.wired(c.id, "SW")) this.drive(c, "SW", Number(!pressed));
+        }
+        if (c.type === "mq-2-gas-sensor") {
+          const gas = clamp(numeric(c, "gasLevel", 0), 0, 100), threshold = clamp(numeric(c, "alarmThreshold", 55), 0, 100);
+          readings.gasLevel = gas; readings.alarm = Number(gas >= threshold);
+          if (powered && this.wiring.wired(c.id, "AOUT")) this.drive(c, "AOUT", gas / 100);
+          if (powered && this.wiring.wired(c.id, "DOUT")) this.drive(c, "DOUT", Number(gas >= threshold));
+        }
+        const outputPin = String(details.outputPin ?? "");
+        if (outputPin && powered && !["ky-023-joystick", "mq-2-gas-sensor", "ntc-thermistor-10k", "photoresistor-gl5528"].includes(c.type)) {
+          const propertyName = String(details.valueProperty ?? "");
+          const raw = c.properties?.[propertyName];
+          if (details.outputMode === "digital") {
+            const active = typeof raw === "boolean" ? raw : typeof raw === "number" ? raw > 0 : typeof raw === "string" ? raw !== "" && raw !== "none" : false;
+            const output = c.type.includes("ir-receiver") ? Number(!active) : Number(active);
+            if (this.wiring.wired(c.id, outputPin)) this.drive(c, outputPin, output);
+            readings.output = output;
+          } else if (details.outputMode === "analog" && typeof raw === "number") {
+            const min = Number(details.min ?? 0), max = Number(details.max ?? (c.type === "as5600-magnetic-encoder" ? 360 : 100));
+            const analog = clamp((raw - min) / Math.max(1e-9, max - min), 0, 1);
+            if (this.wiring.wired(c.id, outputPin)) this.drive(c, outputPin, analog);
+            readings.analogOutput = analog;
+          } else if (details.outputMode === "frequency" && typeof raw === "number") {
+            const frequencyHz = clamp(raw * Number(details.pulsesPerUnit ?? 7.5), 0, 1_000);
+            if (this.wiring.wired(c.id, outputPin)) this.drive(c, outputPin, Number(frequencyHz > 0));
+            readings.frequencyHz = frequencyHz;
+            readings.output = Number(frequencyHz > 0);
+          }
+        }
+        const i2c = family === "i2c-sensor";
+        const bus = i2c && this.busPresent(c);
+        if (i2c) status = !powered ? "Unpowered" : bus ? "I²C ready" : "I²C disconnected";
+        else if (!powered) status = "Unpowered";
+        else if (c.type === "hc-sr501" || c.type === "rcwl-0516-microwave-radar" || c.type === "ld2410c-mmwave-radar") status = readings.output ? "Motion detected" : "No motion";
+        else if (c.type === "mq-2-gas-sensor") status = readings.alarm ? "Gas threshold exceeded" : "Monitoring";
+        else if (c.type === "dht11") status = "DHT11 ready";
+        else if (c.type === "ds18b20-waterproof") status = "1-Wire ready";
+        else status = "Sensor ready";
+        if (c.type === "as5600-magnetic-encoder" && powered) {
+          const angle = clamp(numeric(c, "angleDeg", 0), 0, 360); readings.angleDeg = angle;
+          if (this.wiring.wired(c.id, "OUT")) this.drive(c, "OUT", angle / 360);
+        }
+      } else if (family === "pixel") {
+        const count = Number(details.pixelCount ?? 8);
+        const dataPin = Number(this.values.get(`component:${c.id}.dataPin`) ?? -1);
+        const dataConnected = m.initialized && dataPin >= 0 && !!this.ws2812DataPath(c, dataPin);
+        readings.pixelCount = count; readings.litPixels = m.pixels.filter(pixel => pixel.r || pixel.g || pixel.b).length;
+        status = !powered ? "Unpowered" : !m.initialized ? "Ready" : !dataConnected ? "Data disconnected" : readings.litPixels ? "Displaying" : "Ready";
+        pixels = powered && dataConnected ? m.pixels.map(pixel => ({ ...pixel })) : m.pixels.map(() => ({ r: 0, g: 0, b: 0 }));
+      } else if (family === "display") {
+        const spiDisplay = ["max7219-8x8-matrix", "st7735s-tft-1-8", "ili9341-tft-2-8", "epaper-2-9-spi", "gc9a01-round-tft"].includes(c.type);
+        const spiPins: Readonly<Record<string, { mosi: string; miso: string | null; sck: string; cs: string }>> = {
+          "max7219-8x8-matrix": { mosi: "DIN", miso: null, sck: "CLK", cs: "CS" },
+          "st7735s-tft-1-8": { mosi: "SDA", miso: null, sck: "SCL", cs: "CS" },
+          "ili9341-tft-2-8": { mosi: "MOSI", miso: "MISO", sck: "SCK", cs: "CS" },
+          "epaper-2-9-spi": { mosi: "DIN", miso: null, sck: "CLK", cs: "CS" },
+          "gc9a01-round-tft": { mosi: "SDA", miso: null, sck: "SCL", cs: "CS" },
+        };
+        const bus = spiDisplay ? this.wiring.spi(c, undefined, spiPins[c.type]!) : c.type === "sh1107-oled-128x128" ? this.busPresent(c) : c.type === "tm1637-4-digit-display" ? this.wiring.wired(c.id, "CLK") && this.wiring.wired(c.id, "DIO") : m.initialized;
+        readings.spiBytes = Number(m.registers[0xfe]);
+        if (c.type === "tm1637-4-digit-display") { readings.value = m.displayValue; display = [...m.displayText]; }
+        if (c.type === "sh1107-oled-128x128") { readings.width = 128; readings.height = 128; display = [...m.displayText]; }
+        if (c.type === "max7219-8x8-matrix") {
+          const on = m.registers[0x0c] === 1, limit = Math.min(8, m.registers[0x0b] + 1);
+          display = Array.from({ length: limit }, (_, row) => Array.from({ length: 8 }, (_, column) => m.registers[row + 1] & (1 << (7 - column)) ? "#" : ".").join(""));
+          readings.scanLimit = limit - 1; readings.litPixels = on ? display.reduce((sum, row) => sum + [...row].filter(character => character === "#").length, 0) : 0;
+          if (!on) display = [];
+        }
+        status = !powered ? "Unpowered" : !bus ? spiDisplay ? "SPI disconnected" : c.type === "sh1107-oled-128x128" ? "I²C disconnected" : "Control disconnected" : c.type === "max7219-8x8-matrix" && m.registers[0x0c] !== 1 ? "Shutdown" : m.initialized && m.displayOn ? "Displaying" : "Ready";
+      } else if (family === "actuator" && (c.type === "mg996r-servo" || c.type === "sg90-servo")) {
+        const servo = servos.find(item => item.attached && item.pin >= 0 && (!item.boardId || item.boardId === this.boardId) && (!item.boardComponentId || item.boardComponentId === this.boardComponentId) && this.wiring.boardConnected(c.id, "SIG", item.pin));
+        const signal = Boolean(powered && servo);
+        const angle = signal ? clamp(servo!.angle, 0, 180) : clamp(numeric(c, "angle", 90), 0, 180);
+        readings.angle = angle; readings.signal = Number(signal);
+        status = !powered ? "Unpowered" : !servo ? "Signal disconnected" : "Tracking sketch command";
+      } else if (family === "actuator") {
+        const current = Math.abs(this.powerResult?.current(c.id) ?? 0);
+        const active = powered && current > 1e-6;
+        readings.current = current;
+        if (c.type === "r385-water-pump") readings.flowLpm = active ? clamp(numeric(c, "flowLpm", 2), 0, 10) : 0;
+        status = !powered ? "Unpowered or switched off" : active ? c.type === "solenoid-valve-12v" ? "Open" : "Pumping" : "Off";
+      } else if (family === "driver") {
+        if (c.type === "l298n-driver-module") {
+          const enabledA = powered && this.high(c, "ENA"), enabledB = powered && this.high(c, "ENB");
+          const in1 = Number(this.high(c, "IN1")), in2 = Number(this.high(c, "IN2")), in3 = Number(this.high(c, "IN3")), in4 = Number(this.high(c, "IN4"));
+          if (enabledA) { this.drive(c, "OUT1", in1); this.drive(c, "OUT2", in2); }
+          if (enabledB) { this.drive(c, "OUT3", in3); this.drive(c, "OUT4", in4); }
+          Object.assign(readings, { OUT1: Number(enabledA && in1), OUT2: Number(enabledA && in2), OUT3: Number(enabledB && in3), OUT4: Number(enabledB && in4) });
+          status = !powered ? "Unpowered" : "H-bridge ready";
+        } else if (c.type === "uln2003-stepper-driver") {
+          for (let index = 1; index <= 7; index++) {
+            const high = powered && this.high(c, `IN${index}`); readings[`OUT${index}`] = Number(high);
+            if (this.wiring.wired(c.id, `OUT${index}`)) this.drive(c, `OUT${index}`, Number(!high));
+          }
+          status = powered ? "Low-side outputs ready" : "Unpowered";
+        }
+      } else if (family === "switch") {
+        for (let index = 1; index <= 8; index++) readings[`switch${index}`] = Number(c.properties?.[`switch${index}`] === true);
+        status = "Switch contacts ready";
+      } else if (family === "logic") {
+        if (c.type === "ne555-timer") {
+          const supplyVoltage = this.wiring.voltage(c.id, "VCC") ?? 5;
+          const trigger = this.wiring.voltage(c.id, "TRIG"), threshold = this.wiring.voltage(c.id, "THRESH");
+          if (powered && trigger !== undefined && trigger < supplyVoltage / 3) m.registers[0] = 1;
+          else if (powered && threshold !== undefined && threshold >= 2 * supplyVoltage / 3) m.registers[0] = 0;
+          this.drive(c, "OUT", m.registers[0]); this.drive(c, "DISCH", Number(!m.registers[0]));
+          readings.output = m.registers[0]; status = !powered ? "Unpowered" : m.registers[0] ? "Output HIGH" : "Output LOW";
+        } else status = powered ? "Discrete switch model" : "Unpowered";
+      }
+      if ((family === "sensor" || family === "i2c-sensor" || family === "input") && !powered) {
+        for (const key of Object.keys(readings)) readings[key] = 0;
+      }
+      this.states[c.id] = { type: c.type, powered, status, readings, ...(display ? { display: display.filter(Boolean) } : {}), ...(pixels ? { pixels } : {}), ...(Object.keys(readings).some(key => key === "OUT" || key === "output") ? { channels: { OUT: Number(readings.OUT ?? readings.output ?? 0) } } : {}) };
+    }
+  }
   private stepperDrivers() {
-    const drivers = this.project.components.filter(component => component.type === "a4988-stepper-driver");
-    const motors = this.project.components.filter(component => component.type === "bipolar-stepper-motor");
-    const motorWires = (driver: CircuitComponent, motor: CircuitComponent) => ["1A", "1B", "2A", "2B"].every(pin => this.wiring.connected(driver.id, pin, motor.id, pin));
+    const drivers = this.project.components.filter(component => ["a4988-stepper-driver", "tmc2209-stepper-driver"].includes(component.type));
+    const motors = this.project.components.filter(component => ["bipolar-stepper-motor", "nema17-stepper-17hs4401s"].includes(component.type));
+    const outputPins = ["1A", "1B", "2A", "2B"];
+    const motorPins = (motor: CircuitComponent) => motor.type === "nema17-stepper-17hs4401s" ? ["A1", "A2", "B1", "B2"] : outputPins;
+    const motorWires = (driver: CircuitComponent, motor: CircuitComponent) => outputPins.every((pin, index) => this.wiring.connected(driver.id, pin, motor.id, motorPins(motor)[index]!));
     for (const driver of drivers) {
       const m = this.m(driver), powered = this.powered(driver);
-      const controls = ["STEP", "DIR", "EN", "RST", "SLP"];
+      const isA4988 = driver.type === "a4988-stepper-driver";
+      const controls = isA4988 ? ["STEP", "DIR", "EN", "RST", "SLP"] : ["STEP", "DIR", "EN"];
       const connected = (pin: string) => getBoardProfile(this.boardId)?.ioPins.some(candidate => candidate.runtimePin !== undefined && !candidate.reserved
         && (candidate.signals ?? ["digital"]).includes("digital") && this.wiring.boardConnected(driver.id, pin, candidate.runtimePin)) ?? false;
-      const controlsConnected = controls.every(connected);
+      const high = (voltage: number | undefined) => voltage !== undefined && voltage >= 2;
+      const resetSleepStrappedHigh = isA4988
+        && this.wiring.wired(driver.id, "RST")
+        && this.wiring.connected(driver.id, "RST", driver.id, "SLP")
+        && high(this.wiring.voltage(driver.id, "RST"));
+      const controlsConnected = isA4988
+        ? ["STEP", "DIR", "EN"].every(connected) && (connected("RST") && connected("SLP") || resetSleepStrappedHigh)
+        : controls.every(connected);
       const completeMotors = motors.filter(motor => motorWires(driver, motor));
       const motorHasExclusiveDriver = completeMotors.length === 1
         && drivers.filter(candidate => motorWires(candidate, completeMotors[0])).length === 1;
       const stepVoltage = this.wiring.voltage(driver.id, "STEP");
       const dirVoltage = this.wiring.voltage(driver.id, "DIR");
       const enableVoltage = this.wiring.voltage(driver.id, "EN");
-      const resetVoltage = this.wiring.voltage(driver.id, "RST");
-      const sleepVoltage = this.wiring.voltage(driver.id, "SLP");
-      if (!controlsConnected) this.error("A4988_CONTROL_DISCONNECTED", `${driver.label}: wire STEP, DIR, EN, RST, and SLP to supported digital pins on ${this.boardId}.`);
-      if (motors.length && completeMotors.length !== 1) this.error("A4988_MOTOR_WIRING", `${driver.label}: connect its four outputs 1A/1B/2A/2B to exactly one bipolar stepper motor with matching coil labels.`);
-      if (!powered && controlsConnected) this.error("A4988_SUPPLY", `${driver.label}: supply VDD (3–5.5 V), VMOT (8–35 V), and both ground pins before stepping.`);
-      const high = (voltage: number | undefined) => voltage !== undefined && voltage >= 2;
-      const awake = high(resetVoltage) && high(sleepVoltage);
+      const resetVoltage = isA4988 ? this.wiring.voltage(driver.id, "RST") : undefined;
+      const sleepVoltage = isA4988 ? this.wiring.voltage(driver.id, "SLP") : undefined;
+      const diagnosticPrefix = isA4988 ? "A4988" : "TMC2209";
+      if (!controlsConnected) this.error(`${diagnosticPrefix}_CONTROL_DISCONNECTED`, isA4988
+        ? `${driver.label}: wire STEP/DIR/EN to supported digital pins on ${this.boardId}; RST and SLP must either use GPIO or be joined together and pulled HIGH from VDD.`
+        : `${driver.label}: wire ${controls.join(", ")} to supported digital pins on ${this.boardId}.`);
+      if (motors.length && completeMotors.length !== 1) this.error(`${diagnosticPrefix}_MOTOR_WIRING`, `${driver.label}: connect its four outputs 1A/1B/2A/2B to exactly one supported bipolar motor with matching coil pairs.`);
+      if (!powered && controlsConnected) this.error(`${diagnosticPrefix}_SUPPLY`, `${driver.label}: connect all documented logic and motor supplies and ground before stepping.`);
+      const awake = !isA4988 || high(resetVoltage) && high(sleepVoltage);
       const enabled = powered && controlsConnected && awake && enableVoltage !== undefined && enableVoltage < 0.8 && completeMotors.length === 1 && motorHasExclusiveDriver;
       const stepHigh = high(stepVoltage);
       let microstep = 1;
-      const selectors = ["MS1", "MS2", "MS3"].map(pin => high(this.wiring.voltage(driver.id, pin)));
-      const selectorBits = Number(selectors[0]) * 4 + Number(selectors[1]) * 2 + Number(selectors[2]);
-      microstep = ({ 0: 1, 4: 2, 2: 4, 6: 8, 7: 16 } as Record<number, number>)[selectorBits] ?? 1;
+      if (isA4988) {
+        const selectors = ["MS1", "MS2", "MS3"].map(pin => high(this.wiring.voltage(driver.id, pin)));
+        const selectorBits = Number(selectors[0]) * 4 + Number(selectors[1]) * 2 + Number(selectors[2]);
+        microstep = ({ 0: 1, 4: 2, 2: 4, 6: 8, 7: 16 } as Record<number, number>)[selectorBits] ?? 1;
+      }
       const rising = stepHigh && !m.clock;
       if (rising && enabled && dirVoltage !== undefined) {
         const direction = high(dirVoltage) ? 1 : -1;
@@ -627,8 +873,8 @@ export class DeviceRuntime {
       m.clock = stepHigh;
       const recent = m.lastStepAt >= 0 && this.time - m.lastStepAt <= Math.max(100, m.stepIntervalMs * 3);
       const rpm = recent && m.stepIntervalMs > 0 ? 60000 / m.stepIntervalMs / Math.max(1, numeric(completeMotors[0] ?? driver, "stepsPerRevolution", 200) * microstep) : 0;
-      const driverStatus = !powered ? "Unpowered" : !controlsConnected ? "Connect STEP/DIR/EN/RST/SLP" : !awake ? resetVoltage !== undefined && resetVoltage < 2 ? "Reset" : "Sleeping" : enableVoltage !== undefined && enableVoltage >= 0.8 ? "Disabled" : completeMotors.length !== 1 ? "Connect one bipolar stepper" : !motorHasExclusiveDriver ? "Driver output conflict" : recent ? `Running · ${rpm.toFixed(1)} RPM` : "Stopped";
-      if (completeMotors.length === 1 && !motorHasExclusiveDriver) this.error("A4988_OUTPUT_CONTENTION", `${driver.label}: another stepper driver is connected to the same motor coils; connect each driver to its own motor.`);
+      const driverStatus = !powered ? "Unpowered" : !controlsConnected ? isA4988 ? "Check STEP/DIR/EN and RST/SLP" : "Connect STEP/DIR/EN" : !awake ? resetVoltage !== undefined && resetVoltage < 2 ? "Reset" : "Sleeping" : enableVoltage !== undefined && enableVoltage >= 0.8 ? "Disabled" : completeMotors.length !== 1 ? "Connect one bipolar stepper" : !motorHasExclusiveDriver ? "Driver output conflict" : recent ? `Running · ${rpm.toFixed(1)} RPM` : "Stopped";
+      if (completeMotors.length === 1 && !motorHasExclusiveDriver) this.error(`${diagnosticPrefix}_OUTPUT_CONTENTION`, `${driver.label}: another stepper driver is connected to the same motor coils; connect each driver to its own motor.`);
       this.states[driver.id] = { type: driver.type, powered, status: driverStatus, readings: { steps: m.stepCount, microstep, stepIntervalMs: m.stepIntervalMs, rpm, enabled: Number(enabled) } };
     }
     for (const motor of motors) {
@@ -647,6 +893,55 @@ export class DeviceRuntime {
       const direction = m.stepCount === 0 ? "stopped" : Number(driverMemory?.registers[0x21]) ? "forward" : "reverse";
       const rpm = Number(driverState?.readings?.rpm ?? 0);
       this.states[motor.id] = { type: motor.type, powered, status: !powered ? "Unpowered" : rpm > 0 ? `${direction === "forward" ? "Forward" : "Reverse"} · ${rpm.toFixed(1)} RPM` : "Stopped", direction, speed: rpm > 0 ? Math.min(1, rpm / 300) : 0, readings: { steps: m.stepCount, angleDegrees: Number(angle.toFixed(2)), rpm, microstep } };
+    }
+    this.unipolarStepperDrivers();
+  }
+  private unipolarStepperDrivers() {
+    const drivers = this.project.components.filter(component => component.type === "uln2003-stepper-driver");
+    const motors = this.project.components.filter(component => component.type === "stepper-28byj-48");
+    const phases = [1, 3, 2, 6, 4, 12, 8, 9];
+    for (const driver of drivers) {
+      const memory = this.m(driver);
+      const powered = this.powered(driver);
+      const motorMatches = motors.filter(motor => ["A", "B", "C", "D"].every((pin, index) => this.wiring.connected(driver.id, `OUT${index + 1}`, motor.id, pin)));
+      const motor = motorMatches.length === 1 ? motorMatches[0] : undefined;
+      const commonVoltage = motor ? this.wiring.voltage(motor.id, "COM") : undefined;
+      const supplyReady = commonVoltage !== undefined && commonVoltage >= 4.5 && commonVoltage <= 5.5;
+      const controlsConnected = [1, 2, 3, 4].every(index => getBoardProfile(this.boardId)?.ioPins.some(pin => pin.runtimePin !== undefined && !pin.reserved
+        && (pin.signals ?? ["digital"]).includes("digital") && this.wiring.boardConnected(driver.id, `IN${index}`, pin.runtimePin)) ?? false);
+      const enabled = powered && supplyReady && controlsConnected && !!motor;
+      let phaseMask = 0;
+      for (let index = 1; index <= 4; index++) if (enabled && this.high(driver, `IN${index}`)) phaseMask |= 1 << (index - 1);
+      const currentIndex = phases.indexOf(phaseMask);
+      const previousValid = memory.registers[0x32] === 1;
+      if (enabled && currentIndex >= 0 && previousValid) {
+        const previousIndex = memory.registers[0x31]!;
+        const nextHalfStep = (previousIndex + 1) % phases.length;
+        const previousHalfStep = (previousIndex + phases.length - 1) % phases.length;
+        const nextFullStep = (previousIndex + 2) % phases.length;
+        const previousFullStep = (previousIndex + phases.length - 2) % phases.length;
+        if (currentIndex === nextHalfStep || currentIndex === previousHalfStep || currentIndex === nextFullStep || currentIndex === previousFullStep) {
+          const direction = currentIndex === nextHalfStep || currentIndex === nextFullStep ? 1 : -1;
+          const motorMemory = this.m(motor!);
+          motorMemory.stepCount += direction;
+          if (motorMemory.lastStepAt >= 0) motorMemory.stepIntervalMs = Math.max(1, this.time - motorMemory.lastStepAt);
+          motorMemory.lastStepAt = this.time;
+          memory.registers[0x21] = direction > 0 ? 1 : 0;
+        }
+      }
+      if (enabled && currentIndex >= 0) {
+        memory.registers[0x31] = currentIndex;
+        memory.registers[0x32] = 1;
+      } else if (!enabled) memory.registers[0x32] = 0;
+      const stepCount = motor ? this.m(motor).stepCount : memory.stepCount;
+      const rpm = motor && this.m(motor).stepIntervalMs > 0 && this.time - this.m(motor).lastStepAt <= Math.max(100, this.m(motor).stepIntervalMs * 3)
+        ? 60_000 / (this.m(motor).stepIntervalMs * Math.max(1, numeric(motor, "stepsPerRevolution", 2048))) : 0;
+      this.states[driver.id] = { type: driver.type, powered, status: !powered ? "Unpowered" : !supplyReady ? "Motor supply disconnected" : !controlsConnected ? "Connect IN1–IN4" : !motor ? "Connect one 28BYJ-48" : rpm > 0 ? `Running · ${rpm.toFixed(1)} RPM` : "Ready", readings: { steps: stepCount, phase: phaseMask, energizedPhases: Number(phaseMask !== 0), enabled: Number(enabled) } };
+      if (motor) {
+        const angle = ((stepCount / Math.max(1, numeric(motor, "stepsPerRevolution", 2048)) * 360) % 360 + 360) % 360;
+        const direction = stepCount === 0 ? "stopped" : memory.registers[0x21] ? "forward" : "reverse";
+        this.states[motor.id] = { type: motor.type, powered: enabled, status: !enabled ? "Unpowered" : rpm > 0 ? `${direction === "forward" ? "Forward" : "Reverse"} · ${rpm.toFixed(1)} RPM` : "Stopped", direction, speed: rpm > 0 ? Math.min(1, rpm / 30) : 0, readings: { steps: stepCount, angleDegrees: Number(angle.toFixed(2)), rpm, energizedPhases: Number(phaseMask !== 0) } };
+      }
     }
   }
   private expander(c: CircuitComponent, m: DeviceMemory, powered: boolean) {
@@ -684,6 +979,23 @@ export class DeviceRuntime {
 
   private readRegister(c: CircuitComponent, register: number): number {
     const m = this.m(c); const v = (property: string, fallback: number) => numeric(c, property, fallback);
+    const screenshot = SCREENSHOT_COMPONENT_CONFIG[c.type];
+    if (screenshot?.family === "i2c-sensor") {
+      if (c.type === "as5600-magnetic-encoder") {
+        // AS5600 ANGLE registers are a 12-bit value at 0x0E (MSB) and
+        // 0x0F (LSB), not a generic little-endian scalar register. Keep the
+        // raw I2C contract aligned with the datasheet and deterministic knob.
+        const degrees = clamp(numeric(c, "angleDeg", 0), 0, 360);
+        const rawAngle = Math.round(degrees * 4096 / 360) & 0x0fff;
+        if (register === 0x0e) return (rawAngle >> 8) & 0x0f;
+        if (register === 0x0f) return rawAngle & 0xff;
+      }
+      const valueProperty = String(screenshot.details.valueProperty ?? "");
+      const defaultValue = c.type === "scd41-co2-sensor" ? 420 : c.type === "veml7700-light-sensor" ? 500 : c.type === "as5600-magnetic-encoder" ? 0 : c.type === "vl53l0x-tof-distance" ? 500 : 0;
+      const reading = valueProperty ? Number(c.properties?.[valueProperty] ?? defaultValue) : Number(c.properties?.temperatureC ?? c.properties?.temperature ?? 25);
+      const scaled = Math.max(0, Math.round(reading * (c.type === "as5600-magnetic-encoder" ? 100 : 1)));
+      return (scaled >>> ((register & 3) * 8)) & 255;
+    }
     if (c.type === "ds3231-rtc") return this.rtcRegister(c, m, register);
     if (c.type === "bq27441-g1") return this.gauge(c).read(register);
     if (c.type === "tca9548a") return m.registers[0];
@@ -745,18 +1057,27 @@ export class DeviceRuntime {
     const instance = this.instances.get(name); if (!instance?.api.component) return undefined;
     const ctor = this.constructorArgs(name, evaluate); const type = instance.api.component;
     if (["dht22", "ds18b20"].includes(type)) {
+      const supportedTypes = [type, ...(instance.api.components ?? [])];
       let dataPin = Number(ctor[0]);
       if (instance.api.type === "DallasTemperature") dataPin = Number(this.constructorArgs(String(ctor[0]).replace(/^&/, ""), evaluate)[0]);
-      const candidates = this.project.components.filter(c => c.type === type && this.wiring.boardConnected(c.id, type === "dht22" ? "DATA" : "DQ", dataPin) && this.wiring.pullup(c.id, type === "dht22" ? "DATA" : "DQ") && this.powered(c));
+      const selectedDht = Number(ctor[1]) === 11 ? "dht11" : type;
+      const candidates = this.project.components.filter(c => supportedTypes.includes(c.type)
+        && (type !== "dht22" || c.type === selectedDht)
+        && this.wiring.boardConnected(c.id, type === "dht22" ? "DATA" : "DQ", dataPin)
+        && this.wiring.pullup(c.id, type === "dht22" ? "DATA" : "DQ") && this.powered(c));
       const c = candidates[type === "ds18b20" ? Number(args[0] ?? 0) : 0];
       if (c && initialize) { this.m(c).initialized = true; this.bindings.set(name, c.id); }
       return c;
     }
     if (type === "ws2812b-strip-8") {
       const dataPin = Number(ctor[1] ?? -1);
+      const supportedTypes = [type, ...(instance.api.components ?? [])];
+      const declaredCount = Number(ctor[0] ?? 8);
       const profile = getBoardProfile(this.boardId);
       const pinSupported = profile?.ioPins.some(pin => pin.runtimePin === dataPin && !pin.reserved && (pin.signals ?? ["digital"]).includes("digital")) ?? false;
-      const strips = this.project.components.filter(component => component.type === type && this.powered(component) && this.ws2812DataPath(component, dataPin));
+      const strips = this.project.components.filter(component => supportedTypes.includes(component.type)
+        && Number(SCREENSHOT_COMPONENT_CONFIG[component.type]?.details.pixelCount ?? 8) === declaredCount
+        && this.powered(component) && this.ws2812DataPath(component, dataPin));
       const c = strips.length === 1 && pinSupported ? strips[0] : undefined;
       if (!c && initialize) this.error("NEOPIXEL_NOT_CONNECTED", `${name}.begin(): connect one powered WS2812B DIN to a supported digital output on ${this.boardId}; the configured pin must match the sketch.`);
       if (c && initialize) {
@@ -770,6 +1091,14 @@ export class DeviceRuntime {
         this.values.set(`component:${c.id}.dataPin`, dataPin);
         this.bindings.set(name, c.id);
       }
+      return c;
+    }
+    if (type === "tm1637-4-digit-display") {
+      const [clockPin, dataPin] = ctor.map(Number);
+      const c = this.project.components.find(component => component.type === type && this.powered(component)
+        && this.wiring.boardConnected(component.id, "CLK", clockPin) && this.wiring.boardConnected(component.id, "DIO", dataPin));
+      if (c && initialize) { this.bindings.set(name, c.id); this.m(c).initialized = true; }
+      if (!c && initialize) this.error("TM1637_NOT_CONNECTED", `${name}.begin(): connect a powered TM1637's CLK and DIO to the two declared digital pins.`);
       return c;
     }
     if (type === "ky-040") {
@@ -836,13 +1165,15 @@ export class DeviceRuntime {
       const c = this.project.components.find(c => c.type === type && this.powered(c) && this.wiring.spi(c, Number(ctor[0]), { mosi: "SDI", miso: "SDO", sck: "SCK", cs: "CSB" }));
       if (c && initialize) this.bindings.set(name, c.id); return c;
     }
-    const defaults: Record<string, number> = { bme280: 0x77, bmp280: 0x77, "sht31-dis": 0x44, "mpu-6050": 0x68, mcp23017: 0x20, tca9548a: Number(ctor[0] ?? 0x70), "bq27441-g1": 0x55, bq76920: Number(ctor[1] ?? 0x08), "bh1750-sen0097": Number(ctor[0] ?? 0x23), "ssd1306-oled-128x64": 0x3c };
+    const defaults: Record<string, number> = { bme280: 0x77, bmp280: 0x77, "sht31-dis": 0x44, "mpu-6050": 0x68, mcp23017: 0x20, tca9548a: Number(ctor[0] ?? 0x70), "bq27441-g1": 0x55, bq76920: Number(ctor[1] ?? 0x08), "bh1750-sen0097": Number(ctor[0] ?? 0x23), "ssd1306-oled-128x64": 0x3c, "sh1107-oled-128x128": 0x3c,
+      "bme280-gy-bme-p280": 0x76, "sgp40-voc-sensor": 0x59, "bme680-gas-sensor": 0x77, "scd41-co2-sensor": 0x62, "mpu-6050-breakout": 0x68, "veml7700-light-sensor": 0x10, "apds-9960-proximity-gesture": 0x39, "vl53l0x-tof-distance": 0x29, "as5600-magnetic-encoder": 0x36 };
     const bound = this.project.components.find(c => c.id === this.bindings.get(name));
     const address = ["bh1750-sen0097", "ssd1306-oled-128x64"].includes(type)
       ? initialize ? Number(args[1] ?? defaults[type]) : Number(this.values.get(`${name}.address`) ?? defaults[type])
       : initialize ? Number(type === "bq76920" ? defaults[type] : args[0] ?? defaults[type]) : bound ? Number(this.values.get(`${name}.address`) ?? defaults[type]) : defaults[type];
     const c = this.byAddress(address);
-    if (c?.type !== type) return undefined;
+    const acceptedTypes = [type, ...(instance.api.components ?? [])];
+    if (!c || !acceptedTypes.includes(c.type)) return undefined;
     if (initialize) { this.bindings.set(name, c.id); this.values.set(`${name}.address`, address); }
     return c;
   }
@@ -918,6 +1249,21 @@ export class DeviceRuntime {
         return 0;
       }
     }
+    if (this.instances.get(name)?.api.type === "TM1637Display") {
+      const c = this.resolve(name, args, evaluate, true);
+      if (!c) return 0;
+      const m = this.m(c); m.initialized = true;
+      if (method === "setBrightness") { m.brightness = clamp(Number(args[0]), 0, 7); return 0; }
+      if (method === "clear") { m.displayText = ["    "]; m.displayOn = true; m.displayValue = 0; return 0; }
+      if (method === "showNumberDec") {
+        const value = Math.trunc(Number(args[0]));
+        const text = (args[1] ? String(value) : String(Math.abs(value))).slice(-4).padStart(4, " ");
+        m.displayText = [text]; m.displayOn = true; m.displayValue = value; return 4;
+      }
+      if (method === "showString") { m.displayText = [String(args[0] ?? "").slice(0, 4).padEnd(4, " ")]; m.displayOn = true; return m.displayText[0]!.trimEnd().length; }
+      if (method === "setSegments") { m.displayText = [Array.isArray(args[0]) ? args[0].map(value => String.fromCharCode(Number(value))).join("").slice(0, 4) : "    "]; m.displayOn = true; return 0; }
+      return 0;
+    }
     if (name === "WiFi") return this.wifi(method, args);
     if (this.instances.get(name)?.api.type === "WiFiUDP") return this.udp(name, method, args);
     if (name === "LoRa" && method === "setPins") { this.radioPins = [Number(args[0]), Number(args[1] ?? 9), Number(args[2] ?? 2)]; return 0; }
@@ -964,18 +1310,20 @@ export class DeviceRuntime {
         return Math.round(measured / precision) * precision;
       }
     }
-    if (c.type === "ssd1306-oled-128x64") {
+    if (["ssd1306-oled-128x64", "sh1107-oled-128x128"].includes(c.type)
+      && ["Adafruit_SSD1306", "Adafruit_SH1107"].includes(instance?.api.type ?? "")) {
+      const lineCount = c.type === "sh1107-oled-128x128" ? 16 : 8;
       if (initialize) {
         m.initialized = true; m.displayOn = false; m.cursorColumn = 0; m.cursorRow = 0;
-        m.displayBuffer = Array(8).fill(""); m.displayText = Array(8).fill("");
+        m.displayBuffer = Array(lineCount).fill(""); m.displayText = Array(lineCount).fill("");
         return 1;
       }
-      const blank = () => { m.displayBuffer = Array(8).fill(""); m.cursorColumn = 0; m.cursorRow = 0; };
+      const blank = () => { m.displayBuffer = Array(lineCount).fill(""); m.cursorColumn = 0; m.cursorRow = 0; };
       if (method === "clearDisplay") { blank(); return 0; }
       if (method === "setCursor") {
         const size = Math.max(1, m.textSize);
         m.cursorColumn = clamp(Math.floor(Number(args[0]) / (6 * size)), 0, 20);
-        m.cursorRow = clamp(Math.floor(Number(args[1]) / (8 * size)), 0, 7);
+        m.cursorRow = clamp(Math.floor(Number(args[1]) / (8 * size)), 0, lineCount - 1);
         return 0;
       }
       if (method === "setTextSize") { m.textSize = clamp(Math.trunc(Number(args[0])), 1, 4); return 0; }
@@ -987,11 +1335,11 @@ export class DeviceRuntime {
         }
         const columns = Math.max(1, Math.floor(21 / m.textSize));
         for (const char of text) {
-          if (char === "\n" || m.cursorColumn >= columns) { m.cursorColumn = 0; m.cursorRow = Math.min(7, m.cursorRow + 1); if (char === "\n") continue; }
+          if (char === "\n" || m.cursorColumn >= columns) { m.cursorColumn = 0; m.cursorRow = Math.min(lineCount - 1, m.cursorRow + 1); if (char === "\n") continue; }
           const line = [...(m.displayBuffer[m.cursorRow] ?? "").padEnd(columns, " ")];
           line[m.cursorColumn] = char; m.displayBuffer[m.cursorRow] = line.join("").slice(0, columns); m.cursorColumn++;
         }
-        if (method === "println") { m.cursorColumn = 0; m.cursorRow = Math.min(7, m.cursorRow + 1); }
+        if (method === "println") { m.cursorColumn = 0; m.cursorRow = Math.min(lineCount - 1, m.cursorRow + 1); }
         return text.length;
       }
       if (method === "display") { m.displayText = [...m.displayBuffer]; m.displayOn = true; return 0; }
@@ -1016,6 +1364,14 @@ export class DeviceRuntime {
         const sample = model.libraryMeasurement(this.time); this.pendingDelayMs = sample.delay;
         return method === "readTemperature" ? sample.temperature : sample.humidity;
       }
+    }
+    if (c.type === "bme680-gas-sensor" && method === "performReading") {
+      m.readyAt = this.time;
+      return 1;
+    }
+    if (c.type === "bme680-gas-sensor" && method === "readGasResistance") {
+      if (m.sleeping || this.time < m.readyAt) return NaN;
+      return clamp(numeric(c, "gasOhms", 120000), 0, 1_000_000);
     }
     if (c.type === "tca9548a") {
       const channel = clamp(Number(args[0]), 0, 7);
@@ -1046,12 +1402,12 @@ export class DeviceRuntime {
       const objects: DeviceValue[] = [{ acceleration: { x: readings.ax, y: readings.ay, z: readings.az } }, { gyro: { x: readings.gx, y: readings.gy, z: readings.gz } }, { temperature: readings.temperature }];
       args.forEach((arg, i) => this.assignOutput(arg, objects[i])); return 1;
     }
-    if (c.type === "dht22" && ["readTemperature", "readHumidity", "read"].includes(method)) {
+    if (["dht22", "dht11"].includes(c.type) && ["readTemperature", "readHumidity", "read"].includes(method)) {
       const force = Boolean(args[method === "readTemperature" ? 1 : 0]);
       if (force && this.time - m.sampleAt < 2000) return method === "read" ? 0 : NaN;
       if (this.time - m.sampleAt >= 2000) {
-        this.values.set(`${c.id}.readTemperature`, clamp(numeric(c, "temperature", 25), -40, 80));
-        this.values.set(`${c.id}.readHumidity`, clamp(numeric(c, "humidity", 50), 0, 100));
+        this.values.set(`${c.id}.readTemperature`, clamp(numeric(c, "temperatureC", numeric(c, "temperature", 25)), -40, 80));
+        this.values.set(`${c.id}.readHumidity`, clamp(numeric(c, "humidityPct", numeric(c, "humidity", 50)), 0, 100));
         m.sampleAt = this.time;
       }
       if (method === "read") return 1;
@@ -1096,6 +1452,11 @@ export class DeviceRuntime {
       const m = this.m(c);
       if (c.type === "sht31-dis") { const result = this.wireTx.length ? this.sht(c).write(this.wireTx, this.time) : 0; this.wireTx = []; return result; }
       if (c.type === "bh1750-sen0097") { const result = this.wireTx.length ? Number(this.configureBh1750(c, this.wireTx[0]) ? 0 : 3) : 0; this.wireTx = []; return result; }
+      if (c.type === "sh1107-oled-128x128" && this.wireTx.length) {
+        const text = this.wireTx.slice(1).filter(value => value >= 32 && value <= 126).map(value => String.fromCharCode(value)).join("");
+        if (text) m.displayText = [text];
+        m.displayOn = true; m.initialized = true; this.wireTx = []; return 0;
+      }
       if (this.wireTx.length) {
         if (c.type === "tca9548a") this.writeRegister(c, 0, this.wireTx[0]);
         else { m.pointer = this.wireTx[0]; this.wireTx.slice(1).forEach((v, i) => this.writeRegister(c, m.pointer + i, v)); }
@@ -1117,6 +1478,7 @@ export class DeviceRuntime {
         return 0;
       }
       const m = this.m(c);
+      if (c.type === "sh1107-oled-128x128") { this.wireRx = []; return 0; }
       if (c.type === "sht31-dis") { this.wireRx = this.sht(c).read(clamp(Number(args[1]), 0, 256), this.time); return this.wireRx.length; }
       if (c.type === "bh1750-sen0097") {
         const mode = m.registers[0];
@@ -1140,11 +1502,32 @@ export class DeviceRuntime {
   private spi(method: string, args: DeviceValue[]): DeviceValue {
     if (method === "beginTransaction" || method === "endTransaction") { this.spiAddress = undefined; return 0; }
     if (method !== "transfer") return 0;
-    const selected = this.project.components.filter(c => ["rfm95w", "bme280", "bmp280"].includes(c.type) && this.powered(c) && this.wiring.voltage(c.id, c.type === "rfm95w" ? "NSS" : "CSB") === 0 && this.wiring.spi(c, undefined, c.type === "rfm95w" ? { mosi: "MOSI", miso: "MISO", sck: "SCK", cs: "NSS" } : { mosi: "SDI", miso: "SDO", sck: "SCK", cs: "CSB" }));
+    const spiPins: Readonly<Record<string, { mosi: string; miso: string | null; sck: string; cs: string }>> = {
+      "max7219-8x8-matrix": { mosi: "DIN", miso: null, sck: "CLK", cs: "CS" },
+      "st7735s-tft-1-8": { mosi: "SDA", miso: null, sck: "SCL", cs: "CS" },
+      "ili9341-tft-2-8": { mosi: "MOSI", miso: "MISO", sck: "SCK", cs: "CS" },
+      "epaper-2-9-spi": { mosi: "DIN", miso: null, sck: "CLK", cs: "CS" },
+      "gc9a01-round-tft": { mosi: "SDA", miso: null, sck: "SCL", cs: "CS" },
+    };
+    const screens = Object.keys(spiPins);
+    const selected = this.project.components.filter(c => {
+      if (!this.powered(c)) return false;
+      if (screens.includes(c.type)) { const names = spiPins[c.type]!; return this.wiring.voltage(c.id, names.cs) === 0 && this.wiring.spi(c, undefined, names); }
+      const names = c.type === "rfm95w" ? { mosi: "MOSI", miso: "MISO", sck: "SCK", cs: "NSS" } : { mosi: "SDI", miso: "SDO", sck: "SCK", cs: "CSB" };
+      return ["rfm95w", "bme280", "bmp280"].includes(c.type) && this.wiring.voltage(c.id, names.cs) === 0 && this.wiring.spi(c, undefined, names);
+    });
     if (selected.length !== 1) { this.spiAddress = undefined; this.spiSelected = undefined; this.error("SPI_SELECTION", "SPI transfer needs exactly one powered, wired device selected."); return 255; }
     const c = selected[0]; const value = Number(args[0]);
     if (this.spiSelected !== c.id) this.spiAddress = undefined;
     this.spiSelected = c.id;
+    if (screens.includes(c.type)) {
+      const m = this.m(c); m.initialized = true; m.displayOn = true; m.registers[0xfe]++;
+      if (c.type === "max7219-8x8-matrix") {
+        if (m.registers[0xff] === 0) { m.pointer = value & 0x0f; m.registers[0xff] = 1; }
+        else { this.writeRegister(c, m.pointer, value); m.registers[0xff] = 0; }
+      }
+      this.spiAddress = undefined; return 0;
+    }
     if (this.spiAddress === undefined) { this.spiRead = c.type === "rfm95w" ? !(value & 128) : !!(value & 128); this.spiAddress = c.type === "rfm95w" ? value & 127 : value | 128; return 0; }
     const address = this.spiAddress;
     if (!(c.type === "rfm95w" && address === 0)) this.spiAddress++;
@@ -1186,10 +1569,10 @@ export class DeviceRuntime {
     const parts = this.oneWire.parts(pin);
     const address = (value: DeviceValue): number[] => {
       const resolved = typeof value === "string" ? this.values.get(value.replace(/^&/, "")) : value;
-      return Array.isArray(resolved) ? resolved : [];
+      return Array.isArray(resolved) ? resolved.map(Number) : [];
     };
     if (direct) {
-      const result = this.oneWire.transaction(pin, method, args.map(a => Array.isArray(a) ? a : typeof a === "string" && this.values.has(a) ? address(a) : Number(a)));
+      const result = this.oneWire.transaction(pin, method, args.map(a => Array.isArray(a) ? a.map(Number) : typeof a === "string" && this.values.has(a) ? address(a) : Number(a)));
       if (Array.isArray(result)) { this.assignOutput(args[0], result); return 1; }
       return result;
     }
@@ -1231,8 +1614,9 @@ export class DeviceRuntime {
   }
   private hardwareSerial(name: string, method: string, args: DeviceValue[]): DeviceValue {
     const port = Number(name.match(/\d+$/)?.[0] ?? 0);
-    const available = getBoardProfile(this.boardId)?.uart.length ?? 1;
-    if (port <= 0 || port >= available) {
+    const profile = getBoardProfile(this.boardId);
+    const uart = profile?.uart[port];
+    if (port < 0 || port > 3 || port > 0 && !uart) {
       this.error("UART_PORT_UNAVAILABLE", `${name} is not available on the selected board profile.`);
       return method === "available" ? 0 : -1;
     }
@@ -1241,13 +1625,23 @@ export class DeviceRuntime {
     const rx = this.uartRx.get(port) ?? [];
     if (method === "available") return rx.length;
     if (method === "read") return rx.shift() ?? -1;
+    if (method === "parseInt") {
+      const delimiter = rx.findIndex(value => value === 10 || value === 13);
+      const bytesToConsume = delimiter >= 0 ? delimiter + 1 : rx.length;
+      const text = String.fromCharCode(...rx.splice(0, bytesToConsume));
+      const match = /[-+]?\d+/.exec(text);
+      return match ? Number(match[0]) : 0;
+    }
     if (["write", "print", "println"].includes(method)) {
       const baud = Number(this.values.get(`${name}.baud`) ?? 0);
       if (!baud) { this.error("UART_NOT_INITIALIZED", `${name}: call begin(baud) before transmitting.`); return 0; }
       const data = method === "write"
         ? bytes(args[0]).slice(0, args[1] === undefined ? undefined : Math.max(0, Math.trunc(Number(args[1]))))
         : [...new TextEncoder().encode(String(args[0] ?? "") + (method === "println" ? "\n" : ""))];
-      this.uartTx.push({ port, baud, data });
+      // Serial is both the sketch's USB monitor and, on profiles with a
+      // physical UART0 pin pair, the wired hardware UART. USB-only boards
+      // retain monitor output but have no implicit board-to-board link.
+      if (uart) this.uartTx.push({ port, baud, data });
       return data.length;
     }
     this.error("DEVICE_METHOD_UNIMPLEMENTED", `${name}.${method} is not implemented.`);
@@ -1303,7 +1697,7 @@ export class DeviceRuntime {
   }
   drainUartTransmissions(): UartTransmission[] { const result = this.uartTx; this.uartTx = []; return result; }
   enqueueUart(port: number, baud: number, data: readonly number[]): boolean {
-    const name = `Serial${port}`;
+    const name = port === 0 ? "Serial" : `Serial${port}`;
     if (Number(this.values.get(`${name}.baud`) ?? 0) !== baud) return false;
     const queue = this.uartRx.get(port) ?? [];
     queue.push(...data);
@@ -1331,14 +1725,14 @@ export class DeviceRuntime {
     }
     if (type === "ZBTxStatusResponse") {
       const indexes: Record<string, number> = { getFrameId: 1, getTxRetryCount: 4, getDeliveryStatus: 5, getDiscoveryStatus: 6 };
-      if (method === "getRemoteAddress") return (data[2] ?? 0) << 8 | (data[3] ?? 0);
+      if (method === "getRemoteAddress") return Number(data[2] ?? 0) << 8 | Number(data[3] ?? 0);
       return data[indexes[method]] ?? NaN;
     }
     if (type === "ZBRxResponse") {
       if (method === "getDataLength") return Math.max(0, data.length - 12);
       if (method === "getData") return data[12 + Number(args[0])] ?? -1;
       if (method === "getOption") return data[11] ?? 0;
-      if (method === "getRemoteAddress16") return (data[9] ?? 0) << 8 | (data[10] ?? 0);
+      if (method === "getRemoteAddress16") return Number(data[9] ?? 0) << 8 | Number(data[10] ?? 0);
       if (method === "getRemoteAddress64") return data.slice(1, 9);
     }
     this.error("DEVICE_METHOD_UNIMPLEMENTED", `${name}.${method} is not implemented.`); return NaN;

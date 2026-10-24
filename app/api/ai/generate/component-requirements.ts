@@ -17,7 +17,10 @@ const LOGIC_GATE_OPERATORS: Record<string, string> = {
   "logic-nor": "nor",
   "logic-not": "not",
 };
-const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+const normalize = (value: string) => value.toLowerCase()
+  .replace(/[µμ]/g, "u")
+  .replace(/(\d)\s+(?=u?f\b)/g, "$1")
+  .replace(/[^a-z0-9]+/g, " ").trim();
 const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 function explicitlyRequestsLogicGate(componentId: string, prompt: string): boolean {
@@ -35,10 +38,22 @@ function explicitlyRequestsLogicGate(componentId: string, prompt: string): boole
  * addressable-strip pixel numbers as separate hardware. */
 export function requestedComponentCounts(prompt: string, definitions: readonly ComponentDefinition[]): Map<string, number> {
   const normalizedPrompt = ` ${normalize(prompt)} `;
+  const explicitlyNamesIdealMosfet = /\bideal\s+(?:n\s+)?mosfet\b|\bideal\s+n\s+mos\s+switch\b/.test(normalizedPrompt);
+  const explicitlyNames2n7000 = /\b2n7000\b/.test(normalizedPrompt);
+  const explicitlyNamesTsop = /\btsop4838\b/.test(normalizedPrompt);
+  const explicitlyNamesVs1838 = /\bvs1838b\b/.test(normalizedPrompt);
+  const explicitlyNamesBme280Breakout = /\b(?:gy bme\s*p?280|bme280 breakout|bme280 module)\b/.test(normalizedPrompt);
   const mentionsAddressableLedStrip = /\b(?:ws2812[a-z0-9]*|neopixel|addressable|pixel)\b[\s\S]{0,48}\bstrip\b/.test(normalizedPrompt);
   const counts = new Map<string, number>();
   for (const definition of definitions) {
     if (isBoardType(definition.id)) continue;
+    if (definition.id === "bme280" && explicitlyNamesBme280Breakout) continue;
+    if (definition.id === "n-mosfet-2n7000" && explicitlyNamesIdealMosfet && !explicitlyNames2n7000) continue;
+    if (definition.id === "ideal-mosfet" && explicitlyNames2n7000 && !explicitlyNamesIdealMosfet) continue;
+    if (definition.id === "tsop4838-ir-receiver" && explicitlyNamesVs1838 && !explicitlyNamesTsop) continue;
+    if (definition.id === "vs1838b-ir-receiver-module" && explicitlyNamesTsop && !explicitlyNamesVs1838) continue;
+    if (definition.id === "vs1838b-ir-receiver-module" && !explicitlyNamesTsop && !explicitlyNamesVs1838
+      && /\b(?:ir|infrared)\s+receivers?\b/.test(normalizedPrompt) && !/\bmodule\b/.test(normalizedPrompt)) continue;
     if (definition.id in LOGIC_GATE_OPERATORS && !explicitlyRequestsLogicGate(definition.id, normalize(prompt))) continue;
     if (definition.id === "ground" && !/(?:\b(?:ground|gnd)\s+(?:symbol|component|part)\b|\b(?:add|include|place)\s+(?:(?:a|an|one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+)?(?:ground|gnd)\b)/i.test(normalizedPrompt)) continue;
     const names = [definition.id, definition.displayName, ...(definition.requestAliases ?? []), ...(definition.metadata?.aliases ?? [])]
@@ -82,6 +97,14 @@ export function requestedComponentCounts(prompt: string, definitions: readonly C
       });
     });
     counts.set(definition.id, Math.max(counts.get(definition.id) ?? 0, appearsInsideModelNumber || parsedQuantity > 100 ? 1 : parsedQuantity));
+  }
+
+  if (/\bcapacitors?\b/.test(normalizedPrompt)
+    && !counts.has("capacitor-1uf") && !counts.has("electrolytic-capacitor-100uf")) {
+    const defaultCapacitor = /\b(?:bulk|electrolytic|smoothing|reservoir)\s+capacitor\b/.test(normalizedPrompt)
+      ? "electrolytic-capacitor-100uf"
+      : "capacitor-1uf";
+    if (definitions.some(definition => definition.id === defaultCapacitor)) counts.set(defaultCapacitor, 1);
   }
 
   const explicitStandaloneMotorSupply = /\b(?:(?:separate|external|regulated|bench|adjustable|dedicated)\s+){1,3}(?:(?:dc|motor|fan|actuator|power)\s+){0,3}(?:power\s+)?supply\b|\b(?:motor|fan|actuator)\s+(?:power\s+)?supply\b/.test(normalizedPrompt);

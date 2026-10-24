@@ -27,6 +27,29 @@ test("same-origin validation accepts matching origins and localhost loopback ali
   })), true);
 });
 
+test("same-origin validation accepts the browser-facing Host behind a local proxy", () => {
+  assert.equal(isSameOriginRequest(new Request("http://172.29.64.1:3000/api/auth/session", {
+    method: "POST",
+    headers: {
+      origin: "http://localhost:3000",
+      host: "localhost:3000",
+      "x-forwarded-host": "attacker.example",
+    },
+  })), true);
+});
+
+test("same-origin validation rejects a mismatched Host even when forwarded headers match Origin", () => {
+  assert.equal(isSameOriginRequest(new Request("http://172.29.64.1:3000/api/auth/session", {
+    method: "POST",
+    headers: {
+      origin: "https://attacker.example",
+      host: "cirkitra.example",
+      "x-forwarded-host": "attacker.example",
+      "x-forwarded-proto": "https",
+    },
+  })), false);
+});
+
 test("same-origin validation never trusts client-controlled forwarded headers", () => {
   assert.equal(isSameOriginRequest(new Request("http://127.0.0.1:3000/api/auth/session", {
     method: "POST",

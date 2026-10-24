@@ -6,6 +6,9 @@ import type { ComponentProperties } from "../lib/circuit/types.ts";
 import { getComponentDefinition, simulationCapability } from "../lib/circuit/catalog.ts";
 import { pinPosition } from "../lib/schematic/geometry.ts";
 import { getBoardProfile, isBoardType } from "../lib/circuit/boards.ts";
+import { getHardwareArtworkKind, getHardwareBoardArtworkKind } from "../lib/circuit/hardware-artwork.ts";
+import { HardwareBoardArtwork, HardwarePartArtwork } from "./component-artwork";
+import { useServoVisualAngle } from "./use-servo-visual";
 
 export interface SchematicSymbolProps {
   type: string;
@@ -334,9 +337,6 @@ function DcMotorSymbol({ powered, direction, speed, simulationStatus = "idle", p
         <span className="symbol-motor__shaft" />
         <span className="symbol-motor__rotor"><i /><b /></span>
       </div>
-      <span className="symbol-motor__status" title="Simulated drive level, not physical RPM">
-        <span aria-hidden="true">{display.active ? display.direction === "reverse" ? "↶" : "↷" : "■"}</span> {display.label}
-      </span>
     </div>
   );
 }
@@ -423,11 +423,11 @@ function TemperatureSymbol({ powered, temperature }: { powered: boolean; tempera
   );
 }
 
-function GenericSymbol({ type, powered, state, zoom = 1, status }: { type: string; powered: boolean; state?: SimulatedComponentState; zoom?: number; status?: SimulatorStatus }) {
+function GenericSymbol({ type, powered, state }: { type: string; powered: boolean; state?: SimulatedComponentState }) {
   const definition = getComponentDefinition(type);
   if (definition?.symbol) return (
     <div className={`symbol-registry symbol-registry--${definition.symbol} symbol-registry--${type} ${powered && simulationCapability(definition) !== "unavailable" ? "is-powered" : ""}`} aria-hidden="true">
-      <div className="symbol-registry__body"><b>{definition.displayName}</b><small>{definition.metadata?.manufacturer}</small></div>
+      {!getHardwareArtworkKind(type) && <div className="symbol-registry__body"><b>{definition.displayName}</b><small>{definition.metadata?.manufacturer}</small></div>}
       <RegisteredPartArtwork type={type} state={state} />
       {type === "ds3231-rtc" && <span className="symbol-rtc__display"><b>{["hour", "minute", "second"].map(key => String(Math.trunc(Number(state?.readings?.[key] ?? 0))).padStart(2, "0")).join(":")}</b><small>{["year", "month", "day"].map(key => String(Math.trunc(Number(state?.readings?.[key] ?? 0))).padStart(key === "year" ? 4 : 2, "0")).join("-")}</small></span>}
       {type === "ssd1306-oled-128x64" && <span className="symbol-oled__screen"><b>{(state?.display ?? ["CIRKITRA", "OLED 128×64"]).filter(Boolean).slice(0, 2).join("\n")}</b></span>}
@@ -441,15 +441,10 @@ function GenericSymbol({ type, powered, state, zoom = 1, status }: { type: strin
       {type === "keypad-4x4" && <span className="symbol-keypad__matrix">{"123A456B789C*0#D".split("").map((key, index) => <i key={index} className={Number(state?.readings?.keyCode) === key.charCodeAt(0) ? "is-active" : ""}>{key}</i>)}</span>}
       {type === "relay-module-1ch-active-low" && <span className={`symbol-relay__contact ${state?.readings?.energized ? "is-energized" : ""}`}><i /></span>}
       {type === "ws2812b-strip-8" && <div className="symbol-ws2812__pixels" aria-label="Simulated RGB pixels">{(state?.pixels ?? Array.from({ length: 8 }, () => ({ r: 0, g: 0, b: 0 }))).map((pixel, index) => <i key={index} style={{ background: `rgb(${pixel.r}, ${pixel.g}, ${pixel.b})`, boxShadow: pixel.r || pixel.g || pixel.b ? `0 0 8px rgb(${pixel.r}, ${pixel.g}, ${pixel.b})` : "none" }} />)}</div>}
-      {definition.pins.map(pin => {
+      {!getHardwareArtworkKind(type) && definition.pins.map(pin => {
         const point = pinPosition({ type, x: 0, y: 0 }, pin.id, definition);
         return point && <span key={pin.id} className={`symbol-registry__pin side-${pin.side} ${pin.noConnect ? "is-nc" : ""}`} style={{ top: point.y }}><em>{pin.number}</em> {pin.label}</span>;
       })}
-      {state?.status && simulationCapability(definition) !== "unavailable" && status !== "idle" && !state.fault && state.status !== "Wiring fault" && <span className="symbol-registry__state" style={{ transform: `translateX(-50%) scale(${1 / Math.max(0.4, Math.min(1, zoom))})` }}>
-        <strong>{state.status}{status === "paused" ? " · Paused" : ""}</strong>
-        {state.powered && <small>{Object.entries(state.readings ?? {}).filter(([, value]) => Number.isFinite(value)).slice(0, 2).map(([key, value]) => `${key}: ${Number(value.toFixed(2))}`).join(" · ")}</small>}
-        {state.powered && state.display?.some(line => line.trim()) && <small>{state.display.filter(line => line.trim()).slice(0, 2).join(" · ")}</small>}
-      </span>}
     </div>
   );
   const label = type.replace(/[-_]+/g, " ").trim().toUpperCase().slice(0, 14) || "PART";
@@ -539,7 +534,7 @@ export function SchematicSymbol({
   type,
   properties = {},
   powered = false,
-  simulationStatus,
+  simulationStatus: providedSimulationStatus,
   playbackSpeed,
   zoom,
 }: SchematicSymbolProps) {
@@ -549,8 +544,22 @@ export function SchematicSymbol({
   } catch {
     electrical = {};
   }
+  const simulationStatus = providedSimulationStatus ?? "idle";
+  const currentSimulationStatus = simulationStatus;
+  const isServo = ["servo", "sg90-servo", "mg996r-servo"].includes(type);
+  const configuredServoAngle = numericProperty(properties, "angle", 90, 0, 180);
+  const servoAngle = useServoVisualAngle({
+    enabled: isServo,
+    commandAngle: isServo && properties.__servoCommandActive === true ? configuredServoAngle : undefined,
+    resetAngle: configuredServoAngle,
+    status: currentSimulationStatus,
+    playbackSpeed: playbackSpeed ?? 1,
+  });
+  const state = electrical as SimulatedComponentState;
+  if (getHardwareBoardArtworkKind(type)) return <HardwareBoardArtwork type={type} powered={powered} />;
+  if (getHardwareArtworkKind(type)) return <HardwarePartArtwork type={type} state={state} servoAngle={servoAngle} simulationStatus={simulationStatus} />;
   if (isBoardType(type) && type !== "arduino-uno") return <BoardSymbol type={type} powered={powered} />;
-  if (getComponentDefinition(type)?.symbol) return <GenericSymbol type={type} powered={powered} state={electrical as SimulatedComponentState} zoom={zoom} status={simulationStatus} />;
+  if (getComponentDefinition(type)?.symbol) return <GenericSymbol type={type} powered={powered} state={state} />;
   switch (type) {
     case "ground":
       return <GroundSymbol />;
@@ -575,7 +584,7 @@ export function SchematicSymbol({
     case "buzzer":
       return <BuzzerSymbol powered={powered} />;
     case "servo":
-      return <ServoSymbol powered={powered} angle={numericProperty(properties, "angle", 90, 0, 180)} />;
+      return <ServoSymbol powered={powered} angle={servoAngle} />;
     case "dc-motor":
       return <DcMotorSymbol powered={powered} direction={electrical.direction} speed={electrical.speed} simulationStatus={simulationStatus} playbackSpeed={playbackSpeed} zoom={zoom} />;
     case "l293d":
