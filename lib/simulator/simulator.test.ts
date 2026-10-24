@@ -61,13 +61,17 @@ test("compiles constants and the supported Arduino call subset", () => {
   assert.equal(program.valid, true);
   assert.deepEqual(
     program.setup.map((instruction) => instruction.kind),
-    ["pinMode", "serialPrint"],
+    ["pinMode", "deviceCall", "deviceCall"],
   );
   assert.deepEqual(
     program.loop.map((instruction) => instruction.kind),
     ["digitalWrite", "delay", "digitalWrite", "delay"],
   );
   assert.equal(program.diagnostics.length, 0);
+  const simulator = new ArduinoSimulator(blinkSketch);
+  simulator.run();
+  simulator.advance(100);
+  assert.deepEqual(simulator.getSnapshot().serial.map(entry => entry.text), ["ready"]);
 });
 
 test("compiles and executes pure numeric helpers with nested early returns", () => {
